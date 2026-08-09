@@ -224,11 +224,15 @@ documentation pass adds from reading the code against that evidence.
   exercised it — the target board's current configuration exposes dedicated
   per-device ports, and no code path in this collection speaks single-port
   mode at all.
-- **`asmb8_redirection` and `plugins/module_utils/ivtp.py` have zero live-hardware
-  evidence and zero unit/mock test coverage — the only module and
-  `module_utils` file in this collection with neither.** Every protocol fact
-  they rely on is Tier 1 (decompiled vendor client analysis) with nothing
-  behind it at Tier 2 or Tier 3. Specifically unverified:
+- **`asmb8_console` and `plugins/module_utils/ivtp.py` have zero live-hardware
+  evidence and zero unit/mock test coverage of the handshake state machine —
+  the only module and `module_utils` file in this collection with neither.**
+  (This module was named `asmb8_redirection` until it was split from the
+  now-separate, differently-behaved module of that name -- see
+  `changelogs/fragments/` and `docs/asmb8_redirection.md`; nothing about its
+  own evidence changed in that split.) Every protocol fact it relies on is
+  Tier 1 (decompiled vendor client analysis) with nothing behind it at Tier 2
+  or Tier 3. Specifically unverified:
   - Whether the `VALIDATE_VIDEO_SESSION` packet's `pktSize` header field
     should be 324 (this collection's choice, self-consistent with every other
     packet-building method in the decompiled client) or 332 (what the
@@ -244,16 +248,36 @@ documentation pass adds from reading the code against that evidence.
     rejection from the KVM service looks anything like what
     `plugins/module_utils/ivtp.py` assumes — no such rejection has been
     observed.
-  - **`asmb8_redirection.py`'s own `DOCUMENTATION` claims the KVM service
+  - **`asmb8_console.py`'s own `DOCUMENTATION` claims the KVM service
     permits 4 concurrent sessions with an 1800-second server-side inactivity
     timeout, attributed only to "the task brief this collection was built
     against."** This is not sourced from the decompiled vendor client, a live
     capture, or any other authoritative reference this document cites
     elsewhere, and does not belong at Tier 1 or Tier 3 despite reading like a
     confident, specific fact. Treat both numbers as unverified until a real
-    source backs them.
+    source backs them. The new, separate `asmb8_redirection` module's own
+    static catalog repeats these same two figures for the same seven
+    services, with the same caveat -- see the next item.
+  - **`asmb8_redirection`'s `known`/`enabled` signals are a static catalog,
+    not a live query.** Its `reachable` signal is a genuine, live, per-run TCP
+    probe -- that part is Tier 1 in the ordinary sense (a bare socket connect,
+    nothing protocol-specific to source). But `known` and `enabled` are read
+    from a catalog built into the module from the BMC's own Services page as
+    read from its web UI, per `docs/hardware-evidence-2026-08-08.md`'s
+    "Service capacities, and a provenance caveat" section -- not observed on
+    the wire, and not re-queried live on any run, because no sourced RPC
+    exists for fetching that page's state over the wire. Treat `enabled` as
+    "what the vendor's Services page showed once," not "what is true right
+    now."
+  - **Whether any RPC exists on this BMC's `.asp` surface for toggling a
+    service's enablement.** Investigated specifically for `asmb8_redirection`
+    and not found; `plugins/module_utils/asp.py` documents every RPC this
+    collection has sourced, and none of them toggle a service. `state` is
+    accepted by the module's argument spec (so it fails with a clear,
+    specific message rather than an "unrecognised parameter" error) but
+    always fails with `error_class=unsupported_capability`.
 - **`decoded_frame` capture is a deliberate non-goal, not a proven gap.**
-  `asmb8_redirection` refuses to decode AMI/ASPEED video into pixels
+  `asmb8_console` refuses to decode AMI/ASPEED video into pixels
   (`error_class=unsupported_capability`) rather than approximating one. This
   is correct, honest behaviour — listed here only so a reader does not read
   "video decoding is unproven" (above) as "video decoding was attempted and

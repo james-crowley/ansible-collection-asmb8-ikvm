@@ -7,226 +7,152 @@ from __future__ import annotations
 
 DOCUMENTATION = r"""
 module: asmb8_redirection
-short_description: Open an ASMB8-iKVM console/KVM (IVTP) session headlessly
+short_description: Report and optionally toggle ASMB8-iKVM service enablement
 description:
   - >-
-    Opens an ASMB8-iKVM BMC's KVM/console-redirection channel the same way the vendor's Java
-    C(JViewer) client does, but headlessly -- no Java, no JRE, and no on-screen window. It logs in
-    to the C(.asp) web-management surface, fetches C(jviewer.jnlp) to mint a fresh C(-kvmtoken) and
-    allocate a video session, then speaks AMI's proprietary IVTP protocol directly over
-    O(kvm_port) to complete the session handshake.
+    Reads (and, if O(state) is given, would mutate) whether this BMC's own listed services --
+    C(web), C(kvm), C(cd-media), C(fd-media), C(hd-media), C(ssh), C(telnet), exactly as the BMC's
+    own Services page names them -- are enabled, plus whether each service's TCP port is actually
+    reachable right now. This module is named, and shaped, after the sibling
+    M(james_crowley.intel_amt.amt_redirection) module: same three-signal reporting discipline, same
+    read-only-unless-O(state)-is-given default. It does B(not) open a console/video channel itself
+    -- see M(james_crowley.asmb8_ikvm.asmb8_console) for that, and this module's own C(seealso).
   - >-
-    B(What this module actually proves, honestly.) The full AMI/ASPEED video codec (a hybrid
-    vector-quantisation + JPEG/DCT tile stream, optionally RC4-obfuscated) is B(not) implemented by
-    this collection -- porting it is a large, separate undertaking this module does not attempt,
-    and it never fabricates or approximates a decode. O(capture=handshake_only) (the default) only
-    proves the channel is live: it completes the session handshake and returns the negotiated
-    facts in RV(channel). O(capture=raw_frame) additionally waits for and saves one complete video
-    frame's raw, still-encoded bytes -- B(not) a viewable image -- to O(output_path), clearly
-    labelled as undecoded in RV(frame). O(capture=decoded_frame) always fails with
-    RV(ignore:error_class) V(unsupported_capability): asking for a decoded image is refused rather
-    than answered with a placeholder.
+    Three separate signals are always reported per service, per the same discipline the sibling
+    module uses, and never collapsed into one boolean: RV(services[].known) -- is this a service
+    name this BMC's own Services page lists at all; RV(services[].enabled) -- does the BMC report
+    it Active; and RV(services[].reachable) -- does a bare TCP connect to its port(s) actually
+    succeed right now. A service can be enabled yet unreachable (see the next paragraph for why
+    that is the B(normal) case here, not a fault), or its port can be open while the BMC reports
+    the service itself disabled -- collapsing these would hide exactly the distinction an operator
+    needs.
   - >-
-    B(TLS for the KVM socket is governed by O(kvm_secure), never inferred from O(kvm_port).)
-    Observed directly from the vendor's own decompiled client: whether the video socket is
-    TLS-wrapped is carried by a boolean flag, completely independent of which TCP port is dialled.
-    When O(token) is not supplied, O(kvm_secure) defaults to whatever the C(jviewer.jnlp) fetch
-    itself reported for this session (which follows the scheme O(use_tls) selects for that fetch --
-    see the connection fragment's note on O(use_tls)); set O(kvm_secure) explicitly to override it,
-    and it B(must) be set explicitly whenever O(token) is supplied, since there is then no JNLP
-    response to read it from.
+    B(This distinction matters even more here than on Intel AMT, and it must be understood before
+    reading RV(services[].reachable).) C(kvm)/C(cd-media)/C(fd-media)/C(hd-media) (RV(services[].on_demand)
+    V(true)) are B(on-demand) listeners on this board: they return TCP RST until a C(.asp) login
+    plus C(GET /Java/jviewer.jnlp?EXTRNIP=<ip>&JNLPSTR=JViewer) allocates a session (see
+    M(james_crowley.asmb8_ikvm.asmb8_console) and C(plugins/module_utils/asp.py)'s
+    C(allocate_media_session)). B("Active but unreachable" is this module's normal resting state
+    for those four services, not a fault.) Collapsing RV(services[].enabled) and
+    RV(services[].reachable) into one boolean would report a perfectly healthy board as broken the
+    moment nobody happens to hold a session open. C(web)/C(ssh)/C(telnet) are B(not) on-demand --
+    their ports listen continuously whenever the service is enabled, so an unreachable port there
+    is a more meaningful signal.
   - >-
-    B(O(kvm_port) refuses connections until a session is allocated, and that is normal.) On the
-    target hardware this listener is on-demand: it binds only after the C(.asp) login plus the
-    C(jviewer.jnlp) fetch allocate a session. This module's own flow always performs that
-    allocation before dialling O(kvm_port), so this is transparent to a normal run; it is noted
-    here only so an operator manually probing O(kvm_port) outside of this module is not alarmed to
-    find it closed with no session active.
+    RV(services[].known) and RV(services[].enabled) come from a B(static catalog) built into this
+    module from the BMC's own Services page -- read from its web UI by this collection's
+    maintainer, B(not) observed on the wire -- documented in C(docs/hardware-evidence-2026-08-08.md)
+    and cited there with an explicit caveat this module preserves: the port numbers and the
+    plaintext/secure split are confirmed on the wire, but the exact session-timeout and
+    max-session figures, and the live Active/Inactive state itself, are the BMC's own self-report,
+    not independently measured or re-queried by this module on every run. B(No sourced C(.asp) RPC
+    exists to fetch the Services page's live state over the wire) -- this module does not invent
+    one; see O(state) below for what that means for mutation. RV(services[].reachable) is the one
+    signal this module actually probes fresh, live, on every run: a bare TCP connect-and-close,
+    never a byte of any BMC protocol.
   - >-
-    B(This BMC's KVM service is far less prone to slot exhaustion than virtual media.) Per the task
-    brief this collection was built against: the C(kvm) service allows B(4 concurrent sessions)
-    with an B(1800-second) server-side inactivity timeout, unlike M(james_crowley.asmb8_ikvm.asmb8_media)'s
-    virtual-media channel, which permits exactly one session with no server-side reclaim at all.
-    RV(ignore:error_class) V(bmc_busy) can still surface here -- it is inherited from the
-    C(.asp) login/JNLP-allocation step this module performs before ever touching O(kvm_port) (see
-    C(module_utils/asp.py)) -- but hitting the KVM slot limit itself would require 4 other sessions
-    already attached, not merely one stale prior session, which is M(james_crowley.asmb8_ikvm.asmb8_media)'s
-    far easier-to-hit failure mode.
+    Without O(state), this module is read-only and always reports C(changed=false) -- exactly like
+    the sibling module.
   - >-
-    This module never mutates persistent BMC state -- RV(changed) is always V(false), the same
-    convention M(james_crowley.asmb8_ikvm.asmb8_info) uses for its own C(include_web_session). A
-    KVM session is opened and, best-effort, closed again (C(STOP_SESSION_IMMEDIATE) is sent, then
-    the socket is closed) before this module returns; nothing about the BMC's standing
-    configuration is changed by running it.
+    O(state), if given, always fails with C(error_class=unsupported_capability), before any
+    network is touched. C(plugins/module_utils/asp.py) -- this BMC's only documented RPC surface --
+    exposes no endpoint for toggling a service's enablement; nothing here was sourced from a
+    capture, a decompiled client, or a specification, so this module refuses to guess at one rather
+    than silently building a mutating feature on an invented endpoint. Change a service's
+    enablement from the BMC's own web UI (its Services configuration page) until a real RPC for
+    this is confirmed and a future release can add it honestly.
 version_added: 0.1.0
 author:
   - Jim Crowley (@james-crowley)
 extends_documentation_fragment:
   - james_crowley.asmb8_ikvm.connection
 options:
-  kvm_port:
-    description:
-      - TCP port of the BMC's IVTP KVM/console-redirection listener.
-      - >-
-        Confirmed on the target board's current configuration: this port is plaintext-only there
-        (the paired secure port, 7582 on this protocol family, is refused outright because
-        media/KVM encryption is disabled in this BMC's configuration) -- see O(kvm_secure).
-    type: int
-    default: 7578
-  kvm_secure:
+  services:
     description:
       - >-
-        Whether the KVM socket itself is TLS-wrapped. B(Independent of O(kvm_port)) -- see the
-        module description. When O(token) is not set, defaults to whatever the C(jviewer.jnlp)
-        fetch reports for O(kvm_secure)/C(vmsecure) on this session; set this explicitly to
-        override that. B(Required) when O(token) is set, since this module then has no JNLP
-        response of its own to read the flag from.
-      - >-
-        On the target hardware this is V(false): the secure KVM port is refused outright because
-        media/KVM encryption is disabled in this BMC's configuration, so the plaintext channel is
-        what actually works there today.
-    type: bool
-  token:
+        Which of the BMC's own listed services to report on. Defaults to all seven this module's
+        catalog knows about (see the module description). Every name here is exactly as the BMC's
+        own Services page spells it.
+    type: list
+    elements: str
+    choices: [web, kvm, cd-media, fd-media, hd-media, ssh, telnet]
+    default: [web, kvm, cd-media, fd-media, hd-media, ssh, telnet]
+  service:
     description:
-      - >-
-        A pre-existing C(-kvmtoken) (16 characters on the target hardware), if the caller already
-        holds one from a prior C(jviewer.jnlp) fetch (for example, one minted by a concurrently
-        running M(james_crowley.asmb8_ikvm.asmb8_media) session) and wants to open a KVM channel
-        without a second web login. B(Requires) O(kvm_secure) to be set explicitly alongside it.
-      - >-
-        When omitted (the default), this module performs its own C(.asp) login and
-        C(jviewer.jnlp) fetch using O(username)/O(password), exactly as
-        M(james_crowley.asmb8_ikvm.asmb8_media) does for virtual media, and mints a fresh token
-        for this call only.
-      - This value is never written to the RV(channel) facts, the RV(operation) receipt, or any error message.
-      - >-
-        Marked as a secret in this module's argument spec, so Ansible redacts it
-        from its own output. That marking is declared in the argument spec rather
-        than in this documentation block on purpose - the key is not valid here,
-        and ansible-test's validate-modules rejects it with "extra keys not
-        allowed". Do not add it back to this block.
+      - Which single service O(state) targets. Required together with O(state) (and meaningless without it).
     type: str
-  client_username:
+    choices: [web, kvm, cd-media, fd-media, hd-media, ssh, telnet]
+  state:
     description:
       - >-
-        The client-side username presented in the C(VALIDATE_VIDEO_SESSION) handshake packet.
-        Per the decompiled vendor client, this is the B(local machine's) OS username
-        (C(System.getProperty("user.name"))), B(not) the BMC account named by O(username) -- this
-        module follows that same convention by default, detecting the controller's own OS
-        username. Override only if that default does not make sense for your environment; this
-        field's effect on the BMC's behaviour has not been confirmed against live hardware either
-        way.
+        When set, requests that O(service) be toggled to V(enabled) or V(disabled). B(Always
+        fails) with C(error_class=unsupported_capability), before any network is touched -- see
+        the module description for why: no sourced RPC exists on this BMC's C(.asp) surface for
+        toggling a service's enablement, and this module will not invent one. Change it from the
+        BMC's own web UI instead.
+      - When absent (the default), this module only reads and reports current state; C(changed) is always V(false).
     type: str
-  send_get_web_token:
+    choices: [enabled, disabled]
+  probe_timeout:
     description:
-      - >-
-        Whether to send an extra C(GET_WEB_TOKEN) (opcode 21) packet, carrying O(token), before
-        C(VALIDATE_VIDEO_SESSION). The decompiled vendor client sends this on its standalone-app
-        code path, which this headless module is closest to -- but whether the BMC actually
-        requires it, as opposed to merely tolerating it, has not been confirmed against live
-        hardware. Kept as an option, rather than hardcoded either way, specifically so that can be
-        tested without a code change once hardware access is available.
-    type: bool
-    default: true
-  capture:
-    description:
-      - >-
-        What to do once the KVM session handshake completes. V(handshake_only) (the default) does
-        nothing further and reports RV(channel) only -- this is the "confirm the channel is live"
-        path. V(raw_frame) additionally waits for one complete video frame and saves its raw,
-        still-encoded bytes to O(output_path) -- see RV(frame) for why this is explicitly not a
-        viewable image. V(decoded_frame) always fails immediately, before any network is touched,
-        with RV(ignore:error_class) V(unsupported_capability): decoding the AMI/ASPEED VQ+JPEG/DCT
-        (optionally RC4-obfuscated) video codec into pixels is not implemented by this collection,
-        and this module refuses to fabricate one rather than silently downgrading to
-        V(handshake_only) or returning a placeholder image.
-    type: str
-    choices: [handshake_only, raw_frame, decoded_frame]
-    default: handshake_only
-  output_path:
-    description:
-      - >-
-        Path, on the Ansible controller, to write the captured frame's raw bytes to. B(Required)
-        for O(capture=raw_frame); ignored otherwise. Written mode C(0600). See RV(frame) for the
-        exact, undecoded shape of what is written here.
-    type: path
-  handshake_timeout:
-    description:
-      - >-
-        Seconds to wait for each step of the IVTP session handshake (the BMC's initial greeting,
-        and its response to C(VALIDATE_VIDEO_SESSION)). Distinct from O(connect_timeout), which
-        only bounds the TCP/TLS connect itself.
-    type: int
-    default: 15
-  frame_timeout:
-    description:
-      - >-
-        Seconds to wait for one complete video frame once O(capture=raw_frame). The ASPEED video
-        engine only sends fragments for changed screen content, so an idle/unchanged host display
-        may not produce a full frame within this bound even though the channel itself is healthy
-        -- a timeout here is reported as RV(ignore:error_class) V(timeout), not necessarily a
-        protocol fault. Raise this value, or ensure the target host's display is actually changing,
-        if this is hit routinely.
-    type: int
-    default: 20
+      - Seconds to wait for each per-port TCP reachability probe (RV(services[].reachable)).
+    type: float
+    default: 2.0
 seealso:
-  - module: james_crowley.asmb8_ikvm.asmb8_media
+  - module: james_crowley.asmb8_ikvm.asmb8_console
   - module: james_crowley.asmb8_ikvm.asmb8_info
+  - module: james_crowley.intel_amt.amt_redirection
 attributes:
   check_mode:
     description: >-
-      Supported. Validates options (including that O(output_path)'s parent directory exists for
-      O(capture=raw_frame), and that O(capture=decoded_frame) is rejected) but never logs in, never
-      fetches the JNLP, and never opens a connection to O(kvm_port).
+      Supported, and behaves identically to normal mode. This module never mutates (O(state) fails
+      before any network access, in or out of check mode), and its only network activity -- a
+      bare TCP connect-and-close per port -- is safe to perform in check mode too.
     support: full
   diff_mode:
-    description: Not supported. Use RV(channel)/RV(frame) and the C(operation) receipt instead.
+    description: Not supported. Use RV(services) and the C(operation) receipt instead.
     support: none
-requirements:
-  - requests >= 2.25.0 (on the Ansible controller)
+requirements: []
 """
 
 EXAMPLES = r"""
-- name: Confirm the KVM channel is live without capturing anything
+- name: Report every known service's enablement and reachability
   james_crowley.asmb8_ikvm.asmb8_redirection:
     host: "{{ asmb8_host }}"
-    username: "{{ asmb8_username }}"
-    password: "{{ asmb8_password }}"
-    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
-    capture: handshake_only
   delegate_to: localhost
   no_log: true
-  register: kvm_check
+  register: services
 
-- name: Capture one raw (undecoded) console frame for offline inspection
+- name: Report only the KVM and CD-media services
   james_crowley.asmb8_ikvm.asmb8_redirection:
     host: "{{ asmb8_host }}"
-    username: "{{ asmb8_username }}"
-    password: "{{ asmb8_password }}"
-    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
-    capture: raw_frame
-    output_path: /tmp/asmb8-frame.raw
+    services: [kvm, cd-media]
   delegate_to: localhost
   no_log: true
-  register: kvm_frame
+  register: media_services
 
-- name: Requesting a decoded image fails honestly instead of faking one
-  james_crowley.asmb8_ikvm.asmb8_redirection:
-    host: "{{ asmb8_host }}"
-    username: "{{ asmb8_username }}"
-    password: "{{ asmb8_password }}"
-    capture: decoded_frame
-    output_path: /tmp/asmb8-frame.png
-  delegate_to: localhost
-  no_log: true
-  register: kvm_decode_attempt
-  ignore_errors: true
-
-- name: Assert the decode attempt failed the honest way
+- name: A KVM service that is enabled but unreachable is healthy, not broken -- no session is open
   ansible.builtin.assert:
     that:
-      - kvm_decode_attempt is failed
-      - kvm_decode_attempt.error_class == 'unsupported_capability'
+      - services.services.kvm.on_demand
+      - services.services.kvm.enabled
+      # services.services.kvm.reachable.nonsecure.reachable may legitimately be false here.
+
+- name: Requesting a service-enablement change fails honestly instead of guessing at an endpoint
+  james_crowley.asmb8_ikvm.asmb8_redirection:
+    host: "{{ asmb8_host }}"
+    service: telnet
+    state: enabled
+  delegate_to: localhost
+  no_log: true
+  register: toggle_attempt
+  ignore_errors: true
+
+- name: Assert the toggle attempt failed the honest way
+  ansible.builtin.assert:
+    that:
+      - toggle_attempt is failed
+      - toggle_attempt.error_class == 'unsupported_capability'
 """
 
 RETURN = r"""
@@ -234,58 +160,85 @@ changed:
   description: Always V(false) -- see the module description.
   type: bool
   returned: always
-capture:
-  description: The O(capture) mode this call ran with.
-  type: str
+services:
+  description: Per-service report, keyed by service name, for every name in O(services).
+  type: dict
   returned: always
-channel:
-  description: >-
-    The negotiated handshake facts, present whenever the handshake completed (i.e. whenever this
-    module did not fail before RV(operation.error_class) V(null)).
-  type: dict
-  returned: on success
   contains:
-    session_accepted:
-      description: Always V(true) on success -- the BMC's initial greeting was SESSION_ACCEPTED.
-      type: bool
-    greeting_body_len:
-      description: Byte length of the greeting's own body (an active-client list this module does not parse).
-      type: int
-    validate_status:
-      description: The raw C(VALIDATE_VIDEO_SESSION_RESPONSE) status byte. V(1) is VALID_SESSION.
-      type: int
-    validate_status_name:
-      description: A human-readable name for RV(channel.validate_status).
-      type: str
-    validate_sub_status:
+    known:
       description: >-
-        A second status byte the BMC sometimes includes; V(null) when absent. The decompiled
-        vendor client never names what this means, and neither does this module.
-      type: int
-    resumed:
-      description: Always V(true) on success -- C(RESUME_REDIRECTION) was sent after validation.
+        Whether this service name appears in this module's built-in catalog of the BMC's own
+        Services page. Always V(true) for every name O(services) can contain -- O(services)'
+        C(choices) is exactly that catalog -- kept as its own field for parity with the sibling
+        module's C(supported) signal, and because a future firmware revision that drops or renames
+        a service is exactly the kind of drift this field exists to eventually catch.
       type: bool
-frame:
-  description: Present only when O(capture=raw_frame) succeeded.
-  type: dict
-  returned: when O(capture=raw_frame)
-  contains:
-    decoded:
+    on_demand:
       description: >-
-        Always V(false). The bytes at RV(frame.output_path) are the raw, still-encoded
-        (VQ+JPEG/DCT tile stream, possibly RC4-obfuscated) fragment data for one frame -- B(not) a
-        viewable image, and not something an image viewer or browser can open. Decoding this is not
-        implemented by this collection; see the module description.
+        Whether this service's listener is on-demand (V(true) for C(kvm)/C(cd-media)/C(fd-media)/C(hd-media))
+        rather than continuously listening whenever enabled (V(false) for C(web)/C(ssh)/C(telnet)).
+        See the module description for why this makes "enabled but unreachable" the normal, healthy
+        state for an on-demand service.
       type: bool
-    bytes_written:
-      description: Number of raw bytes written to RV(frame.output_path).
-      type: int
-    output_path:
-      description: Mirrors O(output_path).
-      type: str
+    enabled:
+      description: >-
+        Whether the BMC's own Services page reports this service Active. Sourced from this
+        module's static catalog (see the module description) -- B(not) independently re-queried on
+        this or any run, because no sourced RPC exists to do so. V(true) for every service except
+        C(telnet), which the target hardware's Services page reported Inactive.
+      type: bool
+    capacity:
+      description: >-
+        This service's configured capacity, per the BMC's own Services page. Vendor self-report --
+        see C(docs/hardware-evidence-2026-08-08.md) for exactly what was and was not independently
+        confirmed on the wire (the port numbers and the plaintext/secure split were; the timeout
+        and max-session figures were not).
+      type: dict
+      contains:
+        nonsecure_port:
+          description: The plaintext TCP port, or V(null) if this service has none (C(ssh)).
+          type: int
+        secure_port:
+          description: The TLS-wrapped TCP port, or V(null) if this service has none (C(telnet)).
+          type: int
+        timeout_seconds:
+          description: Server-side inactivity timeout, or V(null) if none is configured (the media services).
+          type: int
+        max_sessions:
+          description: Maximum concurrent sessions, or V(null) if not reported for this service.
+          type: int
+    reachable:
+      description: >-
+        Live, this-run-only TCP connect-and-close results, never a byte of any BMC protocol. Each
+        of RV(services[].reachable.nonsecure)/RV(services[].reachable.secure) is V(null) if this
+        service has no port in that role (see RV(services[].capacity)), otherwise a dict.
+      type: dict
+      contains:
+        nonsecure:
+          description: Reachability of RV(services[].capacity.nonsecure_port), or V(null).
+          type: dict
+          contains:
+            port:
+              description: The port probed.
+              type: int
+            reachable:
+              description: >-
+                Whether the TCP connect succeeded. For a service with RV(services[].on_demand)
+                V(true) this is normally V(false) with no session open -- see the module description.
+              type: bool
+        secure:
+          description: Reachability of RV(services[].capacity.secure_port), or V(null).
+          type: dict
+          contains:
+            port:
+              description: The port probed.
+              type: int
+            reachable:
+              description: Whether the TCP connect succeeded.
+              type: bool
 operation:
   description: >-
-    The C(asmb8-ikvm-operation/v1) receipt for this call, in the same nested shape every other
+    The C(asmb8-ikvm-operation/v1) receipt for this read, in the same nested shape every other
     module in this collection returns it under.
   type: dict
   returned: always
@@ -294,39 +247,77 @@ operation:
       description: Always V(asmb8-ikvm-operation/v1).
       type: str
     action:
-      description: Always V(asmb8_redirection.capture).
+      description: Always V(asmb8_redirection.report).
       type: str
     endpoint:
-      description: The C(host:kvm_port) this call connected (or attempted to connect) to.
+      description: >-
+        The bare O(host) this read was performed against. There is no single port to report here
+        -- this module probes several per-service ports separately; see RV(services).
       type: str
     changed:
       description: Always V(false).
       type: bool
     observed:
-      description: Mirrors RV(channel), or V(null) if the handshake never completed (including check mode).
+      description: Mirrors RV(services).
       type: dict
     error_class:
       description: A stable machine-readable failure class. V(null) on success.
       type: str
 """
 
-import contextlib
-import dataclasses
-import getpass
-import os
-from pathlib import Path
+import socket
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+from ansible.module_utils.basic import AnsibleModule
 
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import ivtp
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp import HAS_REQUESTS, REQUESTS_IMPORT_ERROR, AspClient, TlsTrustPolicy
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import IkvmError, ProtocolError, UnsupportedCapabilityError
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.iusb import resolve_local_ip
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import IkvmError, UnsupportedCapabilityError
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.models import OperationReceipt
 
-CAPTURE_HANDSHAKE_ONLY = "handshake_only"
-CAPTURE_RAW_FRAME = "raw_frame"
-CAPTURE_DECODED_FRAME = "decoded_frame"
+#: The reachability probe's socket factory. Injectable so unit tests exercise this module without
+#: ever opening a real socket -- mirrors the sibling james_crowley.intel_amt collection's
+#: redirection_service.ConnectFn exactly.
+ConnectFn = Callable[[tuple[str, int], float], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceCapacity:
+    """One service's configured capacity, per the BMC's own Services page.
+
+    Vendor self-report, per docs/hardware-evidence-2026-08-08.md's "Service capacities, and a
+    provenance caveat" section: the port numbers and the plaintext/secure split were confirmed on
+    the wire; ``timeout_seconds``, ``max_sessions``, and ``known_active`` were not independently
+    measured -- no session count was ever pushed to its limit, and no session was ever left idle
+    long enough to watch a timeout reclaim it. This dataclass is this module's one and only source
+    for those three fields; nothing here is re-queried live because no sourced RPC exists to do so.
+    """
+
+    nonsecure_port: int | None
+    secure_port: int | None
+    timeout_seconds: int | None
+    max_sessions: int | None
+    on_demand: bool
+    known_active: bool
+
+
+#: Every service name this module recognises, in the same order the BMC's own Services page lists
+#: them. Sourced from docs/hardware-evidence-2026-08-08.md's "Service capacities, and a provenance
+#: caveat" table -- see ServiceCapacity's docstring for exactly what is and is not independently
+#: confirmed within it.
+SERVICE_CATALOG: dict[str, ServiceCapacity] = {
+    "web": ServiceCapacity(nonsecure_port=80, secure_port=443, timeout_seconds=1800, max_sessions=20, on_demand=False, known_active=True),
+    "kvm": ServiceCapacity(nonsecure_port=7578, secure_port=7582, timeout_seconds=1800, max_sessions=4, on_demand=True, known_active=True),
+    "cd-media": ServiceCapacity(nonsecure_port=5120, secure_port=5124, timeout_seconds=None, max_sessions=1, on_demand=True, known_active=True),
+    "fd-media": ServiceCapacity(nonsecure_port=5122, secure_port=5126, timeout_seconds=None, max_sessions=1, on_demand=True, known_active=True),
+    "hd-media": ServiceCapacity(nonsecure_port=5123, secure_port=5127, timeout_seconds=None, max_sessions=1, on_demand=True, known_active=True),
+    "ssh": ServiceCapacity(nonsecure_port=None, secure_port=22, timeout_seconds=600, max_sessions=None, on_demand=False, known_active=True),
+    # Per docs/hardware-evidence-2026-08-08.md: telnet was observed Inactive on the target board's
+    # Services page. Not on-demand -- an inactive standing listener, not an allocate-on-use one.
+    "telnet": ServiceCapacity(nonsecure_port=23, secure_port=None, timeout_seconds=600, max_sessions=None, on_demand=False, known_active=False),
+}
+
+SERVICE_NAMES: tuple[str, ...] = tuple(SERVICE_CATALOG)
 
 
 def _connection_argument_spec() -> dict[str, dict]:
@@ -349,209 +340,101 @@ def argument_spec() -> dict[str, dict]:
     spec = _connection_argument_spec()
     spec.update(
         {
-            "kvm_port": {"type": "int", "default": 7578},
-            "kvm_secure": {"type": "bool"},
-            "token": {"type": "str", "no_log": True},
-            "client_username": {"type": "str"},
-            "send_get_web_token": {"type": "bool", "default": True},
-            "capture": {"type": "str", "choices": [CAPTURE_HANDSHAKE_ONLY, CAPTURE_RAW_FRAME, CAPTURE_DECODED_FRAME], "default": CAPTURE_HANDSHAKE_ONLY},
-            "output_path": {"type": "path"},
-            "handshake_timeout": {"type": "int", "default": 15},
-            "frame_timeout": {"type": "int", "default": 20},
+            "services": {"type": "list", "elements": "str", "choices": list(SERVICE_NAMES), "default": list(SERVICE_NAMES)},
+            "service": {"type": "str", "choices": list(SERVICE_NAMES)},
+            "state": {"type": "str", "choices": ["enabled", "disabled"]},
+            "probe_timeout": {"type": "float", "default": 2.0},
         }
     )
     return spec
 
 
-def build_asp_client(params: dict) -> AspClient:
-    return AspClient(
-        host=params["host"],
-        port=params["port"],
-        username=params["username"],
-        password=params["password"],
-        use_tls=params["use_tls"],
-        validate_certs=params["validate_certs"],
-        ca_path=params["ca_path"],
-        tls_fingerprint=params["tls_fingerprint"],
-        allow_insecure_transport=params["allow_insecure_transport"],
-        timeout=params["timeout"],
-        connect_timeout=params["connect_timeout"],
-    )
+def probe_port(host: str, port: int, *, timeout: float, connect: ConnectFn = socket.create_connection) -> bool:
+    """Attempt a bare TCP connect-and-close to ``host:port``. Never raises; a failure is simply V(false).
 
-
-def default_client_username() -> str:
-    """The controller's own OS username, matching the decompiled vendor client's
-    ``getClientUserName()`` (``System.getProperty("user.name")``) -- see O(client_username)'s docs
-    for why this is deliberately not the BMC account name.
+    Mirrors the sibling james_crowley.intel_amt collection's
+    ``redirection_service.probe_transport_reachable`` exactly, one port at a time so a caller can
+    attribute the result to a specific service/port-role pair. ``connect`` defaults to
+    :func:`socket.create_connection` but is always injectable -- unit tests must never open a real
+    socket.
     """
     try:
-        return getpass.getuser()
-    except OSError:  # pragma: no cover - only reachable on a controller with no resolvable user identity.
-        return "ansible"
+        connection = connect((host, port), timeout)
+    except OSError:
+        return False
+    close = getattr(connection, "close", None)
+    if callable(close):
+        close()
+    return True
 
 
-def validate_output_path(output_path: str | None) -> None:
-    """Fail fast, before any network is touched, if O(output_path) could never be written to.
-
-    Mirrors ``media_session.validate_image``'s reasoning: a bad path should be a synchronous,
-    obvious failure, not something that only shows up after a session was already opened and
-    a frame already captured.
-    """
-    if not output_path:
-        raise ProtocolError("asmb8_redirection capture=raw_frame requires output_path to be set", operation="asmb8_redirection.capture")
-    parent = Path(output_path).parent
-    if not parent.is_dir():
-        raise ProtocolError(f"asmb8_redirection: output_path's parent directory {parent!r} does not exist", operation="asmb8_redirection.capture")
+def _reachable_entry(host: str, port: int | None, *, timeout: float, connect: ConnectFn) -> dict | None:
+    if port is None:
+        return None
+    return {"port": port, "reachable": probe_port(host, port, timeout=timeout, connect=connect)}
 
 
-def resolve_token_and_security(params: dict) -> tuple[str, bool, str]:
-    """Obtain a KVM token (minting one via login+JNLP if the caller did not supply one) plus the
-    O(kvm_secure) flag and the client IP to present in the handshake.
-
-    Returns ``(token, kvm_secure, client_ip)``. Never logs or returns the token itself.
-    """
-    client_ip = resolve_local_ip(params["host"])
-    token = params.get("token")
-    kvm_secure = params.get("kvm_secure")
-
-    if token is not None:
-        if kvm_secure is None:
-            # Backstop: argument_spec's required_by should already have refused this combination.
-            raise ProtocolError("asmb8_redirection: kvm_secure must be set explicitly when token is supplied", operation="asmb8_redirection.capture")
-        return token, kvm_secure, client_ip
-
-    asp_client = build_asp_client(params)
-    asp_client.login()
-    jnlp = asp_client.allocate_media_session(client_ip=client_ip, secure=kvm_secure)
-    if jnlp.kvm_token is None:
-        # allocate_media_session() itself already raises ProtocolError when no token is found in
-        # the JNLP; this is an extra, structural guard so a future change there cannot silently
-        # let a None token reach the IVTP layer.
-        raise ProtocolError("jviewer.jnlp allocation did not yield a usable KVM token", endpoint=asp_client.endpoint, operation="asmb8_redirection.capture")
-    if kvm_secure is None:
-        kvm_secure = bool(jnlp.kvm_secure)
-    return jnlp.kvm_token, kvm_secure, client_ip
-
-
-def build_kvm_transport(params: dict, *, kvm_secure: bool) -> ivtp.SocketTransport:
-    ssl_context = None
-    if kvm_secure:
-        policy = TlsTrustPolicy.create(
-            validate_certs=params["validate_certs"],
-            ca_path=params["ca_path"],
-            tls_fingerprint=params["tls_fingerprint"],
-        )
-        ssl_context = policy.build_ssl_context()
-    return ivtp.SocketTransport.connect(params["host"], params["kvm_port"], timeout=params["connect_timeout"], ssl_context=ssl_context)
-
-
-def channel_facts_dict(facts: ivtp.ChannelFacts) -> dict:
-    return dataclasses.asdict(facts)
-
-
-def write_frame(output_path: str, frame: bytes) -> None:
-    """Write ``frame``'s raw bytes to ``output_path``, mode 0600, create-or-truncate."""
-    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(frame)
-
-
-def run_capture(params: dict, *, endpoint: str) -> dict:
-    token, kvm_secure, client_ip = resolve_token_and_security(params)
-
-    transport = build_kvm_transport(params, kvm_secure=kvm_secure)
-    frame_info: dict | None = None
-    try:
-        username = params.get("client_username") or default_client_username()
-        facts = ivtp.open_channel(
-            transport,
-            token=token,
-            client_ip=client_ip,
-            username=username,
-            handshake_timeout=float(params["handshake_timeout"]),
-            send_get_web_token=params["send_get_web_token"],
-        )
-
-        if params["capture"] == CAPTURE_RAW_FRAME:
-            frame = ivtp.capture_one_frame(transport, frame_timeout=float(params["frame_timeout"]))
-            output_path = params["output_path"]
-            write_frame(output_path, frame)
-            frame_info = {
-                "decoded": False,
-                "bytes_written": len(frame),
-                "output_path": output_path,
-            }
-    finally:
-        with contextlib.suppress(Exception):
-            transport.send_all(ivtp.build_stop_session())
-        transport.close()
-
-    del token
-
-    receipt = OperationReceipt(
-        action="asmb8_redirection.capture",
-        endpoint=endpoint,
-        changed=False,
-        previous=None,
-        desired=params["capture"],
-        observed=facts,
-    )
+def build_service_report(name: str, host: str, *, timeout: float, connect: ConnectFn = socket.create_connection) -> dict:
+    """Assemble one service's three-signal report: known/enabled (catalog) plus reachable (live probe)."""
+    capacity = SERVICE_CATALOG[name]
     return {
-        "changed": False,
-        "capture": params["capture"],
-        "channel": channel_facts_dict(facts),
-        "frame": frame_info,
-        "operation": receipt.to_dict(),
+        "known": True,
+        "on_demand": capacity.on_demand,
+        "enabled": capacity.known_active,
+        "capacity": {
+            "nonsecure_port": capacity.nonsecure_port,
+            "secure_port": capacity.secure_port,
+            "timeout_seconds": capacity.timeout_seconds,
+            "max_sessions": capacity.max_sessions,
+        },
+        "reachable": {
+            "nonsecure": _reachable_entry(host, capacity.nonsecure_port, timeout=timeout, connect=connect),
+            "secure": _reachable_entry(host, capacity.secure_port, timeout=timeout, connect=connect),
+        },
     }
+
+
+def build_services_report(names: list[str], host: str, *, timeout: float, connect: ConnectFn = socket.create_connection) -> dict:
+    return {name: build_service_report(name, host, timeout=timeout, connect=connect) for name in names}
 
 
 def main() -> None:
     module = AnsibleModule(
         argument_spec=argument_spec(),
-        required_if=[("capture", CAPTURE_RAW_FRAME, ["output_path"])],
-        required_by={"token": ["kvm_secure"]},
+        required_by={"state": ["service"]},
         supports_check_mode=True,
     )
     params = module.params
-
-    if not HAS_REQUESTS:
-        module.fail_json(msg=missing_required_lib("requests"), exception=REQUESTS_IMPORT_ERROR)
-        return
-
-    endpoint = f"{params['host']}:{params['kvm_port']}"
+    endpoint = params["host"]
 
     try:
-        if params["capture"] == CAPTURE_DECODED_FRAME:
+        if params["state"] is not None:
+            # Fail before any network access at all, check mode or not -- see the module
+            # description: no sourced RPC exists on this BMC's .asp surface for toggling a
+            # service's enablement, and this module refuses to invent one.
             raise UnsupportedCapabilityError(
-                "capture=decoded_frame is not implemented. Decoding the AMI/ASPEED VQ+JPEG(DCT), "
-                "optionally RC4-obfuscated, video codec into pixels is a large separate undertaking this "
-                "collection has not completed; use capture=raw_frame to save the raw, still-encoded frame "
-                "bytes instead, or capture=handshake_only to confirm the channel is live without saving anything.",
+                f"asmb8_redirection cannot set state={params['state']!r} for service={params['service']!r}: "
+                "no documented RPC exists on this BMC's .asp surface for toggling a service's enablement "
+                "(see plugins/module_utils/asp.py). Change this from the BMC's own web UI (its Services "
+                "configuration page) instead; a future release can add this once a real RPC is confirmed.",
                 endpoint=endpoint,
-                operation="asmb8_redirection.capture",
+                operation="asmb8_redirection.report",
             )
 
-        if params["capture"] == CAPTURE_RAW_FRAME:
-            validate_output_path(params.get("output_path"))
-
-        if module.check_mode:
-            receipt = OperationReceipt(
-                action="asmb8_redirection.capture",
-                endpoint=endpoint,
-                changed=False,
-                previous=None,
-                desired=params["capture"],
-                observed=None,
-            )
-            module.exit_json(changed=False, capture=params["capture"], channel=None, frame=None, operation=receipt.to_dict())
-            return
-
-        result = run_capture(params, endpoint=endpoint)
+        services = build_services_report(params["services"], params["host"], timeout=float(params["probe_timeout"]))
     except IkvmError as err:
         module.fail_json(**err.to_result())
         return
 
-    module.exit_json(**result)
+    receipt = OperationReceipt(
+        action="asmb8_redirection.report",
+        endpoint=endpoint,
+        changed=False,
+        previous=None,
+        desired=None,
+        observed=services,
+    )
+    module.exit_json(changed=False, services=services, operation=receipt.to_dict())
 
 
 if __name__ == "__main__":

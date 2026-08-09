@@ -284,7 +284,13 @@ evidence the underlying protocol is genuinely shared across MegaRAC-based
 boards rather than only coincidentally similar — **[live capture]**, cross-checked
 against **[MIT reference implementation]**.
 
-### The handshake `asmb8_redirection` actually drives
+### The handshake `asmb8_console` actually drives
+
+`asmb8_console` was named `asmb8_redirection` until that name was split off
+for a differently-behaved module (service-enablement reporting, not a
+console session) before this collection's first release — see
+`changelogs/fragments/` and `docs/asmb8_redirection.md`. Nothing about the
+protocol facts below changed in that split.
 
 `plugins/module_utils/ivtp.py` implements a full handshake beyond the bare
 greeting, sourced from a local decompilation of this board's own
@@ -345,11 +351,11 @@ and **[MIT reference implementation]** agreeing independently. Concatenating
 fragments in order between a first and a matching last yields one complete
 frame's **raw, still-encoded** bytes — the AMI/ASPEED VQ+JPEG(DCT), optionally
 RC4-obfuscated, video codec that would turn this into pixels is **not**
-implemented by this collection. `asmb8_redirection`'s `capture=raw_frame`
+implemented by this collection. `asmb8_console`'s `capture=raw_frame`
 saves exactly this undecoded byte stream; `capture=decoded_frame` is refused
 outright (`error_class=unsupported_capability`) rather than approximated.
 
-**Claimed KVM service capacity — unsourced.** `plugins/modules/asmb8_redirection.py`'s
+**Claimed KVM service capacity — unsourced.** `plugins/modules/asmb8_console.py`'s
 own `DOCUMENTATION` states the KVM service allows 4 concurrent sessions with
 an 1800-second server-side inactivity timeout. This number appears nowhere
 else in this collection's sourced material — not in the decompiled client

@@ -19,12 +19,18 @@ action_groups:
   #       username: "{{ asmb8_username }}"
   #       password: "{{ asmb8_password }}"
   #
-  # TODO: none of these five modules exist yet. This action group is written
-  # ahead of them so the group name and membership are settled before the
-  # first module lands, not discovered by trial and error afterwards.
+  # Historical note, not an outstanding task: none of these six modules existed
+  # yet when this action group was first
+  # written; it was drafted ahead of them so the group name and membership were
+  # settled before the first module landed, not discovered by trial and error
+  # afterwards. asmb8_console was added when asmb8_redirection was split in two
+  # (see changelogs/fragments/ and docs/asmb8_redirection.md) -- it carries the
+  # IVTP console/KVM-session implementation that used to live under
+  # asmb8_redirection's own name.
   asmb8_ikvm:
     - asmb8_info
     - asmb8_power
     - asmb8_boot
     - asmb8_media
     - asmb8_redirection
+    - asmb8_console

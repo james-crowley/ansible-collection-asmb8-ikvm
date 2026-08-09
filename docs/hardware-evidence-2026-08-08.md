@@ -226,8 +226,13 @@ state, and this collection independently confirmed only part of it:
   (only the nonsecure ports bound, with encryption disabled in config), and that
   the listeners are on-demand.
 - **NOT independently confirmed:** the session counts and the timeout values.
-  In particular, `asmb8_redirection`'s documentation states that the KVM service
-  allows 4 concurrent sessions with an 1800-second inactivity timeout, and
+  In particular, `asmb8_console`'s documentation (this table's figures were
+  originally cited from `asmb8_redirection` before that module was split in
+  two -- see `changelogs/fragments/` -- into a session-opening module,
+  renamed `asmb8_console`, and a service-enablement-reporting module that
+  kept the `asmb8_redirection` name and now also cites this same table)
+  states that the KVM service allows 4 concurrent sessions with an
+  1800-second inactivity timeout, and
   `asmb8_media`'s reasoning leans on cd-media allowing exactly one session with
   no timeout. Those figures come from **this table only**. We never opened five
   KVM sessions to see the fifth rejected, and never left a session idle for
@@ -239,6 +244,50 @@ is *consistent* with what we observed — a media session survived a host reset 
 was still bound long afterward with nothing holding it — but "consistent with" is
 weaker than "measured." Treat the single-slot behaviour as well-supported and the
 exact numeric limits as vendor self-report.
+
+## Serial-over-LAN: configured correctly and still silent
+
+This is recorded because it cost real time and the negative result is worth
+knowing: **on this board, an IPMI SOL session can establish cleanly, be fully
+configured, and still deliver no console output at all.**
+
+What was verified over IPMI (`Get/Set SOL Configuration Parameters`, netfn `0x0c`
+commands `0x22`/`0x21`, and `Get/Set User Payload Access`, netfn `0x06` commands
+`0x4D`/`0x4C`):
+
+- A SOL session opens without error via `pyghmi`'s console API.
+- The channel-level SOL payload was found **disabled** (parameter 0) and was
+  enabled successfully. This is a BMC-side setting entirely separate from the
+  platform firmware's own console-redirection options — enabling redirection in
+  firmware setup is **not** sufficient on its own.
+- SOL payload access was already granted for the administrative user.
+- Both plausible bitrates were tried (parameters 5 and 6), matching each of the
+  two speeds the firmware setup exposes.
+
+With all three of those satisfied, **zero bytes arrived** across repeated host
+resets, through the whole power-on self-test window. Not garbled output — none.
+
+Leading hypotheses, none confirmed, all requiring physical firmware-setup access
+rather than anything reachable over IPMI:
+
+- The firmware's console-redirection master toggle for the port in question may
+  be off even when its parameters (speed, terminal type, data bits) are set.
+- The BMC's SOL may be wired to a different serial port than the one firmware is
+  redirecting to.
+- If the port the BMC uses is configured for **hardware RTS/CTS flow control**,
+  SOL would stall waiting on a signal no BMC-side virtual cable asserts.
+- This is 2016-era AMI firmware with a documented defect history; a partial or
+  broken SOL implementation would not be surprising.
+
+**Practical consequence for this collection:** do not depend on SOL for
+observing an installer. Everything in this collection was developed and verified
+without it, by correlating the media channel's own read pattern — which sectors
+the firmware asks for, and when — against the ISO's structure. That technique is
+described under "Boot chain, proven" above and turned out to be sufficient to
+diagnose a bootloader stall precisely.
+
+Any SOL configuration this investigation changed was restored to its original
+state afterwards.
 
 ## IPMI
 

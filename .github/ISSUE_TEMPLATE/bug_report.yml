@@ -53,6 +53,7 @@ body:
         - asmb8_boot
         - asmb8_media
         - asmb8_redirection
+        - asmb8_console
         - asmb8_baremetal_install (role)
         - other / not sure
     validations:

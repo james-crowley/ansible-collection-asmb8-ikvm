@@ -224,21 +224,31 @@ behind it.
 
 ### The KVM console channel opens, but nothing decodes video — and part of its own documentation is unverified
 
-`asmb8_redirection` completes the real IVTP handshake and can save one raw
+`asmb8_console` completes the real IVTP handshake and can save one raw
 video frame's still-encoded bytes, but this collection implements **no** part
 of the AMI/ASPEED video codec — `capture=decoded_frame` fails outright with
 `error_class=unsupported_capability` rather than faking a decode. Unlike
-every other module, `asmb8_redirection` has **zero** live-hardware evidence
-and **zero** unit/mock test coverage behind it: everything it does is sourced
-from decompiled vendor client analysis alone, including at least one specific
-wire-format detail (a `pktSize` field this collection writes as 324 bytes,
-where the decompiled client itself inconsistently writes 332) that is flagged
-in its own source as unverified against real hardware. Its claimed KVM
-service capacity — 4 concurrent sessions, an 1800-second inactivity timeout —
-is also unsourced beyond the module's own documentation. See
-[`docs/asmb8_redirection.md`](docs/asmb8_redirection.md) and
-[`docs/capability-matrix.md`](docs/capability-matrix.md) Tier 4 for the full
-accounting.
+every other module, `asmb8_console` has **zero** live-hardware evidence
+and **zero** unit/mock test coverage of its handshake state machine behind
+it: everything it does is sourced from decompiled vendor client analysis
+alone, including at least one specific wire-format detail (a `pktSize` field
+this collection writes as 324 bytes, where the decompiled client itself
+inconsistently writes 332) that is flagged in its own source as unverified
+against real hardware. Its claimed KVM service capacity — 4 concurrent
+sessions, an 1800-second inactivity timeout — is also unsourced beyond the
+module's own documentation. See [`docs/asmb8_console.md`](docs/asmb8_console.md)
+and [`docs/capability-matrix.md`](docs/capability-matrix.md) Tier 4 for the
+full accounting.
+
+### `asmb8_redirection` cannot toggle a service's enablement — only report it
+
+No sourced RPC exists on this BMC's `.asp` surface for toggling whether a
+service (`web`, `kvm`, `cd-media`, `fd-media`, `hd-media`, `ssh`, `telnet`) is
+enabled — see [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md).
+Passing `state` to `asmb8_redirection` always fails with
+`error_class=unsupported_capability`, deliberately, rather than mutating
+through a guessed endpoint. Use the BMC's own web UI to change a service's
+enablement until a real RPC is confirmed and a future release can add it.
 
 ## Requirements
 
@@ -274,9 +284,20 @@ pip install -r requirements.txt
 | [`asmb8_power`](docs/asmb8_power.md) | Power control over IPMI, wrapping `pyghmi` directly | Yes | Implemented |
 | [`asmb8_boot`](docs/asmb8_boot.md) | One-time IPMI boot-device override; persistent changes are refused outright | Yes | Implemented |
 | [`asmb8_media`](docs/asmb8_media.md) | Stream a local ISO to the BMC's virtual CD-ROM over iUSB | Yes | Implemented |
-| [`asmb8_redirection`](docs/asmb8_redirection.md) | Open the iKVM console (IVTP) session headlessly: confirm the channel is live, or save one raw (undecoded) video frame | No (`changed` is always `false`) | Implemented, but **less proven than the other four** — see below |
+| [`asmb8_redirection`](docs/asmb8_redirection.md) | Report (and, once a real RPC is confirmed, toggle) whether this BMC's own services (`web`, `kvm`, `cd-media`, `fd-media`, `hd-media`, `ssh`, `telnet`) are enabled and reachable | No (`changed` is always `false`; `state` is accepted but always fails honestly) | Implemented |
+| [`asmb8_console`](docs/asmb8_console.md) | Open the iKVM console (IVTP) session headlessly: confirm the channel is live, or save one raw (undecoded) video frame | No (`changed` is always `false`) | Implemented, but **less proven than the other four** — see below |
 
-All five are named in `meta/runtime.yml`'s `asmb8_ikvm` action group and
+**Naming note.** `asmb8_console` is what `asmb8_redirection` used to be, before
+the first Galaxy release, when it opened a session under a name borrowed from
+the sibling `james_crowley.intel_amt` collection's `amt_redirection` module —
+which only reports and toggles service enablement and never opens a session
+at all. That mismatch was fixed by splitting the module in two, before
+publishing, specifically so it would never need fixing *after* publishing
+(renaming a module post-release is a breaking change). See
+[`docs/asmb8_redirection.md`](docs/asmb8_redirection.md)'s "Why this module
+exists" section for the full story.
+
+All six are named in `meta/runtime.yml`'s `asmb8_ikvm` action group and
 implemented. Set their shared connection options centrally with
 `module_defaults`:
 
@@ -537,7 +558,8 @@ collection warrants unusual care with credentials.
   [`docs/asmb8_power.md`](docs/asmb8_power.md),
   [`docs/asmb8_boot.md`](docs/asmb8_boot.md),
   [`docs/asmb8_media.md`](docs/asmb8_media.md),
-  [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md) — per-module
+  [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md),
+  [`docs/asmb8_console.md`](docs/asmb8_console.md) — per-module
   reference: options, return values, error classes, and examples.
 - [`docs/capability-matrix.md`](docs/capability-matrix.md) — exactly what is
   verified against real firmware evidence, what is only unit/mock-tested, and
