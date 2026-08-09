@@ -1,0 +1,124 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 1 (see README.md): read-only. Sends no credentials that
+# could be rejected and mutates no BMC-side state -- see the reasoning in
+# .circleci/config.yml's own comment on hardware-observe, which needs no
+# approval gate for exactly this reason.
+#
+# What this touches:
+#   - A bare TLS handshake against the web-management port, to observe (never
+#     to verify) the leaf certificate's SHA-256 fingerprint. No login. This is
+#     what lets an operator learn the value to pin, before being approved to
+#     do the thing the pin protects.
+#   - james_crowley.asmb8_ikvm.asmb8_info with include_web_session left at its
+#     default (false), so only IPMI facts are read -- no .asp session is
+#     created. See that option's own documentation for why creating one is a
+#     deliberate, opt-in exception this stage does not take.
+#   - james_crowley.asmb8_ikvm.asmb8_redirection, which never mutates and
+#     whose only network activity is a bare TCP connect-and-close per port.
+#
+# This is the job wired into .circleci/config.yml's hardware-observe.
+
+- name: "Hardware escalation 1: read-only observation"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: >-
+          ASMB8_HOST is not set. Export it (and ASMB8_USERNAME/ASMB8_PASSWORD)
+          before running this playbook by hand; in CI these come from the
+          restricted asmb8-lab context.
+
+    - name: Observe the web-management TLS certificate (no credentials sent)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/observe-tls-fingerprint.py"
+          - "{{ asmb8_host }}"
+          - "{{ asmb8_port }}"
+      register: tls_observation
+      changed_when: false
+      failed_when: false
+      when: asmb8_use_tls
+
+    - name: Show the observed TLS fingerprint
+      ansible.builtin.debug:
+        msg: "{{ tls_observation.stdout_lines }}"
+      when: asmb8_use_tls and tls_observation.stdout_lines is defined
+
+    - name: Read IPMI-only facts (no .asp session created)
+      block:
+        - name: Read IPMI-only facts
+          james_crowley.asmb8_ikvm.asmb8_info:
+            host: "{{ asmb8_host }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            ipmi_port: "{{ asmb8_ipmi_port }}"
+          no_log: true
+          register: asmb8
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              operation: "{{ ansible_failed_result.operation | default('(none reported)') }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_info failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+              See the redacted detail above.
+
+    - name: Require IPMI to be reachable
+      ansible.builtin.assert:
+        that:
+          - asmb8.asmb8.reachable
+        fail_msg: "asmb8_info reports {{ asmb8_host }} unreachable over IPMI."
+
+    - name: Probe every known service's TCP reachability
+      james_crowley.asmb8_ikvm.asmb8_redirection:
+        host: "{{ asmb8_host }}"
+        password: "{{ asmb8_password }}"
+      no_log: true
+      register: redirection
+
+    - name: Build the evidence document
+      ansible.builtin.set_fact:
+        observe_evidence:
+          ipmi: "{{ asmb8.asmb8 }}"
+          services: "{{ redirection.services }}"
+          tls_fingerprint_observed_lines: "{{ tls_observation.stdout_lines | default([]) | select('search', 'sha256:') | list }}"
+          note: >-
+            services[].reachable is live and this-run-only; services[].enabled/known
+            come from a static catalog -- see docs/asmb8_redirection.md.
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: "{{ observe_evidence | to_nice_json }}\n"
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-observe.json"
+        mode: "0600"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "IPMI reachable: {{ asmb8.asmb8.reachable }}"
+          - "Power state: {{ asmb8.asmb8.ipmi.power_state }}"
+          - "Boot device: {{ asmb8.asmb8.ipmi.boot_device }}"

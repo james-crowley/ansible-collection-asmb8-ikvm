@@ -13,9 +13,10 @@
 # verification sequence in CONTRIBUTING.md, and fix (or justify) whatever the
 # new version finds -- in the same pull request.
 #
-# Versions below are copied from james_crowley.intel_amt's current pins as a
-# starting point, not independently re-validated against this repository yet
-# (there are no plugins or tests here to lint against).
+# Versions below were copied from james_crowley.intel_amt's current pins as a
+# starting point and have since been exercised against this repository's own
+# plugins and tests -- see CONTRIBUTING.md and docs/testing.md for the lint
+# commands this file's tools actually run.
 #
 # Runtime and test-run dependencies live elsewhere and are NOT duplicated here:
 #   requirements.txt                    -- controller runtime (requests)

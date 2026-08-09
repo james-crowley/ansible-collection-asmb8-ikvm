@@ -1,0 +1,131 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Adapted from the sibling james_crowley.intel_amt collection's renovate.json -- same manager set, same reasoning. There is deliberately NO packageRule for cimg/python. The circleci manager is enabled (so a future orb or a literally-pinned image is picked up), but the one image reference this repository has is `cimg/python:<< parameters.python-version >>` -- a CircleCI parameter substitution, not a version string. Renovate cannot resolve it, so any rule targeting cimg/python would match nothing while reading as though the images were managed. The Python versions actually under test are the matrix lists in the `sanity` and `units` workflow entries, and widening those is a support-policy decision a human makes, exactly like ansible-core below."
+  ],
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "America/New_York",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "prConcurrentLimit": 3,
+  "labels": [
+    "dependencies"
+  ],
+  "commitMessagePrefix": "chore(deps):",
+  "enabledManagers": [
+    "pip_requirements",
+    "circleci",
+    "custom.regex"
+  ],
+  "pip_requirements": {
+    "description": "managerFilePatterns, not the deprecated fileMatch. Note the /.../ delimiters: managerFilePatterns treats a bare string as a MINIMATCH GLOB and only an explicitly delimited value as a regular expression, so dropping them here would silently stop matching (^ and \\. are not glob syntax). requirements-dev.txt is included because CI installs the linters from it, so a stale pin there is a stale pin in CI.",
+    "managerFilePatterns": [
+      "/^requirements\\.txt$/",
+      "/^requirements-dev\\.txt$/",
+      "/^tests/unit/requirements\\.txt$/",
+      "/^tests/integration/requirements\\.txt$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The single ansible-core pin used by the hardware qualification jobs -- the `install-hardware-venv` command in .circleci/config.yml, currently `ansible-core~=2.19.0`. This is the only ansible-core version Renovate can meaningfully manage here: the sanity and unit matrices are comma-separated LISTS of supported versions, not single pins, so there is no 'current version' for Renovate to bump. Widening or narrowing that support matrix is a deliberate policy decision no bot can make. matchStrings must match the pin's ACTUAL shape (a full version, not necessarily three-part) and must NOT match `ansible-core~=<< parameters.ansible-core-version >>.0` in the sanity and units jobs, which is a CircleCI parameter substitution rather than a version string -- the leading `\\d+` is what excludes it, so keep the value anchored to a digit.",
+      "managerFilePatterns": [
+        "/^\\.circleci/config\\.yml$/"
+      ],
+      "matchStrings": [
+        "ansible-core~=(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)*)"
+      ],
+      "depNameTemplate": "ansible-core",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": [
+        "ansible-core is the collection's compatibility contract, not an ordinary dependency. meta/runtime.yml declares a floor, the sanity/unit matrices enumerate versions, and the hardware jobs carry a single pin of their own. A bump here is a deliberate support-policy decision, so it gets its own PR and never automerges.",
+        "There is deliberately no allowedVersions cap: nothing about this collection's own runtime pins the hardware jobs' ansible-core below any particular ceiling the way the sibling collection's lab runner Python version once did. Confirm, on any bump, that the version this pin moves to still supports the Python `install-hardware-venv` actually runs on before merging -- see that command's own comment about the lab runner's interpreter, which is unverified as of this writing.",
+        "meta/runtime.yml's `requires_ansible: '>=2.17.0'` is a consumer-facing minimum, not a pin, and must not be dragged along to match the hardware pin. Raising it is a separate, far larger decision than choosing what the hardware jobs run on."
+      ],
+      "matchPackageNames": [
+        "ansible-core"
+      ],
+      "automerge": false,
+      "separateMajorMinor": true,
+      "separateMinorPatch": true,
+      "labels": [
+        "dependencies",
+        "ansible-core",
+        "needs-decision"
+      ],
+      "addLabels": [
+        "priority:high"
+      ],
+      "prBodyNotes": [
+        ":warning: Raising or dropping an ansible-core version is a support-policy change. Before merging, check: `meta/runtime.yml` requires_ansible floor; the sanity and unit matrices in `.circleci/config.yml`; whether `tests/sanity/ignore-*.txt` files need adding or removing; and whether the module boilerplate requirement changed (it changed incompatibly at 2.17). The hardware jobs are separately constrained by whatever Python `install-hardware-venv` actually finds on the `crowley/asmb8-runner` host."
+      ]
+    },
+    {
+      "description": "Runtime dependencies. Deliberately just requests and pyghmi -- see requirements.txt for why no other dependency is added (in particular, no community.general, even though pyghmi is also what its ipmi_power/ipmi_boot modules use). Patch and minor bumps are low risk and the unit suite covers both transports thoroughly.",
+      "matchFileNames": [
+        "requirements.txt"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": false,
+      "groupName": "runtime dependencies"
+    },
+    {
+      "description": "Test-only dependencies. Grouped and automerged on green CI, since a regression here can only break the test run, and the run is what gates it.",
+      "matchFileNames": [
+        "tests/unit/requirements.txt",
+        "tests/integration/requirements.txt"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "test dependencies",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Linters and release tooling, pinned exactly in requirements-dev.txt and installed by the lint job. Deliberately NOT automerged, unlike test dependencies: a new ruff or ansible-lint release routinely adds or widens rules, so the honest outcome of one of these bumps is often 'and here are the code changes it demands' -- which a bot cannot author. Grouped so it is one review a week rather than six.",
+      "matchFileNames": [
+        "requirements-dev.txt"
+      ],
+      "groupName": "dev tooling",
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "ci"
+      ]
+    }
+  ],
+  "ignorePaths": [
+    "changelogs/**",
+    "tests/output/**",
+    "tests/hardware/output/**",
+    "dist/**"
+  ],
+  "vulnerabilityAlerts": {
+    "labels": [
+      "security",
+      "priority:high"
+    ],
+    "schedule": [
+      "at any time"
+    ],
+    "automerge": false
+  },
+  "osvVulnerabilityAlerts": true
+}

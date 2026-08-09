@@ -1,0 +1,132 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 5 (see README.md): power-cycle the managed host over
+# IPMI. The MOST DESTRUCTIVE action in this workflow -- read PREFLIGHT.md
+# before approving hardware-reset-approval in CI.
+#
+# Requires the host to already be reporting `on` (matching this collection's
+# own README note: "never fan out a reset" -- this playbook targets exactly
+# one board and refuses to guess at a starting state). After the reset it
+# independently re-reads the boot-device override and asserts it reverted to
+# `default` -- this is the actual, falsifiable claim behind boot_once.yml
+# leaving an optical override armed rather than reading it back itself: only
+# a REAL reset can prove the override is genuinely one-time rather than
+# merely reported as such.
+#
+# This is the job wired into .circleci/config.yml's hardware-reset.
+
+- name: "Hardware escalation 5: power-cycle the host"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+  vars:
+    asmb8_reset_confirm_retries: 30
+    asmb8_reset_confirm_delay_seconds: 10
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: "ASMB8_HOST is not set."
+
+    - name: Read the boot-device override before the reset
+      james_crowley.asmb8_ikvm.asmb8_info:
+        host: "{{ asmb8_host }}"
+        username: "{{ asmb8_username }}"
+        password: "{{ asmb8_password }}"
+        ipmi_port: "{{ asmb8_ipmi_port }}"
+      no_log: true
+      register: before_reset
+
+    - name: Refuse to reset a host that is not already reporting on
+      ansible.builtin.assert:
+        that:
+          - before_reset.asmb8.ipmi.power_state.powerstate == 'on'
+        fail_msg: >-
+          Refusing to reset: the host reports powerstate={{
+          before_reset.asmb8.ipmi.power_state.powerstate }}, not 'on'. This
+          playbook only exercises the reset path, not power-on from off --
+          bring the host to 'on' first (james_crowley.asmb8_ikvm.asmb8_power
+          state=on) and re-run.
+
+    - name: Issue an immediate reset
+      block:
+        - name: Issue an immediate reset
+          james_crowley.asmb8_ikvm.asmb8_power:
+            host: "{{ asmb8_host }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            ipmi_port: "{{ asmb8_ipmi_port }}"
+            state: reset
+          no_log: true
+          register: reset_result
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              indeterminate: "{{ ansible_failed_result.indeterminate | default(false) }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_power state=reset failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+              See PREFLIGHT.md for the recovery path if the host is left in an
+              uncertain state.
+
+    - name: Poll for the host to come back to on after the reset
+      james_crowley.asmb8_ikvm.asmb8_info:
+        host: "{{ asmb8_host }}"
+        username: "{{ asmb8_username }}"
+        password: "{{ asmb8_password }}"
+        ipmi_port: "{{ asmb8_ipmi_port }}"
+      no_log: true
+      register: after_reset
+      until: after_reset.asmb8.ipmi.power_state.powerstate == 'on'
+      retries: "{{ asmb8_reset_confirm_retries }}"
+      delay: "{{ asmb8_reset_confirm_delay_seconds }}"
+
+    - name: Require the host to have come back on
+      ansible.builtin.assert:
+        that:
+          - after_reset.asmb8.ipmi.power_state.powerstate == 'on'
+        fail_msg: >-
+          The host did not report powerstate=on within {{
+          asmb8_reset_confirm_retries * asmb8_reset_confirm_delay_seconds }}
+          seconds of the reset. See PREFLIGHT.md.
+
+    - name: Report whether the one-time boot override reverted to default
+      ansible.builtin.debug:
+        msg: >-
+          Boot device after reset: {{ after_reset.asmb8.ipmi.boot_device }}.
+          {{ 'Reverted to default -- one-time semantics confirmed.'
+             if after_reset.asmb8.ipmi.boot_device.bootdev == 'default'
+             else 'Did NOT revert to default -- see boot_once.yml and this '
+                  + 'collection docs/hardware-evidence-2026-08-08.md for the '
+                  + 'one-time-override claim this is meant to confirm.' }}
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: >-
+          {{ {'before_reset_boot_device': before_reset.asmb8.ipmi.boot_device,
+              'reset': reset_result.operation,
+              'after_reset_boot_device': after_reset.asmb8.ipmi.boot_device,
+              'boot_override_reverted_to_default': (after_reset.asmb8.ipmi.boot_device.bootdev == 'default'),
+              'note': "before_reset/after_reset compare pyghmi get_bootdev()'s reported override only."}
+             | to_nice_json }}
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-reset.json"
+        mode: "0600"

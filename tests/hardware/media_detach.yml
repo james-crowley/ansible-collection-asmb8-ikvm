@@ -1,0 +1,101 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Guaranteed cleanup half of hardware escalation 3 -- see media_attach.yml's
+# header. Run as a SEPARATE ansible-playbook invocation, with `when: always`,
+# by .circleci/config.yml's hardware-media-attach job, specifically so a
+# crashed, cancelled, or timed-out attach step still gets a detach attempt.
+#
+# Reads the session id media_attach.yml (or its own rescue block, on a failed
+# attach) wrote to disk, rather than taking one as a parameter -- the whole
+# point is that this playbook must be able to find the session even when the
+# process that opened it is long gone.
+#
+# Safe to run with nothing to clean up: if no session id file exists, this is
+# a deliberate, quiet no-op, not a failure -- covers both "attach never got
+# far enough to record one" and "this playbook already ran once for this job".
+
+- name: "Hardware escalation 3 cleanup: detach test media"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+  vars:
+    asmb8_media_scratch_dir: "{{ asmb8_output_dir }}/media"
+    asmb8_session_id_file: "{{ asmb8_media_scratch_dir }}/session-id.txt"
+
+  tasks:
+    - name: Check whether a session id was recorded
+      ansible.builtin.stat:
+        path: "{{ asmb8_session_id_file }}"
+      register: session_id_file_stat
+
+    - name: Nothing to detach
+      ansible.builtin.debug:
+        msg: "No session id file at {{ asmb8_session_id_file }}; nothing to detach."
+      when: not session_id_file_stat.stat.exists
+
+    - name: Detach the recorded session
+      when: session_id_file_stat.stat.exists
+      block:
+        - name: Read the recorded session id
+          ansible.builtin.set_fact:
+            asmb8_media_session_id: "{{ lookup('ansible.builtin.file', asmb8_session_id_file) | trim }}"
+
+        - name: Detach the virtual CD-ROM session
+          block:
+            - name: Detach the virtual CD-ROM session
+              james_crowley.asmb8_ikvm.asmb8_media:
+                host: "{{ asmb8_host }}"
+                port: "{{ asmb8_port }}"
+                username: "{{ asmb8_username }}"
+                password: "{{ asmb8_password }}"
+                use_tls: "{{ asmb8_use_tls }}"
+                allow_insecure_transport: "{{ asmb8_allow_insecure }}"
+                tls_fingerprint: "{{ asmb8_tls_fingerprint if asmb8_use_tls else omit }}"
+                state: detached
+                session_id: "{{ asmb8_media_session_id }}"
+              no_log: true
+              register: detach_result
+          rescue:
+            - name: Report the redacted failure detail
+              ansible.builtin.debug:
+                msg:
+                  error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+                  message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+            - name: Fail with the error class in the summary line
+              ansible.builtin.fail:
+                msg: >-
+                  asmb8_media detach failed with
+                  error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+                  See the redacted detail above. The BMC cold reset
+                  (ipmitool mc reset cold) escape hatch is documented in
+                  README.md if this leaves the media slot stuck.
+
+        - name: Remove the recorded session id file
+          ansible.builtin.file:
+            path: "{{ asmb8_session_id_file }}"
+            state: absent
+
+        - name: Ensure the evidence output directory exists
+          ansible.builtin.file:
+            path: "{{ asmb8_output_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: Record evidence for this run
+          ansible.builtin.copy:
+            content: >-
+              {{ {'changed': detach_result.changed,
+                  'session_state': detach_result.session_state,
+                  'operation': detach_result.operation} | to_nice_json }}
+            dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-media_detach.json"
+            mode: "0600"
+
+        - name: Summary
+          ansible.builtin.debug:
+            msg: "Detached (changed={{ detach_result.changed }}), session_state: {{ detach_result.session_state }}"

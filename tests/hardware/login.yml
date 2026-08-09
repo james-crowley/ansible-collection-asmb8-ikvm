@@ -1,0 +1,86 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 2 (see README.md): BMC login. Escalates past observe.yml
+# because POST /rpc/WEBSES/create.asp creates real BMC-side session state --
+# see james_crowley.asmb8_ikvm.asmb8_info's include_web_session option, which
+# is the deliberate, opt-in exception this playbook takes.
+#
+# Failure mode this collection specifically guards against: this BMC answers a
+# REJECTED login with HTTP 200, not a 4xx/5xx -- the actual signal is a
+# Failure_Login_* marker inside the SESSION_COOKIE value (see
+# plugins/module_utils/asp.py and docs/hardware-evidence-2026-08-08.md). A
+# check that only looked at HTTP status would treat a wrong password as a
+# successful login. This playbook does not re-implement that check -- it
+# relies on asmb8_info/AspClient.login() already doing it, and simply asserts
+# on the module's own result.
+#
+# This is the job wired into .circleci/config.yml's hardware-login.
+
+- name: "Hardware escalation 2: BMC login"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: "ASMB8_HOST is not set."
+
+    - name: Log in to the .asp web-management session and read diagnostic state
+      block:
+        - name: Log in to the .asp web-management session and read diagnostic state
+          james_crowley.asmb8_ikvm.asmb8_info:
+            host: "{{ asmb8_host }}"
+            port: "{{ asmb8_port }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            use_tls: "{{ asmb8_use_tls }}"
+            allow_insecure_transport: "{{ asmb8_allow_insecure }}"
+            tls_fingerprint: "{{ asmb8_tls_fingerprint if asmb8_use_tls else omit }}"
+            include_web_session: true
+          no_log: true
+          register: asmb8
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              operation: "{{ ansible_failed_result.operation | default('(none reported)') }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_info (include_web_session=true) failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+              A rejected login surfaces here as error_class=authentication, never as
+              a bare HTTP status -- see this playbook's own header.
+
+    - name: Require the login to have actually succeeded
+      ansible.builtin.assert:
+        that:
+          - asmb8.asmb8.web_management.logged_in
+        fail_msg: "asmb8_info reported success but web_management.logged_in was not true."
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: "{{ {'web_management': asmb8.asmb8.web_management, 'capabilities': asmb8.asmb8.capabilities} | to_nice_json }}\n"
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-login.json"
+        mode: "0600"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Logged in: {{ asmb8.asmb8.web_management.logged_in }}"

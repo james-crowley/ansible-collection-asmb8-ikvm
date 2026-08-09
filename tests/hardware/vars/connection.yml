@@ -1,0 +1,46 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Shared BMC connection variables for every tests/hardware/*.yml playbook.
+#
+# Contains no secrets: every value below is a lookup against the process
+# environment, resolved at run time -- never a literal. On CircleCI these come
+# from the restricted `asmb8-lab` context (see .circleci/config.yml's
+# `verify-hardware-credentials` command, which checks the same variable names
+# before any playbook here runs); for a manual run, export them in your own
+# shell first.
+#
+# There is deliberately no rendered tests/hardware/inventory.yml the way the
+# sibling james_crowley.intel_amt collection has one. That collection's lab
+# grew to several machines, which is what an inventory group buys you; this
+# collection manages exactly one board today (see README.md "Project
+# status"), and every playbook here targets `hosts: localhost` with
+# `connection: local` and reads its target's address straight out of this
+# file. `hardware-limit` in .circleci/config.yml is still wired for the day a
+# second board is added, at which point this file is the thing that would
+# grow a real per-host inventory -- see tests/hardware/README.md.
+asmb8_host: "{{ lookup('ansible.builtin.env', 'ASMB8_HOST') }}"
+asmb8_username: "{{ lookup('ansible.builtin.env', 'ASMB8_USERNAME') | default('admin', true) }}"
+asmb8_password: "{{ lookup('ansible.builtin.env', 'ASMB8_PASSWORD') }}"
+asmb8_port: "{{ lookup('ansible.builtin.env', 'ASMB8_PORT') | default('443', true) | int }}"
+asmb8_cd_port: "{{ lookup('ansible.builtin.env', 'ASMB8_CD_PORT') | default('5120', true) | int }}"
+asmb8_kvm_port: "{{ lookup('ansible.builtin.env', 'ASMB8_KVM_PORT') | default('7578', true) | int }}"
+asmb8_ipmi_port: "{{ lookup('ansible.builtin.env', 'ASMB8_IPMI_PORT') | default('623', true) | int }}"
+
+# Trust policy, computed rather than looked up twice: a reviewed fingerprint
+# selects TLS pinning; its absence falls back to plaintext, and only when the
+# operator has explicitly acknowledged that with ASMB8_ALLOW_INSECURE=true.
+# This mirrors the collection's own README rule that a trust decision is
+# never implicit -- verify-hardware-credentials already refuses to let a job
+# reach this file's consumers without one or the other being satisfied.
+asmb8_tls_fingerprint: "{{ lookup('ansible.builtin.env', 'ASMB8_TLS_FINGERPRINT') | default('', true) }}"
+asmb8_allow_insecure: "{{ (lookup('ansible.builtin.env', 'ASMB8_ALLOW_INSECURE') | default('false', true)) | bool }}"
+asmb8_use_tls: "{{ asmb8_tls_fingerprint | length > 0 }}"
+
+# Where each playbook writes its JSON evidence, and the file basename every
+# evidence file is prefixed with. Single board today, so a fixed name rather
+# than an inventory_hostname -- see the module docstring above.
+asmb8_output_dir: "{{ playbook_dir }}/output"
+asmb8_evidence_name: asmb8-board

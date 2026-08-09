@@ -1,0 +1,106 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 4 (see README.md): arm a one-time IPMI boot-device
+# override. Escalates past media_attach.yml because this changes real BMC
+# state -- IPMI's one-shot boot-flag bit -- even though it does not yet power-
+# cycle anything.
+#
+# Deliberately arms `device: optical` and leaves it armed: reset.yml (the
+# very next job in the chain) power-cycles the host and independently
+# confirms the override reverted to `default` afterwards, which is the actual
+# one-time-semantics claim this collection makes (see README.md's "Project
+# status" -- "confirmation that it reverted to default after the following
+# reset"). Nothing here uses `persistent: true`; asmb8_boot refuses that
+# outright regardless.
+#
+# This is the job wired into .circleci/config.yml's hardware-boot-once.
+
+- name: "Hardware escalation 4: arm a one-time boot-device override"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: "ASMB8_HOST is not set."
+
+    - name: Read the boot-device override before this run, in check mode (never mutates)
+      james_crowley.asmb8_ikvm.asmb8_boot:
+        host: "{{ asmb8_host }}"
+        username: "{{ asmb8_username }}"
+        password: "{{ asmb8_password }}"
+        ipmi_port: "{{ asmb8_ipmi_port }}"
+        device: default
+      no_log: true
+      register: before
+      check_mode: true
+
+    - name: Arm a one-time optical boot override
+      block:
+        - name: Arm a one-time optical boot override
+          james_crowley.asmb8_ikvm.asmb8_boot:
+            host: "{{ asmb8_host }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            ipmi_port: "{{ asmb8_ipmi_port }}"
+            device: optical
+          no_log: true
+          register: armed
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_boot failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+
+    - name: Independently confirm the override took effect
+      james_crowley.asmb8_ikvm.asmb8_info:
+        host: "{{ asmb8_host }}"
+        username: "{{ asmb8_username }}"
+        password: "{{ asmb8_password }}"
+        ipmi_port: "{{ asmb8_ipmi_port }}"
+      no_log: true
+      register: confirmed
+
+    - name: Require the confirmation read to show the optical override
+      ansible.builtin.assert:
+        that:
+          - confirmed.asmb8.ipmi.boot_device.bootdev == 'optical'
+        fail_msg: >-
+          asmb8_boot reported the override armed, but an independent
+          asmb8_info read shows boot_device={{ confirmed.asmb8.ipmi.boot_device }}.
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: >-
+          {{ {'previous': before.previous,
+              'armed': armed.operation,
+              'confirmed_boot_device': confirmed.asmb8.ipmi.boot_device,
+              'note': 'Left armed deliberately -- reset.yml confirms the revert to default after a power cycle.'}
+             | to_nice_json }}
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-boot_once.json"
+        mode: "0600"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Armed device={{ armed.device }} uefi={{ armed.uefi }}; confirmed boot_device={{ confirmed.asmb8.ipmi.boot_device }}"

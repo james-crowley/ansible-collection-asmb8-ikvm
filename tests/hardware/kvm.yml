@@ -1,0 +1,97 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 6 (see README.md): open the IVTP KVM/console-redirection
+# channel. LAST job in the chain, downstream of reset.yml.
+#
+# capture=handshake_only only -- this playbook does not attempt raw_frame
+# capture. Per docs/capability-matrix.md Tier 4, asmb8_console and
+# plugins/module_utils/ivtp.py are the one module and module_utils file in
+# this collection with ZERO live-hardware evidence and zero unit/mock test
+# coverage of the handshake state machine: everything they do is sourced from
+# decompiled vendor client analysis alone, including at least one specific
+# wire-format detail flagged in ivtp.py's own module docstring as unverified
+# against real hardware. This playbook is exactly what would move that from
+# "sourced from decompilation" to "confirmed against real firmware" -- but
+# only once it is actually run against the board, which it has not been. A
+# passing run here would be genuinely new evidence, not a formality.
+#
+# This is the job wired into .circleci/config.yml's hardware-kvm.
+
+- name: "Hardware escalation 6: open the KVM/console channel"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: "ASMB8_HOST is not set."
+
+    - name: Open the KVM channel and confirm the handshake
+      block:
+        - name: Open the KVM channel and confirm the handshake
+          james_crowley.asmb8_ikvm.asmb8_console:
+            host: "{{ asmb8_host }}"
+            port: "{{ asmb8_port }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            use_tls: "{{ asmb8_use_tls }}"
+            allow_insecure_transport: "{{ asmb8_allow_insecure }}"
+            tls_fingerprint: "{{ asmb8_tls_fingerprint if asmb8_use_tls else omit }}"
+            kvm_port: "{{ asmb8_kvm_port }}"
+            capture: handshake_only
+          no_log: true
+          register: kvm_result
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_console failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+              A bmc_busy here means all 4 KVM session slots are already held
+              (see docs/asmb8_console.md); anything else is a genuinely new
+              hardware finding worth recording, not a formality -- this is
+              this collection's first-ever hardware exercise of this channel.
+
+    - name: Require the session to have been accepted and validated
+      ansible.builtin.assert:
+        that:
+          - kvm_result.channel.session_accepted
+          - kvm_result.channel.validate_status_name == 'valid_session'
+        fail_msg: >-
+          The IVTP handshake completed without raising, but channel facts
+          were {{ kvm_result.channel }} -- see docs/protocol-notes.md and
+          plugins/module_utils/ivtp.py for the expected shape.
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: >-
+          {{ {'channel': kvm_result.channel,
+              'operation': kvm_result.operation,
+              'note': 'First hardware exercise of the IVTP handshake -- see docs/capability-matrix.md Tier 4.'}
+             | to_nice_json }}
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-kvm.json"
+        mode: "0600"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "session_accepted: {{ kvm_result.channel.session_accepted }}; validate_status_name: {{ kvm_result.channel.validate_status_name }}"

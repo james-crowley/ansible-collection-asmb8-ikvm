@@ -1,0 +1,134 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Hardware escalation 3 (see README.md): attach a small local ISO to the BMC's
+# virtual CD-ROM over iUSB. Escalates past login.yml because this opens a real
+# iUSB session against the target hardware.
+#
+# ALWAYS paired with media_detach.yml in .circleci/config.yml's
+# hardware-media-attach job, with the detach step running `when: always`. This
+# board's cd-media service permits exactly ONE active session, board-wide,
+# with NO server-side timeout to reclaim an abandoned one (see
+# docs/hardware-evidence-2026-08-08.md) -- a crashed or cancelled run of this
+# playbook without a guaranteed detach afterwards would wedge the board's only
+# media slot for every future job and every human until a physical/BMC reset.
+# This playbook writes the session id to disk specifically so
+# media_detach.yml, run as a separate ansible-playbook invocation in the same
+# job, can find and stop the same session even if this playbook's own process
+# is what failed.
+#
+# This is the job wired into .circleci/config.yml's hardware-media-attach.
+
+- name: "Hardware escalation 3: attach test media over iUSB"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/connection.yml
+  vars:
+    asmb8_media_scratch_dir: "{{ asmb8_output_dir }}/media"
+    asmb8_session_id_file: "{{ asmb8_media_scratch_dir }}/session-id.txt"
+    asmb8_test_iso_path: "{{ lookup('ansible.builtin.env', 'ASMB8_TEST_ISO_PATH') | default(asmb8_media_scratch_dir + '/asmb8-test.iso', true) }}"
+
+  tasks:
+    - name: Require ASMB8_HOST to be set
+      ansible.builtin.assert:
+        that:
+          - asmb8_host | length > 0
+        fail_msg: "ASMB8_HOST is not set."
+
+    - name: Ensure the media scratch directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_media_scratch_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Provision the local test ISO (no request to the BMC; fetches from boot.ipxe.org)
+      ansible.builtin.command:
+        argv:
+          - "{{ playbook_dir }}/make-test-media.sh"
+          - "{{ asmb8_test_iso_path }}"
+        creates: "{{ asmb8_test_iso_path }}"
+
+    - name: Attach the test ISO to the virtual CD-ROM over iUSB
+      block:
+        - name: Attach the test ISO to the virtual CD-ROM over iUSB
+          james_crowley.asmb8_ikvm.asmb8_media:
+            host: "{{ asmb8_host }}"
+            port: "{{ asmb8_port }}"
+            username: "{{ asmb8_username }}"
+            password: "{{ asmb8_password }}"
+            use_tls: "{{ asmb8_use_tls }}"
+            allow_insecure_transport: "{{ asmb8_allow_insecure }}"
+            tls_fingerprint: "{{ asmb8_tls_fingerprint if asmb8_use_tls else omit }}"
+            cd_port: "{{ asmb8_cd_port }}"
+            state: attached
+            image: "{{ asmb8_test_iso_path }}"
+          no_log: true
+          register: media_result
+      rescue:
+        - name: Report the redacted failure detail
+          ansible.builtin.debug:
+            msg:
+              error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+              indeterminate: "{{ ansible_failed_result.indeterminate | default(false) }}"
+              message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+
+        # A session may still have been recorded even on a failed attach (see
+        # asmb8_media's attach_timeout documentation: the session is not torn
+        # down on an unconfirmed attach, because it may simply be slow). Save
+        # whatever session_id the failure itself reports, so media_detach.yml
+        # can still find and stop it.
+        - name: Persist any session id the failure itself reported
+          ansible.builtin.copy:
+            content: "{{ ansible_failed_result.session_id }}"
+            dest: "{{ asmb8_session_id_file }}"
+            mode: "0600"
+          when: ansible_failed_result.session_id is defined
+
+        - name: Fail with the error class in the summary line
+          ansible.builtin.fail:
+            msg: >-
+              asmb8_media attach failed with
+              error_class={{ ansible_failed_result.error_class | default('unknown') }}.
+              See the redacted detail above. media_detach.yml still runs next
+              (when: always in .circleci/config.yml) to clean up.
+
+    - name: Require the session to have actually attached
+      ansible.builtin.assert:
+        that:
+          - media_result.session_state == 'attached'
+        fail_msg: >-
+          asmb8_media reported success but session_state was
+          {{ media_result.session_state }}, not 'attached'.
+
+    - name: Persist the session id for media_detach.yml
+      ansible.builtin.copy:
+        content: "{{ media_result.session_id }}"
+        dest: "{{ asmb8_session_id_file }}"
+        mode: "0600"
+
+    - name: Ensure the evidence output directory exists
+      ansible.builtin.file:
+        path: "{{ asmb8_output_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Record evidence for this run
+      ansible.builtin.copy:
+        content: >-
+          {{ {'session_state': media_result.session_state,
+              'bytes_read': media_result.bytes_read,
+              'reclaimed_sessions': media_result.reclaimed_sessions,
+              'operation': media_result.operation} | to_nice_json }}
+        dest: "{{ asmb8_output_dir }}/{{ asmb8_evidence_name }}-media_attach.json"
+        mode: "0600"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "session_id: {{ media_result.session_id }}"
+          - "session_state: {{ media_result.session_state }}"
+          - "bytes_read so far: {{ media_result.bytes_read }}"

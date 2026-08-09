@@ -14,9 +14,14 @@ Three tiers, in increasing cost and risk:
 | Mock integration | local mock `.asp`/iUSB servers | every push | none |
 | Hardware-in-the-loop | a real ASMB8-iKVM board | self-hosted runner, opt-in | **power-cycles hardware, attaches virtual media, opens a live KVM channel** |
 
-The hardware tier's playbooks (`tests/hardware/*.yml`) do not exist yet —
-only a `tests/hardware/.keep` placeholder is committed — so today only the
-first two tiers actually run anywhere. See
+The hardware tier's playbooks (`tests/hardware/*.yml`) now exist — see
+[`tests/hardware/README.md`](../tests/hardware/README.md) for the escalation
+chain and [`tests/hardware/PREFLIGHT.md`](../tests/hardware/PREFLIGHT.md) for
+the two riskiest jobs — but **none of them have ever actually run against
+real hardware**. Building the playbooks closes the gap between what
+`.circleci/config.yml` names and what is committed; it does not, by itself,
+close the gap between "this collection's own understanding of the protocol"
+and "confirmed against real firmware". See
 [`docs/capability-matrix.md`](capability-matrix.md) Tier 4 for what that means
 for this collection's confidence level.
 
@@ -299,12 +304,13 @@ server-side timeout to reclaim it, so a crashed or cancelled attach step
 would otherwise wedge the board's only media slot for every future job (and
 every human) until a physical/BMC reset.
 
-**None of these hardware playbooks (`tests/hardware/*.yml`) exist yet.** The
-workflow is wired exactly as it will run once they land — the same pattern
-`integration-mock` uses ahead of its own mock servers — but every hardware job
-above is presently unreachable in practice for a reason beyond the approval
-gates: there is nothing at those paths to run. See
-[`docs/capability-matrix.md`](capability-matrix.md) Tier 4.
+**Every hardware playbook (`tests/hardware/*.yml`) this workflow names now
+exists** — see [`tests/hardware/README.md`](../tests/hardware/README.md).
+What has not changed is that **none of them have ever been triggered against
+real hardware**: `run-hardware-tests` still defaults to `false`, and every
+escalation is still behind its own manual approval. See
+[`docs/capability-matrix.md`](capability-matrix.md) Tier 4 for exactly what
+that does and does not establish.
 
 ## Documented traps (see `CONTRIBUTING.md` for the full list)
 

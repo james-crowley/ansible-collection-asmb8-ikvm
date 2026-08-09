@@ -15,81 +15,109 @@ Expect an acknowledgement within a week. There is no bug bounty.
 ## Why this collection warrants unusual care
 
 A BMC (baseboard management controller) is a management processor that runs
-**beneath the operating system**. It is powered whenever the machine has power
-(or has standby power), it is reachable when the host OS is off, and it cannot
-be observed or restricted by anything the host OS runs. Practically:
+**beneath the operating system**. It is powered whenever the machine has
+power (or standby power), it is reachable when the host OS is off, and it
+cannot be observed or restricted by anything the host OS runs. Practically:
 
-**ASMB8 admin credentials are equivalent to physical access to the machine.**
-Someone holding them can power it on or off, force a boot device override over
-IPMI, and — once the virtual-media path works — boot it from media of their
-choosing, regardless of what the installed operating system wants. Treat a
-leaked BMC password as you would treat handing over the machine.
+**ASMB8-iKVM admin credentials are equivalent to physical access to the
+machine.** Someone holding them can power it on or off, force a boot-device
+override over IPMI, and — with `asmb8_media` — boot it from media of their
+own choosing, regardless of what the installed operating system wants. Treat
+a leaked BMC password as you would treat handing over the machine.
 
 Two things about this collection's design deserve specific attention while it
-is still pre-1.0.
+is still pre-1.0 and not hardware-qualified (see
+[`docs/capability-matrix.md`](docs/capability-matrix.md)).
 
-### The iUSB virtual-media protocol is proprietary and undocumented
+### The iUSB virtual-media protocol is proprietary, undocumented, and reverse engineered
 
-AMI's iUSB protocol, which the (not yet implemented) `asmb8_media` module is
-meant to speak, has no public specification. This collection's implementation
-is being built by reverse engineering, informed in part by a third-party Go
-reference client (`BadCoder1337/rd450x-console`, MIT-licensed — see
-[`licenses/MIT.txt`](licenses/MIT.txt)) rather than from vendor documentation.
+AMI's iUSB protocol, which `asmb8_media` speaks, has no public specification.
+This collection's implementation was built by reverse engineering — a
+third-party Go reference client (`BadCoder1337/rd450x-console`,
+MIT-licensed), an older Lua/Python artifact for a different device class, and
+a local, non-redistributed decompilation of the vendor's own JViewer client
+retrieved from the target hardware — not from vendor documentation. See
+[NOTICE](NOTICE) for the full, per-file provenance accounting.
 
-That has a direct security consequence: until real hardware evidence says
-otherwise, **no claim in this document about the iUSB channel's authentication
-or confidentiality properties should be taken as verified.**
+That has a direct security consequence, stated in
+[`docs/protocol-notes.md`](docs/protocol-notes.md) and
+[`docs/capability-matrix.md`](docs/capability-matrix.md) Tier 4 as well:
+**no claim about the iUSB channel's authentication or confidentiality
+properties beyond what riding on top of the `.asp` web session provides has
+been independently verified.** The session token (`-kvmtoken`) is minted by
+the same login that authenticates the `.asp` surface; whether the iUSB socket
+itself adds any further authentication or confidentiality guarantee of its
+own is not measured either way.
 
-<!-- TODO: fill in once the protocol is characterised against real hardware —
-     does the iUSB session carry its own authentication independent of the
-     BMC web session, is traffic ever encrypted, can a session be hijacked by
-     an on-path party. Do not guess at these; leave the TODO until there is
-     evidence. -->
+### The factory TLS certificate can never be chain-validated on this board
 
-### Transport is plaintext by default on this board
+The target board's factory certificate is self-signed **and already
+expired** (validity 2016-06-01 to 2026-05-30 — see
+[`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)).
+`ca_path`/`validate_certs=true` chain validation cannot succeed against it
+under any circumstances; `tls_fingerprint` (SHA-256 leaf pinning) is the only
+trust mode that actually works without replacing the certificate on the BMC.
 
-This board is normally run in a plaintext, single-port management mode rather
-than with TLS on a separate port. Concretely: credentials and virtual-media
-traffic should be assumed to cross the network unencrypted and recoverable by
-an on-path attacker unless and until this collection's documentation says
-otherwise with evidence. Put the BMC on an isolated management network segment,
-the same advice given for IPMI generally.
+Plaintext HTTP is reachable, but only when the caller sets **both**
+`use_tls: false` and `allow_insecure_transport: true` — never selected
+implicitly, and this collection will not probe for TLS and silently fall
+back. When plaintext is used, the session cookie and the iUSB/KVM media
+token cross the network recoverable by an on-path attacker; only use it on
+an isolated management VLAN.
 
-### Power and boot control wrap IPMI, not a purpose-built implementation
+If you find a path that downgrades transport or skips a configured trust
+check without that explicit acknowledgement, that is a vulnerability.
 
-`asmb8_power` and `asmb8_boot` are planned to wrap
-`community.general.ipmi_power` / `ipmi_boot` rather than reimplement IPMI. This
-collection inherits whatever security properties (and limitations) those
-modules and the underlying `ipmitool`/IPMI protocol have; it does not add or
-remove authentication guarantees on that path.
+### Power and boot control wrap `pyghmi` directly, not `community.general`
+
+`asmb8_power`, `asmb8_boot`, and `asmb8_info`'s IPMI facts call `pyghmi`
+directly rather than wrapping `community.general.ipmi_power`/`ipmi_boot` —
+see `galaxy.yml`'s empty `dependencies` and the top-level `README.md`'s
+"Requirements" section for why. This collection inherits whatever security
+properties (and limitations) `pyghmi` and the underlying IPMI 2.0/RMCP+
+protocol have; it does not add or remove authentication guarantees on that
+path, and `asmb8_boot` refuses persistent (beyond-next-boot) boot-order
+changes outright regardless of what is asked for.
 
 ## Credential handling
 
-TODO: once `plugins/module_utils/errors.py` and the connection doc fragment
-exist, this section should state, and be kept honest about, at minimum:
+Report anything that contradicts the following, as each is intended
+behaviour:
 
-- whether `password` is `no_log` in every module argument spec;
-- whether every user-visible message and diagnostic passes through a
-  redaction layer that strips passwords, `Authorization` headers, and similar
-  secrets;
-- whether credentials are ever written to operation receipts, facts, or state
-  files (they should not be);
-- what file mode any session state file is created with.
-
-This section is deliberately left as a checklist rather than a set of
-assertions, because none of that code exists yet and this document must not
-claim behaviour that has not been implemented.
+- `password` is `no_log` in every module's argument spec.
+- Every user-visible message and diagnostic passes through the redaction
+  layer in `plugins/module_utils/errors.py`'s `redact()`, which strips
+  `Authorization`/`Cookie` headers, this BMC's own secret-shaped field names
+  (`SESSION_COOKIE`, `WEBVAR_PASSWORD`, `kvmtoken`, `webcookie`, `STOKEN`),
+  generic `password=`/`token=`-shaped text, and bounds excerpt length.
+- Credentials, session cookies, and iUSB/KVM tokens are never written to
+  operation receipts, facts, or the `asmb8_media` session state file — see
+  `plugins/module_utils/models.py`'s `OperationReceipt`/`JnlpSession`.
+- `asmb8_media` spawns its long-lived background session by forking, not by
+  `subprocess`/`exec`, so credentials cross into it as in-memory values and
+  never appear in `argv` or the process environment where other local users
+  could read them.
+- Session state files under `runtime_dir` are created mode `0600`;
+  `runtime_dir` itself is created mode `0700`.
+- Hardware qualification evidence is redacted before CI publishes it.
+  CircleCI masks context values in **log output only** — masking does not
+  extend to `store_artifacts` content — so `tests/hardware/redact-evidence.py`
+  runs immediately before every `store_artifacts` of
+  `tests/hardware/output`, and the published artifact must be safe
+  regardless of the project's artifact visibility setting. See
+  [`tests/hardware/README.md`](tests/hardware/README.md#evidence-redaction).
 
 ## Scope
 
-In scope: this collection's Python code, its role, and any CI configuration in
-this repository.
+In scope: this collection's Python code, its roles, and any CI configuration
+in this repository.
 
 Out of scope: vulnerabilities in the ASMB8's own MegaRAC firmware itself
-(report those to ASUS), in `ansible-core`, in `requests`, or in
-`community.general` (the IPMI modules this collection wraps).
+(report those to ASUS/American Megatrends), in `ansible-core`, in
+`requests`, or in `pyghmi`.
 
 ## Supported versions
 
-Pre-1.0. Only the latest commit on `main` receives fixes; there are no
-maintained release branches yet.
+Pre-1.0 and not hardware-qualified (see `docs/capability-matrix.md`). Only
+the latest commit on `main` receives fixes; there are no maintained release
+branches yet.

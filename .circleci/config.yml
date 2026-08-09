@@ -461,14 +461,13 @@ jobs:
   # approval is meant to protect. It still only runs on main, and still needs
   # the restricted asmb8-lab context for ASMB8_HOST.
   #
-  # TODO (pending): tests/hardware/observe.yml does not exist yet -- only a
-  # tests/hardware/.keep placeholder is committed. This job (and every
-  # hardware-* job below) is wired exactly as it should run once the hardware
-  # test playbooks land, the same way integration-mock above is wired ahead of
-  # its mock servers. That is safe today because run-hardware-tests defaults
-  # to false and the whole hardware workflow additionally sits behind
-  # per-escalation approvals, a branches-only-main filter, and the restricted
-  # asmb8-lab context -- see the workflow at the bottom of this file.
+  # tests/hardware/observe.yml (and every playbook every hardware-* job below
+  # invokes) now exists -- see tests/hardware/README.md for the escalation
+  # chain. None of them have ever actually run against real hardware:
+  # run-hardware-tests still defaults to false, and the whole hardware
+  # workflow additionally sits behind per-escalation approvals, a
+  # branches-only-main filter, and the restricted asmb8-lab context -- see the
+  # workflow at the bottom of this file.
   hardware-observe:
     machine: true
     resource_class: crowley/asmb8-runner

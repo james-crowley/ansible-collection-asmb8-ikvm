@@ -288,8 +288,12 @@ documentation pass adds from reading the code against that evidence.
   [SECURITY.md](../SECURITY.md).
 - **Hardware-in-the-loop CI.** `.circleci/config.yml`'s `hardware` workflow
   (observe → login → media-attach → boot-once → reset → kvm, each behind its
-  own approval gate) is fully wired but has never actually run — every
-  hardware playbook it invokes (`tests/hardware/*.yml`) does not exist yet;
-  only a `tests/hardware/.keep` placeholder is committed. Everything in Tier 3
-  above came from a manual, one-off session against the lab board, not from
-  this pipeline.
+  own approval gate) is fully wired, and every hardware playbook it invokes
+  (`tests/hardware/*.yml`) now exists and is `ansible-playbook --syntax-check`
+  and `ansible-lint` clean — see `tests/hardware/README.md`. **It has never
+  actually run against real hardware.** Building the playbooks is necessary
+  for this pipeline to ever produce evidence, but it is not itself evidence:
+  everything in Tier 3 above still came from a manual, one-off session
+  against the lab board, not from this pipeline. A future run of this
+  workflow is what would move `asmb8_console`/`ivtp.py` in particular (see
+  below) out of "zero live-hardware evidence".
