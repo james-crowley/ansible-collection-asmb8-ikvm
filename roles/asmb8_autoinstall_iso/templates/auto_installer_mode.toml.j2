@@ -1,26 +1,46 @@
-{# Copyright (c) 2026 Jim Crowley                                            #}
-{# GNU General Public License v3.0 or later                                 #}
-{# SPDX-License-Identifier: GPL-3.0-or-later                                #}
-{#                                                                          #}
-{# Only used by the container/xorriso FALLBACK path                        #}
-{# (tasks/prepare_with_container.yml). When proxmox-auto-install-assistant  #}
-{# itself runs (the preferred path), it writes this file inside the ISO    #}
-{# itself and this template is never rendered.                            #}
-{#                                                                          #}
-{# UNVERIFIED byte-for-byte: reconstructed from public inspection of       #}
-{# proxmox-auto-install-assistant's AutoInstSettings struct (mode,          #}
-{# partition_label, http.{url,cert_fingerprint,token}), serialised with    #}
-{# `toml::to_string_pretty`, NOT from a captured real output file. The     #}
-{# grub.cfg on a stock Proxmox VE ISO only checks that this file EXISTS at #}
-{# the ISO root -- it does not appear to parse its contents to decide      #}
-{# whether to show the "Automated" menu entry or set the 10s timeout (see  #}
-{# docs/proxmox-autoinstall.md fact 1) -- but the running installer        #}
-{# (proxmox-fetch-answer) does read `mode` to know where to fetch          #}
-{# answer.toml from, so getting this wrong likely means the menu           #}
-{# times out into the automated entry but the install then fails to find  #}
-{# its answer file, not that the menu itself misbehaves. Treat this file  #}
-{# as the first thing to re-derive from the installer's actual source for #}
-{# the specific Proxmox VE version in use if the fallback path's prepared  #}
-{# ISO boots into the automated entry but then stalls looking for its     #}
-{# answer file.                                                           #}
+{#-
+Copyright (c) 2026 Jim Crowley
+GNU General Public License v3.0 or later
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Only used by the container/xorriso FALLBACK path
+(tasks/prepare_with_container.yml). When proxmox-auto-install-assistant
+itself runs (the preferred path), it writes this file inside the ISO
+itself and this template is never rendered.
+
+VERIFIED 2026-08-09 against real vendor output. This is no longer a
+reconstruction: proxmox-auto-install-assistant 9.2.8 was run with
+`prepare-iso --fetch-from iso` against a Proxmox VE 9.2-1 ISO, and the
+resulting /auto-installer-mode.toml was extracted and read verbatim. It
+is exactly:
+
+    mode = "iso"
+    partition_label = "proxmox-ais"
+
+    [http]
+
+The empty [http] table is present even in iso mode -- the vendor
+serialises the whole settings struct, so the section header appears with
+no keys under it. Reproduced here for byte-fidelity with the vendor
+tool; the installer does not require the section to be populated when
+mode is "iso".
+
+Why `mode` matters, learned the hard way: a stock ISO's grub.cfg only
+tests that this file EXISTS (`if [ -f auto-installer-mode.toml ]`) to
+enable both the boot timeout and the "Install Proxmox VE (Automated)"
+menu entry. It never parses the contents. But the running installer
+DOES read `mode` to decide where to fetch answer.toml from. So an
+unrecognised mode value produces a very misleading failure: the ISO
+boots, the menu times out into the automated entry, the installer
+starts, silently falls back to the INTERACTIVE installer, and then sits
+at its licence prompt forever. From the outside that looks identical to
+booting a completely unprepared ISO -- same media read pattern, same
+byte count -- so it is easy to misdiagnose as a disk-selection or
+answer-file-placement problem when it is neither. Do not guess at this
+value; if a future Proxmox release changes it, re-derive it by running
+the vendor tool and reading its output, as was done here.
+-#}
 mode = "iso"
+partition_label = "{{ asmb8_autoinstall_iso_partition_label | default('proxmox-ais') }}"
+
+[http]

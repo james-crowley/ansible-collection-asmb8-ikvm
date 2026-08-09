@@ -260,3 +260,16 @@ asmb8_autoinstall_iso_answer_disk_lvm: {}
 #   hdsize: number (GiB)
 #   compress: "on" | "off" | "zlib" | "lzo" | "zstd"
 asmb8_autoinstall_iso_answer_disk_btrfs: {}
+
+# Partition label written into /auto-installer-mode.toml on the prepared ISO, and
+# the label the running installer looks for when fetching its answer file in
+# "partition" mode. VERIFIED 2026-08-09: proxmox-auto-install-assistant 9.2.8
+# emits exactly `partition_label = "proxmox-ais"` for `--fetch-from iso`, so this
+# default reproduces the vendor tool byte-for-byte. Only override it if a future
+# Proxmox release changes the label -- and re-derive the new value by running the
+# vendor tool and reading its output rather than guessing, because a wrong value
+# here fails in a maximally confusing way (see the template's own comment).
+#
+# Used only by the container/xorriso fallback path; when the vendor tool runs it
+# writes this file itself and this variable is unused.
+asmb8_autoinstall_iso_partition_label: "proxmox-ais"
