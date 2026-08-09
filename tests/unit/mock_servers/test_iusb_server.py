@@ -49,11 +49,14 @@ from iusb_server import (
     CONN_ERR_IN_USE_5,
     CONN_OK,
     DEVICE_CDROM,
+    FULL_READ_TOC_RESPONSE_LEN,
     HEADER_LEN,
     OP_ACK,
     OP_AUTH,
+    SCSI_READ10,
     SCSI_READ_CAPACITY10,
     SCSI_READ_TOC,
+    SCSI_REQUEST_SENSE,
     SCSI_TEST_UNIT_READY,
     SERVER_DEVICE_TYPE_BIT,
     SIGNATURE,
@@ -62,6 +65,8 @@ from iusb_server import (
     IdleStep,
     IusbMockServer,
     ProtocolViolation,
+    ScsiStep,
+    captured_install_script,
     eject_step,
     read10_step,
     read_capacity10_step,
@@ -70,7 +75,7 @@ from iusb_server import (
 from iusb_server import test_unit_ready_step as tur_step  # aliased: pytest would otherwise collect this factory as a test itself
 
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import iusb
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import BmcBusyError
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import BmcBusyError, ConnectionError_
 
 DEFAULT_TOKEN = "STOKEN-unit-test-token"  # obviously-fake, not a real credential
 
@@ -475,6 +480,23 @@ class TestRealClientAgainstMock:
         path.write_bytes(data)
         return path
 
+    def _labeled_sector(self, lba: int) -> bytes:
+        """One 2048-byte sector whose first 4 bytes ARE its own LBA (big
+        endian), the rest filled with a byte derived from that same LBA.
+        Unlike ``_make_iso``'s flat repeating-byte pattern, a read that lands
+        on the wrong LBA shows up immediately as a mismatched label rather
+        than as merely-differently-offset, still-plausible-looking noise."""
+        sector = bytearray(CD_BLOCK_SIZE)
+        sector[0:4] = lba.to_bytes(4, "big")
+        sector[4:] = bytes([lba % 256]) * (CD_BLOCK_SIZE - 4)
+        return bytes(sector)
+
+    def _make_labeled_iso(self, tmp_path: Path, *, blocks: int) -> Path:
+        data = b"".join(self._labeled_sector(lba) for lba in range(blocks))
+        path = tmp_path / "labeled.iso"
+        path.write_bytes(data)
+        return path
+
     def test_full_auth_then_scripted_scsi_sequence_byte_exact(self, server, tmp_path):
         blocks = 4
         iso_path = self._make_iso(tmp_path, blocks=blocks)
@@ -587,3 +609,146 @@ class TestRealClientAgainstMock:
 
         assert serve_error == [], f"client's serve loop raised during/after the idle period: {serve_error}"
         assert responses[1] is not None
+
+    def test_captured_install_opcode_sequence_two_phases_read_toc_recurs_across_all_allocations(self, server, tmp_path):
+        """End-to-end guard for the ``CDROMDevice._read_toc`` allocation-length
+        bug (see that method's docstring, and
+        ``test_iusb.TestCDROMDeviceGolden.test_read_toc_honours_the_cdb_allocation_length``
+        for the unit-level half of this regression pair). That unit test proves
+        the emulator itself gets the allocation length right in isolation; this
+        test drives the REAL shipped client through the actual two-phase opcode
+        shape a full OS install produces -- via ``captured_install_script`` --
+        so the bug it exposed can never reach hardware again undetected.
+
+        Covers, in one real client/server exchange:
+
+        * READ_TOC recurs (four times here), never just once, across all three
+          allocation-length cases that matter: 0, 12 (the value that broke real
+          hardware), and 64.
+        * A bootloader phase issues no READ_TOC at all; only the OS phase (past
+          the idle gap) does -- the structural asymmetry that hid the bug.
+        * REQUEST_SENSE never appears anywhere in the script.
+        * READ10 replies are byte-exact for both single-sector and multi-block,
+          irregular-size requests, against a self-identifying synthetic ISO.
+        * The client survives the phase gap without tearing down.
+        """
+        total_blocks = 40
+        iso_path = self._make_labeled_iso(tmp_path, blocks=total_blocks)
+
+        # Short: makes the idle gap below (a couple of seconds, not the real
+        # ~2 real-minute pause) exceed the client's persistent socket read
+        # timeout several times over, exercising the SAME idle-at-a-frame-
+        # boundary path the client hit for real (130s of silence at a
+        # bootloader menu) -- never a mid-frame stall, which is the
+        # DIFFERENT, error-raising path exercised by
+        # test_mid_frame_stall_raises_a_connection_error_not_swallowed_as_idle
+        # below. Nothing here is a real multi-minute sleep.
+        client_session = iusb.Session.connect("127.0.0.1", server.port, DEFAULT_TOKEN, device_type=DEVICE_CDROM, timeout=1.0)
+        server.wait_for_handshake()
+        assert server.auth_status_seen() == CONN_OK
+
+        reader = iusb.FileReader.open(str(iso_path))
+        device = iusb.CDROMDevice(reader)
+        serve_error: list[Exception] = []
+
+        def _serve():
+            try:
+                client_session.serve_forever(device)
+            except Exception as exc:
+                serve_error.append(exc)
+
+        serve_thread = threading.Thread(target=_serve, daemon=True)
+        serve_thread.start()
+
+        script = captured_install_script(blocks=total_blocks, gap_seconds=2.0)
+        try:
+            responses = server.run_script(script, timeout=5.0)
+        finally:
+            server.send_kill()
+            serve_thread.join(timeout=5)
+            reader.close()
+            client_session.close()
+
+        assert not serve_thread.is_alive()
+        assert serve_error == [], f"client's serve loop raised: {serve_error}"
+
+        # -- structural shape of the script itself -----------------------
+        gap_index = next(i for i, step in enumerate(script) if isinstance(step, IdleStep))
+        boot_phase, os_phase = script[:gap_index], script[gap_index + 1 :]
+
+        def is_opcode(step: object, opcode: int) -> bool:
+            return isinstance(step, ScsiStep) and step.opcode == opcode
+
+        assert not any(is_opcode(s, SCSI_READ_TOC) for s in boot_phase), "a bootloader never issues READ_TOC"
+        toc_step_count = sum(is_opcode(s, SCSI_READ_TOC) for s in os_phase)
+        assert toc_step_count >= 3, f"READ_TOC must recur, not fire once (saw {toc_step_count})"
+        assert not any(is_opcode(s, SCSI_REQUEST_SENSE) for s in script), "REQUEST_SENSE must never appear in this script"
+
+        # -- every READ_TOC reply, across every allocation case ----------
+        # run_script() above already enforced each step's expected_data_len
+        # (i.e. the requested allocation was honoured for 0, 12, AND 64).
+        # Additionally check the 2-byte TOC data-length header itself: it
+        # must report the FULL available length even when the body is
+        # truncated, so an initiator that under-allocated can tell and retry.
+        toc_responses = [r for step, r in zip(script, responses, strict=True) if is_opcode(step, SCSI_READ_TOC)]
+        assert len(toc_responses) == toc_step_count
+        for response in toc_responses:
+            data = response.data()
+            assert len(data) >= 2
+            toc_length_field = int.from_bytes(data[0:2], "big")
+            assert toc_length_field == FULL_READ_TOC_RESPONSE_LEN - 2, "the TOC length header must report the FULL length, even when truncated"
+
+        # -- every READ10 reply, single-sector and multi-block ------------
+        for step, response in zip(script, responses, strict=True):
+            if not is_opcode(step, SCSI_READ10):
+                continue
+            lba = int.from_bytes(step.cdb_tail[1:5], "big")
+            blocks_requested = int.from_bytes(step.cdb_tail[6:8], "big")
+            data = response.data()
+            assert len(data) == blocks_requested * CD_BLOCK_SIZE
+            expected = b"".join(self._labeled_sector(lba + n) for n in range(blocks_requested))
+            assert data == expected, f"READ10 at LBA {lba}/{blocks_requested} blocks returned the wrong sector data"
+
+    def test_mid_frame_stall_raises_a_connection_error_not_swallowed_as_idle(self, server, tmp_path):
+        """Contrast case for the phase-gap idle handling exercised above: this
+        truncates a request frame mid-payload (the client's socket read gets
+        SOME bytes, then nothing more ever arrives) rather than sending
+        nothing at all between two complete frames. ``iusb.SocketTransport
+        .recv_exact`` must raise ``ConnectionError_`` here, not swallow it as
+        ``IdleTimeout`` -- see that method's docstring for the exact
+        boundary. This is what proves the phase-gap test above is actually
+        exercising the idle-at-a-frame-boundary branch and not merely
+        tolerating any timeout whatsoever.
+        """
+        iso_path = self._make_iso(tmp_path, blocks=1)
+        client_session = iusb.Session.connect("127.0.0.1", server.port, DEFAULT_TOKEN, device_type=DEVICE_CDROM, timeout=0.3)
+        server.wait_for_handshake()
+
+        reader = iusb.FileReader.open(str(iso_path))
+        device = iusb.CDROMDevice(reader)
+        serve_outcome: list[object] = []
+
+        def _serve():
+            try:
+                serve_outcome.append(client_session.serve_forever(device))
+            except Exception as exc:
+                serve_outcome.append(exc)
+
+        serve_thread = threading.Thread(target=_serve, daemon=True)
+        serve_thread.start()
+        try:
+            # Armed after the handshake, deliberately (see the note in
+            # TestFaultInjection): truncate to header-plus-2-bytes, so the
+            # client's header read completes normally but its payload read
+            # gets 2 of the 29 expected bytes and then nothing further --
+            # mid-frame, not at a boundary.
+            server.faults.truncate_next_frame_to = HEADER_LEN + 2
+            server.send_scsi_request(tur_step())
+            serve_thread.join(timeout=5)
+        finally:
+            reader.close()
+            client_session.close()
+
+        assert not serve_thread.is_alive()
+        assert len(serve_outcome) == 1
+        assert isinstance(serve_outcome[0], ConnectionError_), f"expected a mid-frame ConnectionError_, got {serve_outcome[0]!r}"

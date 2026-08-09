@@ -57,7 +57,7 @@ format this implementation is built against.
 
 ## Project status
 
-**0.1.0 — not hardware-qualified.** This is not a hedge; it is the accurate
+**0.2.0 — not hardware-qualified.** This is not a hedge; it is the accurate
 description of where this collection is. Read
 [`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
 for the full, dated, falsifiable record everything below is drawn from, and

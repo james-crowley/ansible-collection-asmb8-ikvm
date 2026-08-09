@@ -73,6 +73,14 @@ OP_AUTH = 0xF2
 OP_ACK = 0xF1
 OP_KILL = 0xF6
 
+#: VERIFIED LIVE: a second AMI redirection-control opcode observed exactly
+#: once in a full-install opcode census (see ``captured_install_script``
+#: below), distinct from the ack/auth/kill opcodes already modelled above.
+#: Not SCSI at all -- it rides the same >=0xF0 control-opcode range that
+#: ``iusb.CDROMDevice.handle`` bare-echoes rather than treating as an error
+#: (see that method's ``AMI_CONTROL_OPCODE_MIN`` branch).
+OP_AMI_CTRL_F3 = 0xF3
+
 #: The six SCSI/MMC opcodes the real vendor CD-ROM dispatcher recognises
 #: (disassembly-verified by a companion PoC; see docs/protocol-notes.md if/when
 #: it exists, and docs/protocol-notes.md for the account this
@@ -85,6 +93,17 @@ SCSI_READ_CAPACITY10 = 0x25
 SCSI_READ10 = 0x28
 SCSI_READ_TOC = 0x43
 SCSI_READ12 = 0xA8
+
+#: VERIFIED, by absence: the real vendor CD-ROM SCSI dispatcher's six
+#: recognised opcodes (see ``iusb.py``'s module docstring) do NOT include
+#: REQUEST SENSE. No scripted sequence in this file issues it. A test that
+#: asserts its absence across a whole scripted conversation is asserting the
+#: reasoning that let the allocation-length TOC bug (see
+#: ``captured_install_script``) go unnoticed: had the client's replies
+#: actually been malformed in a way the host *noticed*, a real initiator
+#: would have asked for sense data to find out why, and this opcode is what
+#: that ask looks like.
+SCSI_REQUEST_SENSE = 0x03
 
 CD_BLOCK_SIZE = 2048
 
@@ -289,6 +308,17 @@ def _cdb12_tail(lba: int, blocks: int) -> bytes:
     return bytes([0x00]) + lba.to_bytes(4, "big") + blocks.to_bytes(4, "big") + bytes([0x00, 0x00])
 
 
+def _cdb_read_toc_tail(alloc: int) -> bytes:
+    """CDB bytes 1..9 for READ TOC: MSF bit, three reserved bytes, format byte,
+    three more reserved bytes, allocation length (2 bytes BE at CDB[7:9]),
+    control. This is the exact field the real bug (see
+    ``iusb.CDROMDevice._read_toc``'s docstring) ignored: the initiator's
+    stated budget for the TOC response, big-endian, at CDB offset 7."""
+    tail = bytearray(9)
+    tail[6:8] = alloc.to_bytes(2, "big")
+    return bytes(tail)
+
+
 def test_unit_ready_step(**overrides) -> ScsiStep:
     """VERIFIED LIVE: xferlen 0."""
     defaults = {"opcode": SCSI_TEST_UNIT_READY, "transfer_length": 0, "expected_data_len": 0}
@@ -317,8 +347,48 @@ def read12_step(lba: int, blocks: int, **overrides) -> ScsiStep:
     return ScsiStep(**defaults)
 
 
-def read_toc_step(**overrides) -> ScsiStep:
-    defaults = {"opcode": SCSI_READ_TOC, "transfer_length": 20, "expected_data_len": 20}
+#: The full, untruncated READ TOC response length this mock's single-track
+#: TOC body always produces (4-byte header + two 8-byte track descriptors) --
+#: see ``iusb.CDROMDevice._read_toc``. Exposed here so a caller can reason
+#: about ``alloc`` without re-deriving this number.
+FULL_READ_TOC_RESPONSE_LEN = 20
+
+
+def read_toc_step(alloc: int = 0, **overrides) -> ScsiStep:
+    """READ TOC. ``alloc`` is the CDB's allocation length (CDB[7:9], big
+    endian -- see :func:`_cdb_read_toc_tail`), the exact field whose value
+    determines how much of the full TOC response a well-behaved client may
+    return. This is the field the real bug ignored entirely (see
+    ``iusb.CDROMDevice._read_toc``'s docstring), and the reason the previous
+    golden vector -- alloc 0, "no limit stated" -- could not catch it.
+
+    ``expected_data_len`` is derived from ``alloc`` to match SCSI's own rule:
+    a short allocation truncates the response to exactly ``alloc`` bytes; an
+    allocation at or above the full response length changes nothing. Override
+    it explicitly to probe a client that gets this wrong.
+    """
+    if 0 < alloc < FULL_READ_TOC_RESPONSE_LEN:
+        expected = alloc
+    else:
+        expected = FULL_READ_TOC_RESPONSE_LEN
+    defaults = {
+        "opcode": SCSI_READ_TOC,
+        "cdb_tail": _cdb_read_toc_tail(alloc),
+        "transfer_length": FULL_READ_TOC_RESPONSE_LEN,
+        "expected_data_len": expected,
+    }
+    defaults.update(overrides)
+    return ScsiStep(**defaults)
+
+
+def ami_control_step(opcode: int = OP_AMI_CTRL_F3, **overrides) -> ScsiStep:
+    """A non-SCSI AMI control opcode (>= 0xF0) riding mid-session -- e.g. the
+    captured 0xF3 frame (see ``captured_install_script``). Real firmware's
+    dispatcher answers every opcode in this range with a bare envelope echo
+    and no appended data (see ``iusb.CDROMDevice.handle``'s
+    ``AMI_CONTROL_OPCODE_MIN`` branch), never an error; this step exists so a
+    scripted sequence can include one and prove a real client agrees."""
+    defaults = {"opcode": opcode, "transfer_length": 0, "expected_data_len": 0}
     defaults.update(overrides)
     return ScsiStep(**defaults)
 
@@ -338,6 +408,78 @@ def start_stop_unit_step(*, eject: bool, **overrides) -> ScsiStep:
 
 def eject_step(**overrides) -> ScsiStep:
     return start_stop_unit_step(eject=True, **overrides)
+
+
+#: LBAs a real bootloader probed, in order, before any filesystem driver was
+#: involved: the ISO9660 primary volume descriptor's usual neighbourhood (0,
+#: 1) and a path-table/root-directory pair (16, 17), immediately followed by
+#: the El Torito boot catalog and the boot image it points at. VERIFIED LIVE
+#: shape (see ``captured_install_script``'s docstring); the exact catalog/
+#: image LBAs vary per ISO build and are this mock's own stand-in values.
+BOOT_PROBE_LBAS: tuple[int, ...] = (0, 1, 16, 17)
+EL_TORITO_CATALOG_LBA = 20
+EL_TORITO_BOOT_IMAGE_LBA = 21
+
+#: Minimum medium size (in 2048-byte blocks) ``captured_install_script``'s
+#: fixed LBA layout touches -- its highest access is ``read10_step(30, 8)``,
+#: reaching LBA 37.
+MIN_CAPTURED_INSTALL_BLOCKS = 40
+
+
+def captured_install_script(*, blocks: int, gap_seconds: float = 2.0) -> list[ScsiStep | IdleStep]:
+    """Reproduce the two-phase opcode shape captured from one real, full OS
+    install against the target hardware -- the trace that exposed the
+    ``CDROMDevice._read_toc`` allocation-length bug (see that method's
+    docstring). Opcode totals over that one install: TEST_UNIT_READY 132,
+    READ_CAPACITY10 7, READ10 16451, READ_TOC 58, the AMI ack opcode 1, and
+    the AMI 0xF3 control opcode 1. Two structural facts this reproduces:
+
+    1. A bootloader phase of single-sector READ10 probes issues NO READ_TOC
+       at all, followed by an idle gap (a host sitting at a menu -- modelled
+       with :class:`IdleStep` rather than a real multi-minute sleep), then an
+       OS phase where READ_TOC recurs repeatedly, interleaved with
+       TEST_UNIT_READY and multi-block READ10s of irregular size. That
+       asymmetry is exactly why the bug hid: firmware-stage booting never
+       exercised the broken code path, and only a real OS tripped over it.
+    2. READ_TOC recurs across all three allocation-length cases that matter:
+       0 ("no limit stated" -- the old golden vector's case, which could not
+       catch the bug), 12 (the EXACT value a real Linux initrd sent, and the
+       value that broke real hardware), and 64 (over-generous -- must change
+       nothing). A single occurrence of any one case under-tests it.
+
+    ``blocks`` must cover every LBA this script touches (see
+    :data:`MIN_CAPTURED_INSTALL_BLOCKS`); callers size their backing medium
+    accordingly. No step here is :data:`SCSI_REQUEST_SENSE` -- see that
+    constant's docstring for why its absence across this whole script is
+    itself part of what a test asserts.
+    """
+    if blocks < MIN_CAPTURED_INSTALL_BLOCKS:
+        raise ValueError(f"captured_install_script needs a medium of at least {MIN_CAPTURED_INSTALL_BLOCKS} blocks, got {blocks}")
+
+    boot_phase: list[ScsiStep] = [
+        test_unit_ready_step(),
+        read_capacity10_step(),
+        *(read10_step(lba, 1) for lba in BOOT_PROBE_LBAS),
+        read10_step(EL_TORITO_CATALOG_LBA, 1),
+        read10_step(EL_TORITO_BOOT_IMAGE_LBA, 1),
+    ]
+
+    os_phase: list[ScsiStep] = [
+        test_unit_ready_step(),
+        read_toc_step(alloc=0),  # "no limit stated" -- the case the old golden vector covered
+        read10_step(22, 16),  # multi-block, at the BMC's observed 16-block ceiling
+        read_toc_step(alloc=12),  # the EXACT allocation length that broke real hardware
+        read10_step(38, 2),  # irregular size, at an extent boundary
+        test_unit_ready_step(),
+        read_toc_step(alloc=64),  # over-generous allocation: must change nothing
+        read10_step(0, 1),
+        ami_control_step(),  # the captured 0xF3 -- must not be treated as an error
+        test_unit_ready_step(),
+        read_toc_step(alloc=12),  # READ_TOC recurs -- a single occurrence under-tests it
+        read10_step(30, 8),
+    ]
+
+    return [*boot_phase, IdleStep(gap_seconds), *os_phase]
 
 
 # --------------------------------------------------------------------------

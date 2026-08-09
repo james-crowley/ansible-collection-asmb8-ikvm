@@ -46,3 +46,75 @@ releases:
       name: asmb8_redirection
       namespace: ''
     release_date: '2026-08-08'
+  0.2.0:
+    changes:
+      bugfixes:
+      - '``asmb8_media`` - disable Nagle''s algorithm (``TCP_NODELAY``) on the iUSB
+        media socket, which Python''s ``socket.create_connection`` leaves enabled
+        by default. iUSB is strictly synchronous request/response, the traffic shape
+        Nagle handles worst: each reply is written in a single ``sendall``, but its
+        final partial segment was previously withheld pending an ACK the peer delays.
+        This is the theoretically-correct default for this traffic shape regardless
+        of measured impact. A controlled A/B test on real hardware (same install,
+        same ISO, same machine, with and without the option) found no measurable throughput
+        difference - the two runs matched within about 2% throughout and were byte-identical
+        from roughly the 3.5-minute mark onward. Recorded as a negative result: this
+        option was not the install''s latency bottleneck on this hardware, and should
+        not be re-investigated for that reason without new evidence. See ``docs/hardware-evidence-2026-08-08.md``.'
+      - '``asmb8_media`` - the emulated CD-ROM''s ``READ TOC`` handler ignored the
+        SCSI CDB''s allocation length and always returned its full 20-byte response.
+        A Linux initrd requesting 12 bytes received 20, which is a protocol violation;
+        the host''s optical layer concluded the disc had no valid track structure,
+        never read the ISO9660 superblock, and reported no valid installation medium.
+        Only a real operating system is affected - bootloaders read via firmware I/O
+        and never issue ``READ TOC``, so booting an installer appeared to work while
+        the subsequent handoff to the OS always failed. The handler now truncates
+        to the allocation length while still reporting the full available length in
+        the TOC data-length field, so an initiator that under-allocated can retry
+        with a larger buffer.'
+      major_changes:
+      - 'asmb8_redirection - rewritten before the first Galaxy release to actually
+        match its name. It previously opened an IVTP console/KVM session (closer to
+        what amt_media does in the sibling james_crowley.intel_amt collection than
+        to what amt_redirection does); that implementation has moved, essentially
+        unchanged, to the new asmb8_console module. The name asmb8_redirection now
+        does what the sibling collection''s amt_redirection does: report, and (once
+        a real RPC is confirmed) toggle, whether this BMC''s own listed services (web,
+        kvm, cd-media, fd-media, hd-media, ssh, telnet) are enabled, separately from
+        whether each one''s TCP port is actually reachable right now. Without a ``state``
+        option it is read-only, exactly like the sibling module; any ``state`` request
+        currently fails with ``error_class=unsupported_capability``, since no sourced
+        RPC exists yet for toggling a service''s enablement on this BMC (see the module''s
+        own DOCUMENTATION and docs/asmb8_redirection.md).'
+      minor_changes:
+      - asmb8_console - new module, carrying asmb8_redirection's former IVTP console/KVM-session
+        implementation (handshake, ``capture=handshake_only|raw_frame|decoded_frame``)
+        unchanged in behaviour. Added to ``meta/runtime.yml``'s ``asmb8_ikvm`` action
+        group alongside the other five modules.
+      release_summary: "First release intended for Ansible Galaxy. ``0.1.0`` was tagged
+        but never\npublished, and two changes since then would have been breaking
+        or misleading\nto ship, so this supersedes it rather than amending it.\n\nThe
+        headline change is a protocol fix. The emulated CD-ROM's ``READ TOC``\nhandler
+        violated the SCSI allocation-length contract, which made booting an\ninstaller
+        appear to work while every subsequent handoff to a real operating\nsystem
+        failed to find valid installation media. Bootloaders never issue\n``READ TOC``,
+        which is precisely why the fault stayed hidden through several\napparently-successful
+        boots. That fix is confirmed on real hardware: a run\nwith it in place streamed
+        past the point where four earlier attempts stopped\ndead.\n\n``asmb8_redirection``
+        has also been rewritten to match the name it was\nalready using, and its former
+        console implementation moved to a new\n``asmb8_console`` module. Doing this
+        before the first publication avoids a\nbreaking rename later.\n\nThis release
+        remains **not hardware-qualified**. A completed unattended\noperating-system
+        install is still unproven, IPMI Serial-over-LAN does not\nwork on the one
+        board tested, and ``asmb8_console`` has no live-hardware or\nmock coverage
+        of its handshake state machine. ``README.md`` and\n``docs/capability-matrix.md``
+        give the claim-by-claim accounting, and\n``docs/hardware-evidence-2026-08-08.md``
+        records the dated observations\nbehind every claim \u2014 including the negative
+        results, which are documented\ndeliberately so they are not re-investigated
+        without new evidence.\n"
+    fragments:
+    - 0.2.0-release-summary.yml
+    - read-toc-allocation-length.yml
+    - split-asmb8-redirection-console.yml
+    - tcp-nodelay.yml
+    release_date: '2026-08-09'

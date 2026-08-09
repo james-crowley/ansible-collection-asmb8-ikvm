@@ -131,7 +131,16 @@ i.e. a real filesystem driver walking directory records.
 
 - **Throughput ≈ 800–900 KB/s** with 16-block reads. `pve-installer.squashfs`
   alone is **614 MB**, so a real install streams for **13+ minutes**. Timeouts
-  throughout this collection are sized for that.
+  throughout this collection are sized for that. **This must be measured over
+  the bulk streaming phase only** — exclude the ~2-minute bootloader-menu idle
+  at the start of a run and the multi-second installer-side pauses later in it.
+  Correctly windowed: 60.0 MiB over 78 s from 2.0m→3.3m elapsed ≈ **788 KB/s**;
+  a single 15 s interval, 11.6 MiB from 2.5m→2.8m ≈ **660 KB/s**. Dividing
+  *total* bytes by *total* elapsed time instead — 119.4 MiB over 270 s for the
+  same run — gives ≈453 KB/s, roughly half the real streaming rate, and that
+  single averaging error has already caused this accurate figure to be
+  "corrected" wrongly more than once. Always quote a rate with the window it
+  was measured over on this media path; never total-over-total.
 - **A healthy attached session can be completely idle for a very long time.** We
   measured **130 consecutive seconds** of zero requests while the host sat at a
   bootloader menu, after which reads resumed normally. There is no safe upper
@@ -369,6 +378,84 @@ stated" and returns everything.
 its requests ask for, and `READ(10)`/`READ(12)` are bounded by their own block
 counts.
 
+### Confirmed on hardware, 2026-08-09
+
+The fix above was unit-tested at first landing but not yet observed to fix an
+actual install. It has been now: a run made during the `TCP_NODELAY` A/B test
+below passed the exact ~71 MiB / 2,839-read point that stopped all four earlier
+attempts dead, and continued streaming past 119 MiB with no anomalous opcodes.
+The specific failure this fix targeted did not recur. The install itself has
+not yet run to completion — see "Still unproven" below — so this confirms the
+fix, not a finished install.
+
+## `TCP_NODELAY` on the media socket — a negative result, and a corrected latency figure
+
+Added 2026-08-09, same session as the fix above. `SocketTransport.__init__` now
+sets `TCP_NODELAY` on the iUSB media socket (`plugins/module_utils/iusb.py`,
+`_disable_nagle`), because iUSB is strictly synchronous request/response — the
+traffic shape Nagle's algorithm handles worst — and Python's
+`socket.create_connection` leaves Nagle enabled by default. The classic
+two-write mistake Nagle is usually blamed for was never present here (each
+reply is a single `sendall`); the remaining exposure was Nagle withholding the
+final partial segment of a reply pending the peer's delayed ACK.
+
+**The first latency figure quoted for this fix was wrong, and this corrects
+it.** One full install had served 16,451 `READ10` requests over roughly 1,800
+seconds, which averages to ~109 ms/read against a BMC that answers ICMP in
+~5 ms. That whole-run average was read as "every read pays ~99 ms of dead
+time," which is not what the data actually shows once broken out by interval.
+A later run's progress, sampled every few minutes, told a different story:
+reads arrived in bursts of roughly 500 per 15 seconds — **~33 reads/sec, ~30 ms
+per read** — separated by genuine multi-second stretches where the installer
+issued zero reads at all (one interval showed +0 reads over 12 seconds). At
+33 reads/sec, 16,451 reads is only about 8 minutes of actual reading inside a
+much longer install; the rest of the time is the installer doing work that has
+nothing to do with the media transport — decompressing squashfs, writing to
+disk. **The install's duration is not dominated by this collection's network
+path.** Retire the 109 ms figure; ~30 ms per read, arriving in bursts, is the
+number to reason from.
+
+**The A/B test.** The same install, same ISO, same machine, run once with
+Nagle enabled and once with `TCP_NODELAY` set, compared at matching elapsed
+times:
+
+| elapsed | Nagle enabled | `TCP_NODELAY` set |
+|---|---|---|
+| 2.5 min | 967 reads / 23.5 MiB | 1030 reads / 25.1 MiB |
+| 3.0 min | 1966 / 48.8 | 1996 / 49.5 |
+| 3.5 min | 2860 / 71.3 | 2860 / 71.3 |
+| 4.5 min | 3442 / 119.4 | 3442 / 119.4 |
+
+(This table is for comparing the two runs against each other at matching
+elapsed times — do not divide any row's MiB by its elapsed time to get a
+throughput figure. Those elapsed times include the ~2-minute bootloader-menu
+idle baked in; see "Measured performance and behaviour" above for the
+correctly-windowed throughput numbers and the total-over-total trap that
+produces a falsely low rate.)
+
+The two runs stayed within ~2% of each other throughout, and were identical to
+the byte from the 3.5-minute mark on. **`TCP_NODELAY` produced no measurable
+speedup on this hardware. The Nagle hypothesis is falsified as the dominant
+latency cause, not merely unconfirmed.** This is recorded as a negative result
+on purpose, the same way the four wrong diagnoses above are recorded: so the
+next person looking at read latency does not re-try this expecting it to
+matter.
+
+**Why the fix stays anyway.** Disabling Nagle on a strictly synchronous
+request/response socket is still the correct default — it simply was not this
+workload's bottleneck. `changelogs/fragments/tcp-nodelay.yml` describes it as a
+socket-hygiene fix with a measured null result, not a performance win.
+
+**What still explains the ~30 ms.** Network RTT to the BMC is ~5 ms, leaving
+roughly 25 ms per read unaccounted for. The leading candidate is the BMC's own
+USB-to-TCP relay turnaround on this 2014-era ASPEED AST2400 — no client-side
+socket option can affect that half. Separating "our client is slow to
+send/receive" from "the BMC is slow to relay" needs one measurement that has
+not been taken yet: a timestamp immediately before and after the client's own
+`send()` call (client-side delay), compared against the gap between that send
+and the next inbound request arriving (BMC-side turnaround). Whichever side
+that gap lands on is the next real lead — not another socket option.
+
 ## Still unproven — do not claim these
 
 - **Whether the guest OS can obtain its own media session.** Once Linux boots it
@@ -385,3 +472,10 @@ counts.
   only CD-ROM has been exercised.
 - **Any board other than this one.** One machine, one firmware version. This is
   repeatability at best, not a compatibility guarantee.
+- **The cause of the residual ~30 ms per read** (network RTT to the BMC is
+  ~5 ms). `TCP_NODELAY` was tried and produced no measurable change in a
+  controlled A/B test, which rules it out as the dominant cause but does not
+  identify the real one. The BMC's own USB-to-TCP relay turnaround on this
+  2014-era AST2400 is the leading candidate, unmeasured directly — see
+  "`TCP_NODELAY` on the media socket" above for the measurement that would
+  settle it.

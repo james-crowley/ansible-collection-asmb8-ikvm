@@ -170,7 +170,32 @@ short list of things that will waste your time if you do not know them.
   reading through the same held session past kernel handoff. So
   `media_release_after_handoff` in the install role is unnecessary, not merely
   experimental.
-- Throughput is roughly **800 KB/s – 1 MB/s**.
+- Throughput is roughly **800 KB/s – 1 MB/s** with 16-block reads during bulk
+  streaming.
+- **`READ TOC` must honour the CDB allocation length.** A Linux initrd's
+  `READ TOC` (allocation length 12) previously got the full 20-byte response —
+  a SCSI protocol violation that made Linux conclude the disc had no valid
+  track structure and abort with "no device with valid ISO found." **Bootloaders
+  never issue `READ TOC`** (they read via firmware I/O), so every failure
+  happened only at the firmware-to-OS handoff, after streaming a
+  byte-identical ~71 MiB / ~2,839-read trace on every attempt — which is why
+  four other things (answer-file placement, disk target, the `mode` value, a
+  missing driver) were wrongly blamed first. Fixed, unit-tested, and now
+  **confirmed on hardware**: a later run passed that exact stall point and
+  streamed past 119 MiB with the fix in place.
+- **`TCP_NODELAY` is now set on the media socket, and a controlled A/B test
+  showed it changed nothing measurable.** Do not re-investigate this without
+  new evidence. The real per-read number is **~30 ms, arriving in bursts of
+  ~33 reads/sec**, separated by genuine multi-second idle windows where the
+  installer is decompressing squashfs or writing to disk — not waiting on the
+  network. An earlier whole-install average produced a **wrong** 109 ms/read
+  figure by conflating the two; do not use that number. Network RTT to the BMC
+  is ~5 ms, so ~25 ms per read is still unaccounted for. Leading candidate:
+  the BMC's own USB-to-TCP relay turnaround on this 2014-era AST2400 — no
+  client-side socket option can touch that. The measurement that would settle
+  it, not yet taken: timestamp either side of the client's own `send()`
+  (client-side delay) versus the gap before the next inbound request arrives
+  (BMC-side turnaround).
 
 **Console**
 
@@ -178,16 +203,29 @@ short list of things that will waste your time if you do not know them.
   greets first with an 8-byte header; `17 00 00 00 00 00 00 00` was captured
   verbatim. Sending a wrong first frame causes an **immediate silent close** with
   no error frame — so make handshake failures diagnostically loud.
-- **IPMI Serial-over-LAN does not work on this board**, despite appearing fully
-  configured. The channel payload was enabled, per-user access granted, and both
-  plausible bitrates tried; zero bytes arrived across repeated resets. Do not build
-  anything that depends on SOL. The technique that *does* work for observing an
-  installer is correlating the media channel's own read pattern against the ISO's
-  structure — that is how a bootloader stall was diagnosed precisely.
+- **IPMI Serial-over-LAN is dead on this board, not merely unconfigured.**
+  Three separate things were verified correct over IPMI: the channel-level SOL
+  payload (found disabled, then enabled), per-user SOL access (already
+  granted), and both plausible bitrates (parameters 5 and 6). With all three
+  satisfied, zero bytes arrived across repeated resets. **Do not retry this
+  blind.** The technique that *does* work for observing an installer is
+  correlating the media channel's own read pattern against the ISO's
+  structure — that is how both a bootloader stall and the `READ TOC` bug above
+  were diagnosed precisely.
 
 ---
 
 ## 4. Mistakes already made — do not repeat them
+
+**Standing warning, worth internalizing before you diagnose anything else on
+this board:** low-resolution evidence has repeatedly made unrelated failures
+look identical. A missing driver, a wrong answer-file value, a malformed SCSI
+TOC response, and — most recently — a false latency hypothesis have each
+produced symptoms that were merely *consistent with* the wrong explanation,
+not *proof* of it. Get the highest-resolution trace available (every opcode,
+not just reads; per-interval throughput, not a whole-run average) before
+committing to a diagnosis, and keep "consistent with" and "confirms" as two
+different words.
 
 Recorded because each one cost real time.
 
@@ -220,6 +258,25 @@ Recorded because each one cost real time.
 7. **The GRUB timeout fires around two minutes** on this hardware, not at its
    configured value. Any "is this stuck?" heuristic needs a floor well above that,
    or it aborts working installs. One working attempt was killed seconds early.
+8. **Whole-run averages have produced a wrong number on this media path
+   twice now — both times the same total-over-total error, in different
+   units.** First, latency: 16,451 reads over ~1,800 s averages to
+   ~109 ms/read, which reads like "every request pays ~99 ms of dead time" and
+   points straight at Nagle. The real per-interval data showed ~30 ms reads
+   arriving in bursts of ~33 reads/sec, separated by genuine multi-second idle
+   windows with zero reads where the installer was doing unrelated work
+   (decompressing squashfs, writing to disk). A follow-up A/B test then showed
+   `TCP_NODELAY` changed nothing measurable. Second, throughput: dividing total
+   bytes by total elapsed time for a run that includes the ~2-minute
+   bootloader-menu idle at the start gives ≈453 KB/s, which looks like it
+   contradicts the documented ≈800–900 KB/s figure — it does not. The
+   documented figure is correctly windowed to the bulk streaming phase
+   (≈788 KB/s over 2.0m→3.3m elapsed; ≈660 KB/s over a single 15 s interval);
+   the total-over-total number is simply wrong, and this exact miscalculation
+   has already caused the accurate figure to be "corrected" incorrectly more
+   than once. On this media path idle periods are large, legitimate, and
+   installer-driven, so **every rate must be quoted with the window it was
+   measured over** — interval-over-interval, never total-over-total.
 
 ---
 
@@ -237,6 +294,13 @@ Recorded because each one cost real time.
    --answer-file <file>` rather than hand-placing files, target a disk explicitly
    (`disk-list` and `filter` are mutually exclusive, and ext4 requires exactly one
    matching disk), and expect ~2 minutes of GRUB wait before streaming starts.
+   The `READ TOC` bug that stopped every earlier attempt at OS handoff is fixed
+   and hardware-confirmed past that stall point — no install has run to
+   completion yet, but not because of that bug. Do not spend time re-chasing
+   Nagle/`TCP_NODELAY` for speed; that was tested and falsified (§3, §4.8). If
+   you do want to chase the remaining ~30 ms/read, the open lead is the BMC's
+   own relay turnaround, not the client socket — see the discriminating
+   measurement in §3.
 
 ### Then
 
