@@ -1,0 +1,14 @@
+---
+bugfixes:
+  - >-
+    ``asmb8_media`` - the emulated CD-ROM's ``READ TOC`` handler ignored the SCSI
+    CDB's allocation length and always returned its full 20-byte response. A Linux
+    initrd requesting 12 bytes received 20, which is a protocol violation; the
+    host's optical layer concluded the disc had no valid track structure, never
+    read the ISO9660 superblock, and reported no valid installation medium. Only a
+    real operating system is affected - bootloaders read via firmware I/O and never
+    issue ``READ TOC``, so booting an installer appeared to work while the
+    subsequent handoff to the OS always failed. The handler now truncates to the
+    allocation length while still reporting the full available length in the TOC
+    data-length field, so an initiator that under-allocated can retry with a larger
+    buffer.

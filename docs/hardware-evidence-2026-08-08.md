@@ -299,15 +299,86 @@ subsequent reset it **reverted to `default`** — confirming one-time override
 semantics and that no persistent boot-order change occurred. Note `get_mci()`
 returns a string, not a mapping.
 
+## READ TOC must honour the CDB allocation length
+
+Added 2026-08-09. This was the single most consequential protocol finding of the
+whole effort, it took four failed install attempts and five wrong diagnoses to
+reach, and it is worth reading in full before touching the SCSI layer.
+
+**The bug.** `CDROMDevice._read_toc` ignored the CDB entirely and always returned
+its full 20-byte response — a 4-byte header plus two 8-byte track descriptors.
+A Linux initrd probing the emulated drive issued `TEST UNIT READY` followed by
+`READ TOC` with an allocation length of **12** bytes (`CDB[7:9] == 0x000c`).
+Returning more data than the initiator allocated for is a SCSI protocol violation.
+
+**The consequence, in order.** Linux's optical layer read the oversized response,
+concluded the disc had no valid track structure, and therefore never read the
+ISO9660 superblock. `blkid` consequently reported no filesystem type. The Proxmox
+installer, searching for a device containing its ISO, found no candidate with a
+valid `iso9660` signature, reported `no device with valid ISO found, please check
+your installation medium`, and dropped to a debug shell.
+
+**Why it hid for so long, and this is the important part.** *Bootloaders never
+issue `READ TOC`.* GRUB reads through firmware I/O (the BIOS enumerates the device
+as `AMI Virtual CDROM0`), so it loaded the kernel and initrd flawlessly on every
+single attempt. Only a real operating system asks for a TOC. The failure therefore
+always occurred at exactly the firmware-to-OS handoff, which produced two
+misleading effects:
+
+- Every attempt stopped after streaming an identical ~71 MiB / ~2,838 read
+  requests — that being precisely kernel + initrd loaded *via GRUB*.
+- Four completely different configurations produced byte-identical read traces,
+  which invited the inference that the difference between them was irrelevant.
+  The correct inference was that execution never reached the point where any of
+  them mattered.
+
+**What was wrongly blamed, in order:** answer-file placement; the disk target;
+the `auto-installer-mode.toml` `mode` value; a missing `usb-storage` driver; and,
+underlying all of them, treating "the evidence is consistent with my hypothesis"
+as "the evidence confirms my hypothesis." None of those four was ever reached by
+execution.
+
+**What actually identified it.** Two cheap observations, neither of them inference:
+
+1. Instrumenting the client to log *every* inbound opcode, not just reads. That
+   showed `TEST UNIT READY` and `READ TOC` arriving ~10 seconds *after* GRUB
+   finished — proving a second, later consumer (Linux) was probing the device, and
+   killing the missing-driver theory. It also showed `REQUEST SENSE` was **never**
+   sent, so the host was not reporting an error: it believed our malformed data.
+2. Reading the console. `/dev/sr0` existed, `/proc/partitions` showed it at
+   exactly the ISO's size (1,667,264 KiB), and `skipped-devs.txt` showed the
+   installer correctly skipping the data disks while *not* skipping `sr0` — i.e.
+   it examined our device and rejected it.
+
+**Provenance note.** The defect was inherited from the MIT-licensed Go reference
+implementation named in `NOTICE`, whose own `readTOC` also takes the CDB and
+ignores it. That project's virtual media is described as live-verified, which it
+presumably was — against a bootloader, which would never have exposed this. This
+is a genuine divergence from the reference on a real defect, not a stylistic
+choice, and `NOTICE` records it as such.
+
+Per SCSI, the two-byte TOC data-length field still reports the **full** available
+length even when the returned data is truncated, so an initiator that
+under-allocated can detect this and retry with a larger buffer. Implemented that
+way, with a regression test asserting the exact 12-byte case plus at-length,
+above-length and tiny-allocation behaviour. The pre-existing golden vector could
+not have caught this: its allocation length is 0, which correctly means "no limit
+stated" and returns everything.
+
+**No other opcode is affected.** `READ CAPACITY(10)` returns exactly the 8 bytes
+its requests ask for, and `READ(10)`/`READ(12)` are bounded by their own block
+counts.
+
 ## Still unproven — do not claim these
 
-- **A completed unattended OS install.** We reached the installer streaming its
-  squashfs; we have never driven an install to completion.
 - **Whether the guest OS can obtain its own media session.** Once Linux boots it
   re-enumerates USB storage with its own driver, and `cd-media` allows exactly
   **one** session with **no** server-side timeout to reclaim an abandoned one. If
   our daemon holds the slot, the guest may be unable to reach its own media —
-  failing *after* the installer appears to start. This is untested.
+  failing *after* the installer appears to start. Partially addressed: a live
+  Alpine booted from this path kept reading through the same held session past
+  kernel handoff, so the session does appear to carry through to the guest. Not
+  yet confirmed for a full installer that writes to disk.
 - **KVM video decoding.** We have the greeting and the framing; no console frame
   has been decoded from this board.
 - **Virtual floppy and virtual hard disk device classes.** The ports bind, but
