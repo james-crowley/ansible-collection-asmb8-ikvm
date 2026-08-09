@@ -1,0 +1,78 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Fallback path, used only when proxmox-auto-install-assistant is not
+# available (or asmb8_autoinstall_iso_prefer_vendor_tool is false while a
+# container runtime is present). See templates/container_prepare.sh.j2 for
+# the actual xorriso recipe and its provenance, and
+# docs/proxmox-autoinstall.md for how much of this path is proven versus
+# not: the vendor tool path has real evidence behind it, this one currently
+# does not.
+
+- name: Render the auto-installer-mode.toml this fallback path bakes into the ISO
+  ansible.builtin.template:
+    src: auto_installer_mode.toml.j2
+    dest: "{{ _asmb8_autoinstall_iso_work_path }}/root/auto-installer-mode.toml"
+    mode: "0600"
+  delegate_to: localhost
+  run_once: true
+
+- name: Copy the source ISO into the working directory
+  ansible.builtin.copy:
+    src: "{{ asmb8_autoinstall_iso_source }}"
+    dest: "{{ _asmb8_autoinstall_iso_work_path }}/in.iso"
+    mode: "0600"
+    remote_src: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Copy a custom grub.cfg override into the working directory, if one was supplied
+  ansible.builtin.copy:
+    src: "{{ asmb8_autoinstall_iso_grub_cfg_override }}"
+    dest: "{{ _asmb8_autoinstall_iso_work_path }}/root/grub.cfg"
+    mode: "0600"
+    remote_src: true
+  when: asmb8_autoinstall_iso_grub_cfg_override | length > 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Render the container's ISO-preparation script
+  ansible.builtin.template:
+    src: container_prepare.sh.j2
+    dest: "{{ _asmb8_autoinstall_iso_work_path }}/prepare.sh"
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true
+
+- name: Run the container-based xorriso rebuild
+  ansible.builtin.command:
+    argv:
+      - "{{ asmb8_autoinstall_iso_container_runtime }}"
+      - run
+      - --rm
+      - -v
+      - "{{ _asmb8_autoinstall_iso_work_path }}:/work{{ asmb8_autoinstall_iso_container_mount_options }}"
+      - "{{ asmb8_autoinstall_iso_container_image }}"
+      - bash
+      - /work/prepare.sh
+  register: _asmb8_autoinstall_iso_container_result
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Report the container's own output
+  ansible.builtin.debug:
+    msg: "{{ _asmb8_autoinstall_iso_container_result.stdout_lines + _asmb8_autoinstall_iso_container_result.stderr_lines }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Copy the rebuilt ISO out of the working directory to the requested output path
+  ansible.builtin.copy:
+    src: "{{ _asmb8_autoinstall_iso_work_path }}/out.iso"
+    dest: "{{ asmb8_autoinstall_iso_output }}"
+    mode: "0644"
+    remote_src: true
+  delegate_to: localhost
+  run_once: true

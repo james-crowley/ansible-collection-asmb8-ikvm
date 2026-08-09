@@ -1,0 +1,49 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+galaxy_info:
+  role_name: asmb8_autoinstall_iso
+  namespace: james_crowley
+  author: Jim Crowley (@james-crowley)
+  description: >-
+    Prepares a stock Proxmox VE installer ISO for genuinely unattended
+    installation: renders a validated answer.toml from role variables, then
+    bakes it into a copy of the ISO using Proxmox's own
+    proxmox-auto-install-assistant when available, or a container-based
+    xorriso rebuild otherwise. A stock ISO's GRUB menu waits forever for a
+    human at the console -- see README.md for why -- so this is the step that
+    actually removes the human from a bare-metal install driven by
+    asmb8_baremetal_install. Runs entirely on the controller: it never talks
+    to a BMC and never touches a block device, only local ISO files. Refuses
+    to produce a prepared ISO unless the caller has explicitly named the
+    disk(s) to wipe and explicitly confirmed the destructive intent -- see
+    README.md "Disk safety" before setting any variable here.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.17"
+  # Every task in this role delegates to localhost, exactly like
+  # asmb8_baremetal_install and the modules it drives: this role only ever
+  # builds a file on the controller, so "platforms" below describes
+  # controllers this role can run on, not targets it manages.
+  platforms:
+    - name: EL
+      versions: [all]
+    - name: Ubuntu
+      versions: [all]
+    - name: Debian
+      versions: [all]
+    - name: Fedora
+      versions: [all]
+    - name: MacOSX
+      versions: [all]
+  galaxy_tags:
+    - proxmox
+    - iso
+    - autoinstall
+    - unattended
+    - provisioning
+    - baremetal
+    - xorriso
+
+dependencies: []

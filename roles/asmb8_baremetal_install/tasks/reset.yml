@@ -1,0 +1,69 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# The destructive boundary. Everything before this point is reversible or
+# read-only; this is not.
+#
+# This role issues a single asmb8_power state=boot, always -- unlike the
+# sibling james_crowley.intel_amt collection's amt_baremetal_install role,
+# which has to branch between amt_power state=on and state=reset itself.
+# asmb8_power's `boot` state already implements that exact branch internally
+# ("turns the system on if it is off, otherwise resets it" -- see its
+# DOCUMENTATION), because pyghmi's own set_power()/get_power() only ever
+# report `on`/`off`, so asmb8_power can make that decision from a state read it
+# performs itself, atomically with the read tasks/probe.yml already did going
+# stale. Duplicating that branch here would only reintroduce a race between
+# "what tasks/probe.yml observed" and "what is actually true right now".
+#
+# asmb8_power's own `indeterminate=true` signal (confirmation timeout after an
+# accepted command) is documented as never firing for state=boot/reset at all:
+# pyghmi's confirmation loop only runs for on/off/shutdown (see asmb8_power's
+# wait_timeout documentation and module_utils/ipmi.py's `_CONFIRMABLE_STATES`).
+# That does NOT mean a boot/reset failure here is any more certain than an
+# on/off one would be -- IPMI is a fire-and-forget request/response over UDP,
+# and a network blip after the BMC accepted the command but before its
+# response arrived looks identical, from this role's side, to the command
+# never having been accepted at all. This role therefore treats ANY failure in
+# this task as indeterminate, unconditionally, rather than relying on a signal
+# the module itself cannot produce for this call. That is exactly what the
+# rescue block below records.
+
+- name: Issue the one-time boot transition
+  block:
+    - name: Issue the transition via asmb8_power
+      james_crowley.asmb8_ikvm.asmb8_power:
+        ipmi_port: "{{ asmb8_baremetal_install_ipmi_port }}"
+        state: boot
+      delegate_to: localhost
+      no_log: true
+      register: asmb8_baremetal_install_reset_result
+
+    - name: Record that the power request was accepted
+      ansible.builtin.set_fact:
+        asmb8_baremetal_install_run_state: "{{ asmb8_baremetal_install_run_state | combine({'reset_issued': true}) }}"
+
+    - name: Persist run state after issuing the reset
+      ansible.builtin.include_tasks: save_state.yml
+  rescue:
+    - name: Record an uncertain reset outcome before re-raising
+      ansible.builtin.set_fact:
+        asmb8_baremetal_install_run_state: >-
+          {{ asmb8_baremetal_install_run_state | combine({'reset_issued': true,
+                                       'last_failure': 'asmb8_power state=boot failed or timed out; outcome uncertain'}) }}
+
+    - name: Persist the uncertain state immediately
+      ansible.builtin.include_tasks: save_state.yml
+
+    - name: Re-raise -- this role never retries a reset automatically
+      ansible.builtin.fail:
+        msg: >-
+          asmb8_power state=boot failed or timed out for
+          {{ asmb8_baremetal_install_host }}. IPMI is fire-and-forget: a failure
+          here is indistinguishable from a boot/reset that actually happened, so
+          this run records reset_issued=true and stops rather than guessing. A
+          later run of this role refuses to proceed automatically (see
+          tasks/state.yml) until a human confirms the machine's actual state
+          (KVM/physical console) and re-runs with
+          -e asmb8_baremetal_install_force_resume=true.

@@ -1,0 +1,39 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Preflight read before any mutation. asmb8_info never mutates IPMI state (its
+# own DOCUMENTATION guarantees changed=false always), so this is safe to run
+# even against a machine this role will ultimately refuse to touch.
+#
+# include_web_session is deliberately left at its default (false): this role
+# has no use for the small .asp diagnostic read that option gates, and that
+# option's own DOCUMENTATION is explicit that turning it on creates real
+# BMC-side web-session state as a side effect of logging in -- a cost this
+# probe should not pay just to read IPMI facts. Nothing here fetches the
+# jviewer.jnlp document either, so asmb8.media.port_mode below is always
+# "unknown" -- by the same design asmb8_info's own DOCUMENTATION states:
+# determining it requires a JNLP fetch, which itself allocates a BMC-side
+# session, which a read-only module must not perform implicitly. This role does
+# not need that value: tasks/attach_media.yml drives asmb8_media directly, which
+# performs its own JNLP fetch as part of a real attach.
+
+- name: Read IPMI-observed capabilities and state
+  james_crowley.asmb8_ikvm.asmb8_info:
+    ipmi_port: "{{ asmb8_baremetal_install_ipmi_port }}"
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_probe
+
+- name: Require the endpoint to be reachable over IPMI
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_probe.asmb8.reachable
+    fail_msg: "asmb8_info reports {{ asmb8_baremetal_install_host }} unreachable over IPMI; refusing to proceed."
+
+- name: Report the observed power state ahead of the destructive boundary
+  ansible.builtin.debug:
+    msg: >-
+      {{ asmb8_baremetal_install_host }} observed power state:
+      {{ asmb8_baremetal_install_probe.asmb8.ipmi.power_state | default('(read failed)') }}.

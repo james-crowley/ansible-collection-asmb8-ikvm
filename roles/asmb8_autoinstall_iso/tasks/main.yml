@@ -1,0 +1,76 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Every task in this role runs on the controller, never on a managed node --
+# see meta/main.yml. delegate_to/run_once are set explicitly on every task
+# rather than relied on implicitly, so including this role from a play that
+# targets real hosts still does the right thing.
+
+- name: Assert the destructive-confirmation gate and disk-safety guards are satisfied
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Stage a working directory for the rendered answer file and (if needed) the container rebuild
+  ansible.builtin.include_tasks: prepare_workdir.yml
+
+- name: Render and validate answer.toml
+  ansible.builtin.include_tasks: render_answer.yml
+
+- name: Decide which ISO preparation tooling to use
+  ansible.builtin.include_tasks: discover_tooling.yml
+
+- name: Prepare the ISO with proxmox-auto-install-assistant
+  ansible.builtin.include_tasks: prepare_with_vendor_tool.yml
+  when: _asmb8_autoinstall_iso_tooling == 'vendor'
+
+- name: Prepare the ISO with a container-based xorriso rebuild
+  ansible.builtin.include_tasks: prepare_with_container.yml
+  when: _asmb8_autoinstall_iso_tooling == 'container'
+
+- name: Refuse to proceed without a supported preparation tool
+  ansible.builtin.fail:
+    msg: >-
+      Neither proxmox-auto-install-assistant (searched as
+      '{{ asmb8_autoinstall_iso_vendor_tool_path }}') nor a container runtime
+      ('{{ asmb8_autoinstall_iso_container_runtime }}') is available on this
+      controller, so this role has no supported way to prepare an
+      auto-installing ISO. Install proxmox-auto-install-assistant (Debian
+      package proxmox-auto-install-assistant, or from the pve-installer
+      source), install {{ asmb8_autoinstall_iso_container_runtime }}, or set
+      asmb8_autoinstall_iso_container_runtime to a runtime that is installed.
+      Refusing rather than emitting an unprepared, stock ISO that would look
+      like a successful run but boot straight into the same indefinite GRUB
+      wait documented in README.md.
+  when: _asmb8_autoinstall_iso_tooling == 'none'
+  delegate_to: localhost
+  run_once: true
+
+- name: Confirm the prepared ISO was actually written
+  ansible.builtin.stat:
+    path: "{{ asmb8_autoinstall_iso_output }}"
+  register: _asmb8_autoinstall_iso_output_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the prepared ISO exists and is non-empty
+  ansible.builtin.assert:
+    that:
+      - _asmb8_autoinstall_iso_output_stat.stat.exists
+      - _asmb8_autoinstall_iso_output_stat.stat.size > 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_output ({{ asmb8_autoinstall_iso_output }}) was
+      not produced (or is empty) after the preparation step reported
+      success. Treat this as the preparation tool failing silently rather
+      than as this role's own bug -- inspect its output above.
+    success_msg: >-
+      Prepared ISO written to {{ asmb8_autoinstall_iso_output }}
+      ({{ _asmb8_autoinstall_iso_output_stat.stat.size }} bytes). This has
+      NOT been proven to complete a real unattended install on hardware --
+      see docs/proxmox-autoinstall.md.
+  delegate_to: localhost
+  run_once: true
+
+- name: Clean up the staged working directory
+  ansible.builtin.include_tasks: cleanup_workdir.yml
+  when: not asmb8_autoinstall_iso_keep_work_dir

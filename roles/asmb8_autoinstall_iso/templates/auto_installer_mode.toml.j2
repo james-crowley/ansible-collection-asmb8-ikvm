@@ -1,0 +1,26 @@
+{# Copyright (c) 2026 Jim Crowley                                            #}
+{# GNU General Public License v3.0 or later                                 #}
+{# SPDX-License-Identifier: GPL-3.0-or-later                                #}
+{#                                                                          #}
+{# Only used by the container/xorriso FALLBACK path                        #}
+{# (tasks/prepare_with_container.yml). When proxmox-auto-install-assistant  #}
+{# itself runs (the preferred path), it writes this file inside the ISO    #}
+{# itself and this template is never rendered.                            #}
+{#                                                                          #}
+{# UNVERIFIED byte-for-byte: reconstructed from public inspection of       #}
+{# proxmox-auto-install-assistant's AutoInstSettings struct (mode,          #}
+{# partition_label, http.{url,cert_fingerprint,token}), serialised with    #}
+{# `toml::to_string_pretty`, NOT from a captured real output file. The     #}
+{# grub.cfg on a stock Proxmox VE ISO only checks that this file EXISTS at #}
+{# the ISO root -- it does not appear to parse its contents to decide      #}
+{# whether to show the "Automated" menu entry or set the 10s timeout (see  #}
+{# docs/proxmox-autoinstall.md fact 1) -- but the running installer        #}
+{# (proxmox-fetch-answer) does read `mode` to know where to fetch          #}
+{# answer.toml from, so getting this wrong likely means the menu           #}
+{# times out into the automated entry but the install then fails to find  #}
+{# its answer file, not that the menu itself misbehaves. Treat this file  #}
+{# as the first thing to re-derive from the installer's actual source for #}
+{# the specific Proxmox VE version in use if the fallback path's prepared  #}
+{# ISO boots into the automated entry but then stalls looking for its     #}
+{# answer file.                                                           #}
+mode = "iso"

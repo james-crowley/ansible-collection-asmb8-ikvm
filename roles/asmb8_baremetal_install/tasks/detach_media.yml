@@ -1,0 +1,49 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Included from tasks/main.yml's `always` block (and, optionally, from its own
+# early-release step -- see asmb8_baremetal_install_media_release_after_handoff),
+# so this runs whether the lifecycle above succeeded, failed validation, or
+# failed mid-flight. It is always safe to run even when nothing was ever
+# attached this run: asmb8_baremetal_install_run_state.session_id is simply
+# null in that case, and asmb8_media's own state=detached contract already
+# reports changed=false with nothing to do when no state file exists for the
+# given session_id (see its DOCUMENTATION) -- there is no need to duplicate
+# that check here beyond the truthiness guard below.
+#
+# Read that guard precisely: it guards against "the media phase never
+# started", NOT against "the attach failed". Those would be the same condition
+# only if session_id were recorded from a successful attach's *result* --
+# tasks/attach_media.yml claims and persists the session id BEFORE asmb8_media
+# can spawn anything, specifically so that by the time any attach outcome
+# exists (success, error, or an indeterminate timeout) there is already an id
+# here to detach. That is what makes "always detach" a guarantee rather than an
+# intention -- see README.md's single-media-session hazard section for why that
+# matters more on this board than it might elsewhere: the BMC's cd-media slot
+# is single-occupancy, board-wide, with no server-side timeout to reclaim an
+# abandoned session.
+#
+# This task deliberately omits `image` -- irrelevant to state=detached, which
+# never opens a new connection at all, only signals an existing daemon by pid.
+
+- name: Detach iUSB media, if a session was ever attached this run
+  james_crowley.asmb8_ikvm.asmb8_media:
+    session_id: "{{ asmb8_baremetal_install_run_state.session_id }}"
+    runtime_dir: "{{ asmb8_baremetal_install_media_runtime_dir }}"
+    cd_port: "{{ asmb8_baremetal_install_media_cd_port }}"
+    detach_timeout: "{{ asmb8_baremetal_install_media_detach_timeout }}"
+    state: detached
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_media_detach_result
+  when: asmb8_baremetal_install_run_state.session_id is truthy
+
+- name: Record that media has been detached
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: "{{ asmb8_baremetal_install_run_state | combine({'detached': true}) }}"
+  when: asmb8_baremetal_install_run_state.session_id is truthy
+
+- name: Persist run state after detach
+  ansible.builtin.include_tasks: save_state.yml

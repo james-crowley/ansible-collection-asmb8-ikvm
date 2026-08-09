@@ -1,0 +1,89 @@
+{# Copyright (c) 2026 Jim Crowley                                            #}
+{# GNU General Public License v3.0 or later                                 #}
+{# SPDX-License-Identifier: GPL-3.0-or-later                                #}
+{#                                                                          #}
+{# Rendered by james_crowley.asmb8_ikvm's asmb8_autoinstall_iso role.       #}
+{# Generated file -- do not hand-edit; edit the asmb8_autoinstall_iso_answer_*  #}
+{# role variables instead, or the next run overwrites this.                #}
+{#                                                                          #}
+{# Key spellings follow the current kebab-case answer.toml schema          #}
+{# documented at https://pve.proxmox.com/wiki/Automated_Installation for   #}
+{# Proxmox VE 8.4+/9.x. See defaults/main.yml for per-key confidence notes  #}
+{# -- most keys here are directly attested there; a few (marked UNVERIFIED #}
+{# below) are the role's best-effort rendering of an option this role has  #}
+{# not independently confirmed against installer source or a real run.     #}
+{# ALWAYS run this through `proxmox-auto-install-assistant validate-answer` #}
+{# before trusting it -- tasks/render_answer.yml does this automatically   #}
+{# whenever the vendor tool is present, and refuses to proceed if it       #}
+{# reports the file invalid.                                               #}
+{% macro toml_str(value) -%}
+"{{ value | string | replace('\\', '\\\\') | replace('"', '\\"') }}"
+{%- endmacro %}
+{% macro toml_scalar(value) -%}
+{%- if value is sameas true -%}
+true
+{%- elif value is sameas false -%}
+false
+{%- elif value is number -%}
+{{ value }}
+{%- else -%}
+{{ toml_str(value) }}
+{%- endif -%}
+{%- endmacro %}
+{% macro kebab(key) -%}
+{{ key | replace('_', '-') }}
+{%- endmacro %}
+[global]
+keyboard = {{ toml_str(asmb8_autoinstall_iso_answer_keyboard) }}
+country = {{ toml_str(asmb8_autoinstall_iso_answer_country) }}
+fqdn = {{ toml_str(asmb8_autoinstall_iso_answer_fqdn) }}
+{% if asmb8_autoinstall_iso_answer_mailto %}
+mailto = {{ toml_str(asmb8_autoinstall_iso_answer_mailto) }}
+{% endif -%}
+timezone = {{ toml_str(asmb8_autoinstall_iso_answer_timezone) }}
+{% if asmb8_autoinstall_iso_answer_root_password_hashed -%}
+root-password-hashed = {{ toml_str(asmb8_autoinstall_iso_answer_root_password_hashed) }}
+{% elif asmb8_autoinstall_iso_answer_root_password -%}
+root-password = {{ toml_str(asmb8_autoinstall_iso_answer_root_password) }}
+{% endif -%}
+reboot-on-error = {{ toml_scalar(asmb8_autoinstall_iso_answer_reboot_on_error) }}
+reboot-mode = {{ toml_str(asmb8_autoinstall_iso_answer_reboot_mode) }}
+
+[network]
+source = {{ toml_str(asmb8_autoinstall_iso_answer_network_source) }}
+{% if asmb8_autoinstall_iso_answer_network_source == 'from-answer' -%}
+cidr = {{ toml_str(asmb8_autoinstall_iso_answer_network_cidr) }}
+dns = {{ toml_str(asmb8_autoinstall_iso_answer_network_dns) }}
+gateway = {{ toml_str(asmb8_autoinstall_iso_answer_network_gateway) }}
+{% endif -%}
+{% if asmb8_autoinstall_iso_answer_network_filter %}
+{% for _key, _value in asmb8_autoinstall_iso_answer_network_filter.items() -%}
+filter.{{ _key }} = {{ toml_scalar(_value) }}
+{% endfor -%}
+{% endif %}
+[disk-setup]
+filesystem = {{ toml_str(asmb8_autoinstall_iso_answer_disk_filesystem) }}
+{% if asmb8_autoinstall_iso_answer_disk_list -%}
+disk-list = [{% for _disk in asmb8_autoinstall_iso_answer_disk_list %}{{ toml_str(_disk) }}{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif -%}
+{% if asmb8_autoinstall_iso_answer_disk_filter %}
+{% for _key, _value in asmb8_autoinstall_iso_answer_disk_filter.items() -%}
+filter.{{ _key }} = {{ toml_scalar(_value) }}
+{% endfor -%}
+filter-match = {{ toml_str(asmb8_autoinstall_iso_answer_disk_filter_match) }}
+{% endif -%}
+{% if asmb8_autoinstall_iso_answer_disk_filesystem == 'zfs' %}
+{% for _key, _value in asmb8_autoinstall_iso_answer_disk_zfs.items() -%}
+zfs.{{ kebab(_key) }} = {{ toml_scalar(_value) }}
+{% endfor -%}
+{% endif -%}
+{% if asmb8_autoinstall_iso_answer_disk_filesystem in ['ext4', 'xfs'] %}
+{% for _key, _value in asmb8_autoinstall_iso_answer_disk_lvm.items() -%}
+lvm.{{ kebab(_key) }} = {{ toml_scalar(_value) }}
+{% endfor -%}
+{% endif -%}
+{% if asmb8_autoinstall_iso_answer_disk_filesystem == 'btrfs' %}
+{% for _key, _value in asmb8_autoinstall_iso_answer_disk_btrfs.items() -%}
+btrfs.{{ kebab(_key) }} = {{ toml_scalar(_value) }}
+{% endfor -%}
+{% endif %}

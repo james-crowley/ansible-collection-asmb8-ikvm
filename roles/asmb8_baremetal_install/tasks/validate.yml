@@ -1,0 +1,126 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Guards run before anything else, in order of how bad it would be to miss
+# each one. Fan-out is checked first because it is the one mistake that turns
+# a single-machine mistake into a many-machine incident.
+#
+# One assertion carries the whole fan-out guarantee, and deliberately so --
+# same reasoning as the sibling james_crowley.intel_amt collection's
+# amt_baremetal_install role: `ansible_play_hosts_all` is the play's *full*
+# host roster (restrictions ignored); `ansible_play_batch` is only the current
+# `serial:` batch drawn from that same roster, so it is always a subset.
+# `delegate_to: localhost` changes *where* a task runs, not *how many times*:
+# a ten-host play still issues ten resets, `serial: 1` or not.
+
+- name: Guard against inventory fan-out -- this role must run against exactly one host per play
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts_all | length == 1
+    fail_msg: >-
+      asmb8_baremetal_install refuses to run: this play targets
+      {{ ansible_play_hosts_all | length }} hosts
+      ({{ ansible_play_hosts_all | join(', ') }}); the current batch contains
+      {{ ansible_play_batch | length }}. IPMI power/boot actions and iUSB media
+      attach are physically disruptive, and delegate_to: localhost does not stop
+      Ansible from fanning a task out across every host in a play -- a ten-host
+      play still issues ten resets, and `serial: 1` does not change that, it
+      only spreads them out. Target exactly one host (e.g.
+      `ansible-playbook ... -l <single-host>`).
+    success_msg: Fan-out guard passed -- this play targets exactly one host.
+
+- name: Require the destructive-action confirmation variable
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_confirm_destructive | bool
+    fail_msg: >-
+      Refusing to continue: asmb8_baremetal_install power-cycles and can reimage
+      {{ asmb8_baremetal_install_host }}. Re-run with -e asmb8_baremetal_install_confirm_destructive=true
+      only after confirming this is the intended target.
+    success_msg: Destructive-action confirmation received.
+
+- name: Require connection settings that are actually consistent
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_host is truthy
+      - asmb8_baremetal_install_password is truthy
+      - (asmb8_baremetal_install_use_tls | bool and asmb8_baremetal_install_tls_fingerprint is truthy) or
+        (not (asmb8_baremetal_install_use_tls | bool) and asmb8_baremetal_install_allow_insecure_transport | bool)
+    fail_msg: >-
+      Missing or inconsistent connection settings. asmb8_baremetal_install_host and
+      asmb8_baremetal_install_password are always required; asmb8_baremetal_install_tls_fingerprint
+      is required when asmb8_baremetal_install_use_tls is true (the default), and
+      asmb8_baremetal_install_allow_insecure_transport must be explicitly true when
+      asmb8_baremetal_install_use_tls is false. See plugins/doc_fragments/connection.py.
+
+- name: Require an installer ISO -- this role has exactly one boot path
+  # asmb8_media has no PXE/floppy/answer-file fallback: it attaches exactly one
+  # read-only ISO to the CD-ROM slot (see its DOCUMENTATION), and that is this
+  # role's entire reason to exist -- get a bare-metal host booting a local ISO
+  # with no PXE/DHCP/TFTP/NFS/CIFS infrastructure. There is no other source of
+  # bootable media for this role to fall back to.
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_iso_path is truthy
+    fail_msg: >-
+      asmb8_baremetal_install_iso_path is required -- this role has exactly one
+      boot path (a local ISO attached as virtual media over iUSB) and no PXE or
+      other fallback. See defaults/main.yml's comment on this variable for the
+      stock-ISO-stops-at-a-menu limitation before choosing one.
+
+- name: Require an explicit hand-off endpoint when the hand-off wait is enabled
+  # asmb8_baremetal_install_handoff_host has no default at all, on purpose -- see
+  # defaults/main.yml's comment on this variable. Refusing here, before probe,
+  # before attach, before the reset, is strictly cheaper than discovering a wrong
+  # guess after burning the full asmb8_baremetal_install_handoff_timeout (default
+  # 3600s) on a machine that may have installed perfectly.
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_handoff_host is truthy
+    fail_msg: >-
+      asmb8_baremetal_install_wait_for_handoff is true (the default) but
+      asmb8_baremetal_install_handoff_host is not set. This role waits for the
+      freshly installed/booted OS to answer on port
+      {{ asmb8_baremetal_install_handoff_port }}, and the OS does not necessarily
+      answer on {{ asmb8_baremetal_install_host }} -- that is the BMC management
+      address. Set asmb8_baremetal_install_handoff_host explicitly to whatever the
+      installed OS answers on (for a conventional inventory that is usually
+      `{{ '{{' }} inventory_hostname {{ '}}' }}`), or set
+      asmb8_baremetal_install_wait_for_handoff=false to skip the hand-off wait
+      entirely. It is not defaulted because a wrong guess is only discovered
+      after the reset has already happened, having burnt
+      asmb8_baremetal_install_handoff_timeout seconds (currently
+      {{ asmb8_baremetal_install_handoff_timeout }}) on a machine that may well
+      have installed perfectly.
+    success_msg: >-
+      Hand-off endpoint set explicitly ({{ asmb8_baremetal_install_handoff_host }}:{{
+      asmb8_baremetal_install_handoff_port }}).
+  when: asmb8_baremetal_install_wait_for_handoff | bool
+
+- name: Refuse an unpinned target-disk identifier, even though no answer-file feature exists yet
+  # This guard predates the feature it protects. asmb8_media, today, has no
+  # answer-file/unattended-install path at all -- it only ever attaches one
+  # read-only ISO. asmb8_baremetal_install_target_disk is currently unused by
+  # any task in this role. It exists, and this assertion exists, so that the
+  # day a future answer-file feature is added to this role (or built on top of
+  # it), it inherits a refusal that already states why guessing a disk is
+  # unacceptable, rather than that feature's author having to remember to add
+  # one. See defaults/main.yml's comment on this variable for the disk-safety
+  # reasoning in full.
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_target_disk is match('^/dev/disk/by-id/.+$') or
+        asmb8_baremetal_install_target_disk is match('^/dev/disk/by-path/.+$') or
+        asmb8_baremetal_install_target_disk is match('^serial:.+$')
+    fail_msg: >-
+      asmb8_baremetal_install_target_disk={{ asmb8_baremetal_install_target_disk }} is not a
+      stable disk identifier. This lab target has a wipeable NVMe AND additional
+      drives whose contents are unknown and possibly wanted -- a bare device node
+      (/dev/sdX, /dev/nvme0n1), or a wildcard/placeholder value ("first", "any",
+      "*", "auto"), is enumeration-order-dependent and refused outright. Use a
+      path under /dev/disk/by-id/ or /dev/disk/by-path/, or an explicit
+      serial:<value> identifier, once a feature that actually consumes this
+      variable exists.
+  when: asmb8_baremetal_install_target_disk is not none

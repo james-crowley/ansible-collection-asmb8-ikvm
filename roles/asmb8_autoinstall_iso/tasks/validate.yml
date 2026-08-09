@@ -1,0 +1,238 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Disk safety and the destructive-confirmation gate. See README.md "Disk
+# safety" for the reasoning; this file is the enforcement of it. Every
+# assertion here is meant to fail LOUD and SPECIFIC -- each one names
+# exactly which variable is wrong and why, rather than a generic "invalid
+# input", because the caller reading this output at 2am with a screwdriver
+# in hand is the audience that matters.
+
+- name: Assert the destructive-confirmation gate is explicitly set to true
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_confirm_destructive | bool
+    fail_msg: >-
+      Refusing to prepare an auto-install ISO:
+      asmb8_autoinstall_iso_confirm_destructive is not set to a truthy value
+      (matching asmb8_baremetal_install_confirm_destructive's own gate in
+      this collection: `true`, `yes`, `"true"`, `-e ...=true` on the command
+      line all count; the unset default of `false` does not). The ISO this
+      role produces boots straight into an installer that ERASES every disk
+      named by asmb8_autoinstall_iso_answer_disk_list /
+      asmb8_autoinstall_iso_answer_disk_filter, with NO PROMPT, the moment the
+      target machine boots it. Set
+      asmb8_autoinstall_iso_confirm_destructive: true only after you
+      have verified the disk target below is correct for THIS machine -- see
+      README.md "Disk safety".
+    success_msg: Destructive-confirmation gate satisfied.
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the source ISO path and output path are both set
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_source | length > 0
+      - asmb8_autoinstall_iso_output | length > 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_source and asmb8_autoinstall_iso_output are
+      required and have no default -- see defaults/main.yml.
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the source and output paths are not the same file
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_source != asmb8_autoinstall_iso_output
+    fail_msg: >-
+      asmb8_autoinstall_iso_source and asmb8_autoinstall_iso_output name the
+      same path ({{ asmb8_autoinstall_iso_output }}). Preparing an ISO reads
+      the source while writing the output; pick a distinct output path.
+  delegate_to: localhost
+  run_once: true
+
+- name: Stat the source ISO
+  ansible.builtin.stat:
+    path: "{{ asmb8_autoinstall_iso_source }}"
+  register: _asmb8_autoinstall_iso_source_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the source ISO exists and is a regular, readable file
+  ansible.builtin.assert:
+    that:
+      - _asmb8_autoinstall_iso_source_stat.stat.exists
+      - _asmb8_autoinstall_iso_source_stat.stat.isreg
+      - _asmb8_autoinstall_iso_source_stat.stat.readable
+    fail_msg: >-
+      asmb8_autoinstall_iso_source ({{ asmb8_autoinstall_iso_source }}) does
+      not exist, is not a regular file, or is not readable by the account
+      running Ansible.
+  delegate_to: localhost
+  run_once: true
+
+- name: Stat the output path
+  ansible.builtin.stat:
+    path: "{{ asmb8_autoinstall_iso_output }}"
+  register: _asmb8_autoinstall_iso_output_pre_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Refuse to overwrite an existing output ISO unless asmb8_autoinstall_iso_force is set
+  ansible.builtin.assert:
+    that:
+      - (not _asmb8_autoinstall_iso_output_pre_stat.stat.exists) or asmb8_autoinstall_iso_force
+    fail_msg: >-
+      asmb8_autoinstall_iso_output ({{ asmb8_autoinstall_iso_output }})
+      already exists. Set asmb8_autoinstall_iso_force: true to overwrite it
+      deliberately, or choose a different output path.
+  delegate_to: localhost
+  run_once: true
+
+# --- Disk safety: the single most important guard in this role -------------
+# No default target disk exists anywhere in this role (see defaults/main.yml)
+# specifically so that an unset variable fails HERE, loudly, instead of
+# silently falling through to some "first disk" behaviour.
+
+- name: Assert exactly one disk-targeting mechanism is configured
+  ansible.builtin.assert:
+    that:
+      - (asmb8_autoinstall_iso_answer_disk_list | length > 0) != (asmb8_autoinstall_iso_answer_disk_filter | length > 0)
+    fail_msg: >-
+      Set exactly one of asmb8_autoinstall_iso_answer_disk_list or
+      asmb8_autoinstall_iso_answer_disk_filter -- never both, never neither.
+      There is deliberately NO default target disk: an auto-install answer
+      file wipes whatever disk it names, with no prompt, and this role will
+      not guess which disk that should be on your behalf. See README.md
+      "Disk safety".
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert every asmb8_autoinstall_iso_answer_disk_list entry is a concrete, non-wildcard kernel device name
+  vars:
+    _forbidden_disk_tokens: ["*", "?", "first", "any", "all", "auto", "default", "primary", "largest", "smallest", ""]
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_disk_list is sequence
+      - asmb8_autoinstall_iso_answer_disk_list | reject('string') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_list | map('trim') | select('equalto', '') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_list | map('lower') | map('trim') | select('in', _forbidden_disk_tokens) | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_list | select('search', '[]*?[]') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_list | select('match', '^/') | list | length == 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_disk_list contains an empty value, a
+      wildcard/glob character, a leading "/" (Proxmox's disk-list field
+      takes bare kernel names like "nvme0n1", not "/dev/nvme0n1"), or a
+      "first available"-style placeholder ("first", "any", "default",
+      "auto", "*", ...). None of those name a specific disk. This role will
+      not translate a vague target into a real device, because kernel disk
+      naming order is not guaranteed stable across reboots on a board with
+      more than one storage controller, and pointing an unattended installer
+      at the wrong disk is unrecoverable. Name the exact disk(s) explicitly,
+      or -- strongly preferred -- use asmb8_autoinstall_iso_answer_disk_filter
+      keyed on a udev property such as ID_SERIAL_SHORT instead. See
+      README.md "Disk safety".
+    success_msg: "disk_list target(s) look concrete: {{ asmb8_autoinstall_iso_answer_disk_list }}"
+  when: asmb8_autoinstall_iso_answer_disk_list | length > 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert every asmb8_autoinstall_iso_answer_disk_filter value is concrete and non-wildcard
+  vars:
+    _forbidden_disk_tokens: ["*", "?", "first", "any", "all", "auto", "default", ""]
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_disk_filter is mapping
+      - asmb8_autoinstall_iso_answer_disk_filter.keys() | reject('string') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_filter.values() | reject('string') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_filter.values() | map('trim') | select('equalto', '') | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_filter.values() | map('lower') | map('trim') | select('in', _forbidden_disk_tokens) | list | length == 0
+      - asmb8_autoinstall_iso_answer_disk_filter.values() | select('search', '[*?]') | list | length == 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_disk_filter contains an empty, wildcard, or
+      placeholder value. Every udev-property value must name a specific,
+      concrete disk property (e.g. a real serial number), not a pattern or
+      "any"/"first"/"default"-style placeholder. Use
+      `proxmox-auto-install-assistant device-info` against the real target
+      board to read its actual udev properties before writing this
+      variable -- never guess a serial. See README.md "Disk safety".
+    success_msg: "disk_filter target looks concrete: {{ asmb8_autoinstall_iso_answer_disk_filter }}"
+  when: asmb8_autoinstall_iso_answer_disk_filter | length > 0
+  delegate_to: localhost
+  run_once: true
+
+# --- Remaining answer.toml fields: required-ness and internal consistency --
+
+- name: Assert a supported disk-setup filesystem is chosen
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_disk_filesystem in ['ext4', 'xfs', 'zfs', 'btrfs']
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_disk_filesystem must be one of ext4, xfs,
+      zfs, or btrfs (per Proxmox's documented answer.toml schema; btrfs is
+      Proxmox VE-only). Got
+      '{{ asmb8_autoinstall_iso_answer_disk_filesystem }}'. There is no default
+      -- see defaults/main.yml.
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert required [global] identity fields are set
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_fqdn | length > 0
+      - asmb8_autoinstall_iso_answer_timezone | length > 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_fqdn and asmb8_autoinstall_iso_answer_timezone
+      are required and have no default -- see defaults/main.yml.
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert exactly one root password form is set
+  ansible.builtin.assert:
+    that:
+      - (asmb8_autoinstall_iso_answer_root_password | length > 0) != (asmb8_autoinstall_iso_answer_root_password_hashed | length > 0)
+    fail_msg: >-
+      Set exactly one of asmb8_autoinstall_iso_answer_root_password or
+      asmb8_autoinstall_iso_answer_root_password_hashed -- never both, never
+      neither. root_password_hashed is strongly preferred, so a plaintext
+      password never has to exist in a playbook or vaulted variable file --
+      see README.md "Generating a password hash".
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert network_source is a supported value
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_network_source in ['from-dhcp', 'from-answer']
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_network_source must be 'from-dhcp' or
+      'from-answer'. Got '{{ asmb8_autoinstall_iso_answer_network_source }}'.
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert static network fields are set when network_source is from-answer
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_answer_network_cidr | length > 0
+      - asmb8_autoinstall_iso_answer_network_dns | length > 0
+      - asmb8_autoinstall_iso_answer_network_gateway | length > 0
+    fail_msg: >-
+      asmb8_autoinstall_iso_answer_network_source is 'from-answer', which
+      requires asmb8_autoinstall_iso_answer_network_cidr,
+      asmb8_autoinstall_iso_answer_network_dns, and
+      asmb8_autoinstall_iso_answer_network_gateway to all be set.
+  when: asmb8_autoinstall_iso_answer_network_source == 'from-answer'
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the configured container runtime name is supported
+  ansible.builtin.assert:
+    that:
+      - asmb8_autoinstall_iso_container_runtime in ['docker', 'podman']
+    fail_msg: >-
+      asmb8_autoinstall_iso_container_runtime must be 'docker' or 'podman'.
+      Got '{{ asmb8_autoinstall_iso_container_runtime }}'.
+  delegate_to: localhost
+  run_once: true

@@ -1,0 +1,288 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# ---------------------------------------------------------------------------
+# Connection options. These map 1:1 onto the shared `connection` doc fragment
+# every module in this collection extends (plugins/doc_fragments/connection.py)
+# and are supplied to every asmb8_* module call via a single
+# `module_defaults: group/james_crowley.asmb8_ikvm.asmb8_ikvm:` entry on
+# tasks/main.yml's lifecycle block, rather than being repeated on every task --
+# every module in that action group (plugins/asmb8_info, asmb8_power,
+# asmb8_boot, asmb8_media) genuinely accepts this exact same set of options,
+# confirmed by reading each module's own `_connection_argument_spec()`.
+#
+# No inventory-variable fallback convention (e.g. an `asmb8_host` this role
+# would fall back to) is applied here, unlike the sibling james_crowley.intel_amt
+# collection's amt_baremetal_install role. That collection's fallback is
+# documented as matching its own README/docs/tests/hardware/inventory.yml.example
+# conventions; nothing in THIS collection has established an equivalent
+# convention yet, and inventing one here -- in a role, ahead of any such
+# documented convention existing -- would be a guess this role has no standing
+# to make. Every connection variable below is therefore this role's own,
+# unconditionally, with no fallback.
+#
+# Unlike that sibling role's defaults/main.yml, there is no `default(omit, true)`
+# dance anywhere in this file or the tasks that consume these variables. That
+# dance exists there specifically because amt_boot/amt_info/etc.'s `port` option
+# has NO module-level default at all, so an unset role variable has to become an
+# omitted keyword rather than a value Ansible might try to coerce to `int`. Every
+# int-typed connection option in THIS collection's modules -- port (443),
+# ipmi_port (623), asmb8_media's cd_port (5120) -- already has a real
+# module-level default, so this role can simply default its own variables to
+# those same real values and let an explicit override win normally. There is no
+# "unset" state that has to survive as anything other than a concrete int.
+# ---------------------------------------------------------------------------
+
+# BMC web-management address. Required -- there is no default, and there must
+# not be one: this role delegates every task to localhost and drives the BMC
+# directly, so guessing an address (e.g. from inventory_hostname, which names
+# the OPERATING SYSTEM this role is about to install, not the BMC managing it)
+# would aim every subsequent task at the wrong endpoint. tasks/validate.yml
+# fails loudly on an unset value rather than let that happen silently.
+asmb8_baremetal_install_host: null
+# BMC web-management HTTPS/HTTP port. Used for the .asp login and JNLP fetch
+# asmb8_media's attach performs; asmb8_info/asmb8_power/asmb8_boot accept it too
+# (for module_defaults-group compatibility) but only asmb8_info's optional
+# include_web_session actually uses it, which this role never enables (see
+# tasks/probe.yml).
+asmb8_baremetal_install_port: 443
+asmb8_baremetal_install_username: admin
+# Always supply this from a vaulted variable at the point of use. No default
+# beyond null, on purpose -- same reasoning as asmb8_baremetal_install_host: a
+# missing required value must fail loudly in tasks/validate.yml, never coerce
+# silently into an empty-string credential.
+asmb8_baremetal_install_password: null
+asmb8_baremetal_install_use_tls: true
+# Explicit acknowledgement required to talk to the BMC over unencrypted HTTP.
+# Never flip this on implicitly -- see the connection doc fragment's own
+# warning about what crosses the wire in the clear when this is true.
+asmb8_baremetal_install_allow_insecure_transport: false
+asmb8_baremetal_install_validate_certs: true
+# Mutually exclusive with asmb8_baremetal_install_tls_fingerprint (see the
+# connection doc fragment). Left unset because tls_fingerprint is this board's
+# actually-working trust mode -- its factory certificate is self-signed and
+# already expired, so chain validation cannot succeed against it regardless of
+# ca_path (see the connection doc fragment's note on this).
+asmb8_baremetal_install_ca_path: null
+# SHA-256 pin for the BMC's web-management TLS leaf certificate. Required
+# whenever asmb8_baremetal_install_use_tls is true (the default) -- see
+# tasks/validate.yml. No default beyond null: the same "must fail loudly, not
+# coerce silently" reasoning as the password above.
+asmb8_baremetal_install_tls_fingerprint: null
+asmb8_baremetal_install_timeout: 30
+asmb8_baremetal_install_connect_timeout: 10
+# UDP port of the BMC's IPMI-over-LAN (RMCP+) listener. Consumed by
+# asmb8_info/asmb8_power/asmb8_boot (tasks/probe.yml, tasks/arm_boot.yml,
+# tasks/reset.yml, tasks/observe.yml) -- NOT part of the module_defaults group
+# above, because asmb8_media has no ipmi_port option at all and a
+# module_defaults value a module's argument_spec does not declare fails that
+# module's parameter validation outright.
+asmb8_baremetal_install_ipmi_port: 623
+
+# ---------------------------------------------------------------------------
+# The single most important variable in this role. Must be explicitly set to
+# `true` (e.g. `-e asmb8_baremetal_install_confirm_destructive=true`) or the
+# role refuses to go past validation -- see tasks/validate.yml.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_confirm_destructive: false
+
+# ---------------------------------------------------------------------------
+# Installer media. This role has exactly one boot path -- a local ISO attached
+# as virtual media over the BMC's iUSB protocol -- and no PXE/DHCP/TFTP/NFS/CIFS
+# fallback at all; that is this role's entire reason to exist (see README.md).
+# ---------------------------------------------------------------------------
+
+# Path, on the Ansible controller, to a local bootable ISO. Required -- there is
+# no default. See tasks/validate.yml.
+#
+# HARDWARE REALITY, read before picking an ISO: a stock installer ISO (e.g. a
+# vanilla Proxmox VE ISO) boots to its bootloader menu and then WAITS FOR A
+# KEYPRESS. Verified directly against the target hardware: the host reached the
+# branded GRUB menu and sat there indefinitely; the menu's own `set timeout=10`
+# lives inside an `if [ -f auto-installer-mode.toml ]` conditional, and a stock
+# ISO does not ship that marker file -- so the stock image has NO menu timeout at
+# all and never auto-boots. Booting a stock ISO with this role does
+# NOT produce an unattended install -- see README.md's limitation section,
+# stated prominently there for exactly this reason. The supported unattended
+# path is an ISO an install tool has already prepared for unattended boot (for
+# Proxmox VE specifically, `proxmox-auto-install-assistant prepare-iso`, which
+# both bakes in an answer file and flips the ISO to boot its
+# `Install Proxmox VE (Automated)` menu entry, driven by the
+# `proxmox-start-auto-installer` kernel flag, without a keypress).
+asmb8_baremetal_install_iso_path: null
+
+# TCP port of the BMC's iUSB virtual CD-ROM listener (asmb8_media's cd_port).
+#
+# HARDWARE REALITY: on the target board, this port (and the paired KVM/floppy/
+# HD ports) refuses connections outright until a JNLP fetch allocates a
+# session -- verified directly. A closed port here before any attach is
+# NORMAL, not a fault; asmb8_media's own attach flow always fetches the JNLP
+# first, so this is transparent to this role. It is called out here only so an
+# operator manually probing this port ahead of a run is not alarmed to find it
+# refusing connections with no session active.
+asmb8_baremetal_install_media_cd_port: 5120
+# iUSB device-slot instance number. 0 is correct for a board with a single
+# virtual CD-ROM slot, which is the only configuration asmb8_media has been
+# validated against (see its DOCUMENTATION).
+asmb8_baremetal_install_media_instance: 0
+# Directory holding one JSON state file per session_id, plus that session's
+# background daemon's log file. Must be the same path across this role's
+# attach and detach for a given target -- see tasks/attach_media.yml and
+# tasks/detach_media.yml, and README.md#resumability.
+asmb8_baremetal_install_media_runtime_dir: ~/.ansible/asmb8_ikvm/media-sessions
+# Bounded seconds asmb8_media's state=attached waits for its background daemon
+# to report `attached` (or an early failure) before this role's own attach task
+# fails. This is NOT how long an install may run for -- it only bounds
+# confirming the session actually started; the daemon itself then serves for as
+# long as the install takes, unbounded, once attached. Left generously above
+# asmb8_media's own module-level default (10s) because this board's web server
+# is documented (connection doc fragment) to sometimes accept a TCP handshake
+# and then simply never serve the request under load -- a slow-but-genuine
+# attach should not be mistaken for a hung one.
+asmb8_baremetal_install_media_attach_timeout: 30
+# Bounded seconds asmb8_media's state=detached waits for its background daemon
+# to actually exit after being signalled, before this role's detach task
+# returns anyway (as a warning, not a failure) -- see tasks/detach_media.yml and
+# README.md's single-media-session hazard section on why a detach that itself
+# times out still needs a human-visible escape hatch.
+asmb8_baremetal_install_media_detach_timeout: 30
+
+# ---------------------------------------------------------------------------
+# One-time IPMI boot device this role arms before the destructive reset.
+# `optical` is the only value this role has ever driven -- the CD-ROM slot
+# asmb8_media attaches to above -- and is deliberately not left for a caller to
+# repoint at, say, `hd` or `network`: this role's entire design (attach media,
+# then boot from it) only makes sense paired with `optical`. It is exposed as a
+# variable anyway, matching this role's general "every input is a variable"
+# policy, rather than a hardcoded literal buried in tasks/arm_boot.yml.
+#
+# `persistent` is deliberately NOT exposed as a role variable at all, anywhere.
+# asmb8_boot rejects persistent=true outright (error_class=unsupported_capability,
+# before any IPMI session is even opened) -- see its DOCUMENTATION's explicit
+# "DO NOT remove this rejection" comment in its own source. This role always
+# passes persistent: false, hardcoded in tasks/arm_boot.yml, so that no
+# combination of role variables could ever attempt the one thing that module
+# refuses to do.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_boot_device: optical
+# Whether to request UEFI boot explicitly for this one override. Many systems
+# boot UEFI regardless of this flag if that is how they are otherwise
+# configured; IPMI (and pyghmi, which implements it) offers no "don't care"
+# value, only "request UEFI" or not -- see asmb8_boot's DOCUMENTATION.
+asmb8_baremetal_install_boot_uefi: false
+
+# ---------------------------------------------------------------------------
+# Bounded, read-only power-state postcondition probing immediately after the
+# reset (tasks/observe.yml), via asmb8_info -- never a retry of the reset
+# itself. This confirms only that IPMI observed the machine come back on
+# (BIOS/UEFI POST), well before an OS or installer would answer anything; it is
+# separate from asmb8_baremetal_install_wait_for_handoff below.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_observe_retries: 10
+asmb8_baremetal_install_observe_delay: 15
+
+# ---------------------------------------------------------------------------
+# Postcondition wait: whether/how long to wait for something to answer on the
+# target after the reset, before declaring hand-off complete. Point this at
+# whatever the freshly installed/booted OS answers on (SSH by default).
+#
+# asmb8_baremetal_install_handoff_host has no default, and that is the whole
+# point -- exactly the reasoning the sibling james_crowley.intel_amt
+# collection's amt_baremetal_install_handoff_host documents: the BMC management
+# address (asmb8_baremetal_install_host) is not necessarily where the OS itself
+# answers, and a wrong guess only shows up as a full
+# asmb8_baremetal_install_handoff_timeout hang AFTER the destructive reset, on a
+# machine that may well have installed correctly. tasks/validate.yml refuses up
+# front instead, whenever asmb8_baremetal_install_wait_for_handoff is true. For
+# a conventional inventory, `{{ inventory_hostname }}` is usually the right
+# value to pass -- but the caller still has to say so.
+#
+# HARDWARE REALITY, decisive for how you set the timeout: this board streams
+# the ISO to the target over iUSB at roughly 800 KB/s with 16-block (32 KB)
+# reads, measured directly. Proxmox's own pve-installer.squashfs alone is 614
+# MB, which is 13+ MINUTES of streaming for that one file, before the installer
+# even starts running against it. The default below is generous accordingly.
+# Do not shrink it casually, and do not interpret a long, quiet wait as this
+# role having hung -- see README.md's note on this and on idle sessions being
+# normal and unbounded (up to 130 consecutive seconds with zero requests,
+# measured directly, while the host sat at a bootloader menu).
+#
+# Also decisive: the stock-ISO limitation above. If asmb8_baremetal_install_iso_path
+# points at an unprepared installer ISO, the host stops at a keypress-driven
+# menu and this wait will simply exhaust its full timeout and fail -- correctly,
+# because hand-off genuinely never happens. That is not a bug in this wait.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_wait_for_handoff: true
+asmb8_baremetal_install_handoff_host: null
+asmb8_baremetal_install_handoff_port: 22
+asmb8_baremetal_install_handoff_timeout: 3600
+asmb8_baremetal_install_handoff_delay: 120
+
+# ---------------------------------------------------------------------------
+# UNRESOLVED HARDWARE QUESTION -- extension point, not a settled feature.
+#
+# Once Linux itself boots, it re-enumerates USB storage through its own kernel
+# driver, independently of whatever got the firmware/bootloader to boot from
+# this same device. Whether that re-enumeration needs a SEPARATE iUSB session
+# -- one the BMC's single-occupancy media slot (see README.md) might then deny
+# while this role's own daemon is still holding it -- has not been tested on
+# real hardware. This is genuinely unknown, not merely undocumented.
+#
+# Left `false` (the safe default): media stays attached for the whole run,
+# through observe and the hand-off wait, exactly as tested so far. Flipping
+# this to `true` makes this role detach media immediately after
+# tasks/observe.yml confirms IPMI observed power back on -- i.e. right around
+# where Linux's own boot/USB re-init would happen -- and BEFORE the hand-off
+# wait. Do not flip this on for a real install without first proving it does
+# not need this role's daemon anymore at that point: an installer that streams
+# more of the ISO after this moment (which describes an ordinary Proxmox
+# install) will very likely break if the media disappears out from under it.
+# This variable exists so that behaviour can be exercised and measured once
+# someone can actually test it against the real board, not because either
+# value is currently known to be correct.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_media_release_after_handoff: false
+
+# ---------------------------------------------------------------------------
+# DISK SAFETY -- forward guard for a feature that does not exist yet.
+#
+# asmb8_media, as it exists today, has no answer-file/unattended-install
+# support at all: it attaches exactly one read-only ISO image to the CD-ROM
+# slot (see its DOCUMENTATION -- there is no floppy/USB-R writable slot option,
+# unlike the sibling james_crowley.intel_amt collection's amt_media). Nothing in
+# this role reads or writes a target-disk identifier today.
+#
+# This variable, and the assertion in tasks/validate.yml that enforces it, are
+# placed here now anyway: the day this role (or a caller building on it) gains
+# an auto-install answer-file path that names a disk to wipe, that feature MUST
+# require the disk be pinned by a stable identifier
+# (/dev/disk/by-id/..., /dev/disk/by-path/..., or an explicit serial:... value)
+# and MUST refuse a wildcard, "first available", or unset target. The lab
+# target this role is built against has a wipeable NVMe AND additional drives
+# whose contents are unknown and possibly wanted -- an enumeration-order-
+# dependent guess (a bare /dev/sda, "first", "any", "*") is exactly the kind of
+# mistake that guessing the wrong drive turns into permanent data loss on
+# whichever drive Linux happened to enumerate first that boot.
+#
+# Encoding the refusal now, before the feature exists, means nobody can ever
+# introduce that feature without also satisfying (or deliberately removing,
+# with a reviewer's eyes on exactly why) a guard that already states the
+# reason not to. Left null because no caller needs to set this today.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_target_disk: null
+
+# ---------------------------------------------------------------------------
+# Resumability. One JSON state file per target, so re-running this role after
+# an interruption can tell what a prior, incomplete run already did instead of
+# blindly re-arming one-time boot or re-issuing a reset of uncertain outcome.
+# See tasks/state.yml and README.md#resumability.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_state_dir: ~/.ansible/asmb8_ikvm/baremetal-install
+
+# Explicit human acknowledgement required to proceed past a prior run left in
+# an uncertain state (boot armed and/or reset issued with no confirmed
+# postcondition). Never set this from automation -- only after a human has
+# checked the machine's actual state (KVM/physical console) first.
+asmb8_baremetal_install_force_resume: false

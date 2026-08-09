@@ -1,0 +1,45 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+galaxy_info:
+  role_name: asmb8_baremetal_install
+  namespace: james_crowley
+  author: Jim Crowley (@james-crowley)
+  description: >-
+    End-to-end bare-metal OS install driven entirely over an ASMB8-iKVM BMC, with
+    no PXE/DHCP/TFTP/NFS/CIFS infrastructure required: validate -> probe -> attach
+    a local ISO as virtual media over iUSB -> arm one-time optical boot over IPMI
+    -> reset (the destructive boundary) -> observe -> wait for hand-off -> detach.
+    Generic across arbitrary ASMB8-iKVM endpoints -- no lab-specific hosts, IPs, or
+    machine names. See README.md for what is proven versus unproven on real
+    hardware, and for the Proxmox VE worked example.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.17"
+  # This role never executes anything on a managed node -- every task delegates
+  # to localhost, exactly like the modules it drives (see
+  # plugins/doc_fragments/connection.py). "Platforms" below therefore describes
+  # controllers this role can run on, not targets it manages.
+  platforms:
+    - name: EL
+      versions: [all]
+    - name: Ubuntu
+      versions: [all]
+    - name: Debian
+      versions: [all]
+    - name: Fedora
+      versions: [all]
+    - name: MacOSX
+      versions: [all]
+  galaxy_tags:
+    - asmb8
+    - ikvm
+    - ami
+    - ipmi
+    - iusb
+    - baremetal
+    - provisioning
+    - outofband
+
+dependencies: []

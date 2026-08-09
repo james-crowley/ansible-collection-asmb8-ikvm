@@ -1,0 +1,34 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Preferred path: Proxmox's own tool. --fetch-from iso bakes answer.toml
+# straight into the ISO, so the prepared ISO needs no network fetch and no
+# extra infrastructure (no HTTP server, no PXE/DHCP/TFTP) at install time --
+# consistent with this collection's whole point of not requiring that
+# infrastructure. tasks/render_answer.yml has already run
+# `validate-answer` against this exact answer file before this task runs.
+
+- name: Run proxmox-auto-install-assistant prepare-iso
+  ansible.builtin.command:
+    argv:
+      - "{{ asmb8_autoinstall_iso_vendor_tool_path }}"
+      - prepare-iso
+      - "{{ asmb8_autoinstall_iso_source }}"
+      - --fetch-from
+      - iso
+      - --answer-file
+      - "{{ _asmb8_autoinstall_iso_work_path }}/root/answer.toml"
+      - --output
+      - "{{ asmb8_autoinstall_iso_output }}"
+  register: _asmb8_autoinstall_iso_vendor_prepare_result
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Report proxmox-auto-install-assistant's own output
+  ansible.builtin.debug:
+    msg: "{{ _asmb8_autoinstall_iso_vendor_prepare_result.stdout_lines + _asmb8_autoinstall_iso_vendor_prepare_result.stderr_lines }}"
+  delegate_to: localhost
+  run_once: true

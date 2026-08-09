@@ -1,0 +1,93 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Phase flow: validate -> probe -> attach media -> arm one-time boot -> reset
+# (the destructive boundary) -> observe -> [optional early media release] ->
+# wait for hand-off -> detach.
+#
+# block/rescue/always is the mechanism that guarantees the "always detach"
+# requirement: whatever fails inside the block, the always section still runs
+# and stops any iUSB media daemon left holding the BMC's single virtual-media
+# slot open. See README.md's single-media-session hazard section for why that
+# guarantee matters more here than it would for a multi-session protocol: this
+# board's cd-media service allows exactly ONE session, board-wide, with no
+# server-side timeout to reclaim an abandoned one.
+#
+# module_defaults below supplies every asmb8_* module call's shared connection
+# options exactly once, for the whole lifecycle -- including its rescue and
+# always sections, since both are part of the same block/rescue/always task
+# entry that carries this directive. Scoped to exactly the options every
+# module in the james_crowley.asmb8_ikvm.asmb8_ikvm action group actually
+# accepts (see defaults/main.yml's comment on why ipmi_port is deliberately
+# NOT included here).
+
+- name: Validate role preconditions (fan-out guard, confirmation gate, required vars)
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Load and reconcile prior run state for this target
+  ansible.builtin.include_tasks: state.yml
+
+- name: Run the install lifecycle
+  module_defaults:
+    group/james_crowley.asmb8_ikvm.asmb8_ikvm:
+      host: "{{ asmb8_baremetal_install_host }}"
+      port: "{{ asmb8_baremetal_install_port }}"
+      username: "{{ asmb8_baremetal_install_username }}"
+      password: "{{ asmb8_baremetal_install_password }}"
+      use_tls: "{{ asmb8_baremetal_install_use_tls }}"
+      allow_insecure_transport: "{{ asmb8_baremetal_install_allow_insecure_transport }}"
+      validate_certs: "{{ asmb8_baremetal_install_validate_certs }}"
+      ca_path: "{{ asmb8_baremetal_install_ca_path }}"
+      tls_fingerprint: "{{ asmb8_baremetal_install_tls_fingerprint }}"
+      timeout: "{{ asmb8_baremetal_install_timeout }}"
+      connect_timeout: "{{ asmb8_baremetal_install_connect_timeout }}"
+  no_log: true
+  block:
+    - name: Probe BMC-observed capabilities and state before any mutation
+      ansible.builtin.include_tasks: probe.yml
+
+    - name: Attach the installer ISO as virtual media over iUSB
+      ansible.builtin.include_tasks: attach_media.yml
+
+    - name: Arm the one-time optical boot selection
+      ansible.builtin.include_tasks: arm_boot.yml
+
+    - name: Reset -- the destructive boundary
+      ansible.builtin.include_tasks: reset.yml
+
+    - name: Observe the post-reset power state
+      ansible.builtin.include_tasks: observe.yml
+
+    - name: >-
+        EXTENSION POINT (untested on real hardware): optionally release media right
+        after the postcondition probe, before waiting for hand-off -- see
+        defaults/main.yml's asmb8_baremetal_install_media_release_after_handoff and
+        README.md's "Unresolved: Linux's own USB re-enumeration" section. Defaults
+        to false; do not enable for a real install without first proving the
+        installer no longer needs this session at this point.
+      ansible.builtin.include_tasks: detach_media.yml
+      when:
+        - asmb8_baremetal_install_media_release_after_handoff | bool
+        - asmb8_baremetal_install_run_state.session_id is truthy
+
+    - name: Wait for hand-off to the installed/booted OS
+      ansible.builtin.include_tasks: wait_for_handoff.yml
+      when: asmb8_baremetal_install_wait_for_handoff | bool
+  rescue:
+    - name: Record the failure for the next resumption attempt
+      ansible.builtin.include_tasks: record_failure.yml
+
+    - name: Re-raise -- this role never swallows a failure to keep going
+      ansible.builtin.fail:
+        msg: >-
+          asmb8_baremetal_install failed for {{ asmb8_baremetal_install_host }}:
+          {{ asmb8_baremetal_install_fail_msg | default('see previous task output') }}.
+          Re-running this role resumes from the last confirmed step rather than
+          starting over blindly; see this role's README.md#resumability before
+          retrying against a boot/reset of uncertain outcome.
+  always:
+    - name: Always detach media, even on failure, so no daemon is left holding the BMC's single media slot open
+      ansible.builtin.include_tasks: detach_media.yml
+      when: asmb8_baremetal_install_run_state is defined

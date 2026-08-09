@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Rendered by james_crowley.asmb8_ikvm's asmb8_autoinstall_iso role
+# (tasks/prepare_with_container.yml) and run INSIDE the fallback container --
+# never on the controller directly. Generated file -- do not hand-edit.
+#
+# ONLY the vendor tool path (proxmox-auto-install-assistant, preferred
+# whenever present -- see tasks/prepare_with_vendor_tool.yml) has any
+# evidence behind it beyond "El Torito structure survives an xorriso replay
+# rebuild". This fallback path has NOT been proven to produce an ISO that
+# completes a real unattended install on hardware -- see
+# docs/proxmox-autoinstall.md.
+#
+# The xorriso invocation at the bottom is the exact recipe verified against
+# a real Proxmox VE ISO using this base image (debian:bookworm-slim):
+#
+#   xorriso -indev in.iso -outdev out.iso -boot_image any replay \
+#           -compliance no_emul_toc -map /local/grub.cfg /boot/grub/grub.cfg -commit
+#
+# extended with two more -map entries that add auto-installer-mode.toml and
+# answer.toml at the ISO root -- adding those two files (see fact 1 in
+# docs/proxmox-autoinstall.md) is what turns a plain passthrough rebuild
+# into one that actually boots into an unattended install, PROVIDED the
+# stock ISO's own grub.cfg already conditions its timeout and "Automated"
+# menu entry on auto-installer-mode.toml existing, which is the case on the
+# stock Proxmox VE 9.2-1 ISO this role was developed against. This script
+# checks that condition on whatever ISO it is actually given, rather than
+# assuming it, and refuses to guess a GRUB patch for an ISO where the
+# condition is not there.
+
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends xorriso >/dev/null
+
+readonly marker='auto-installer-mode.toml'
+grub_cfg_map_args=()
+
+if xorriso -indev /work/in.iso -osirrox on -extract /boot/grub/grub.cfg /work/extracted-grub.cfg >/dev/null 2>&1 \
+        && grep -q -- "${marker}" /work/extracted-grub.cfg; then
+    echo "Stock grub.cfg already conditions its timeout and 'Automated' menu entry on ${marker} -- no grub.cfg patch needed." >&2
+elif [ -s /work/root/grub.cfg ]; then
+    echo "Stock grub.cfg does not reference ${marker}; using the grub.cfg supplied via asmb8_autoinstall_iso_grub_cfg_override instead." >&2
+    grub_cfg_map_args=(-map /work/root/grub.cfg /boot/grub/grub.cfg)
+else
+    {
+        echo "ERROR: this ISO's /boot/grub/grub.cfg does not reference ${marker}."
+        echo "Adding auto-installer-mode.toml alone will not add a timeout or an"
+        echo "'Automated' menu entry to a GRUB menu that never conditions on it, so"
+        echo "the prepared ISO would still wait forever at the boot menu -- exactly"
+        echo "the failure mode this role exists to remove. This script will not"
+        echo "guess a GRUB patch for a menu layout it has not seen."
+        echo "Fix: supply a corrected grub.cfg via"
+        echo "asmb8_autoinstall_iso_grub_cfg_override, or use the"
+        echo "proxmox-auto-install-assistant vendor tool path instead (it writes its"
+        echo "own grub.cfg and does not depend on this script's detection at all)."
+    } >&2
+    exit 3
+fi
+
+xorriso -indev /work/in.iso \
+        -outdev /work/out.iso \
+        -boot_image any replay \
+        -compliance no_emul_toc \
+        -map /work/root/auto-installer-mode.toml /auto-installer-mode.toml \
+        -map /work/root/answer.toml /answer.toml \
+        "${grub_cfg_map_args[@]}" \
+        -commit

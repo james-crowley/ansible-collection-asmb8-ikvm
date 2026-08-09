@@ -1,0 +1,262 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# READ docs/proxmox-autoinstall.md and README.md "Disk safety" before setting
+# anything below. In particular: asmb8_autoinstall_iso_answer_disk_list and
+# asmb8_autoinstall_iso_answer_disk_filter have NO default and MUST be set by the
+# caller. This role asserts and refuses if neither is set, or if either names
+# a wildcard/placeholder target -- see tasks/validate.yml.
+
+# ---------------------------------------------------------------------------
+# Source ISO / output
+# ---------------------------------------------------------------------------
+
+# Path to the stock Proxmox VE installer ISO to prepare. Required -- no
+# default. Must already exist and be readable.
+asmb8_autoinstall_iso_source: ""
+
+# Path to write the prepared (auto-installing) ISO to. Required -- no
+# default. Refused if it is the same path as asmb8_autoinstall_iso_source
+# (that would overwrite the stock ISO you are reading from mid-build).
+asmb8_autoinstall_iso_output: ""
+
+# Overwrite asmb8_autoinstall_iso_output if it already exists. Default false
+# so a repeated run does not silently clobber a previously prepared ISO that
+# something else might already be relying on.
+asmb8_autoinstall_iso_force: false
+
+# ---------------------------------------------------------------------------
+# Destructive-confirmation gate -- see README.md "Disk safety"
+# ---------------------------------------------------------------------------
+#
+# The ISO this role produces boots straight into an installer that erases
+# every disk named below with NO PROMPT. This variable is the explicit,
+# separate acknowledgement of that fact -- same name pattern and gating
+# style as this collection's asmb8_baremetal_install role's own
+# asmb8_baremetal_install_confirm_destructive: never defaulted true, checked
+# with the `bool` filter in tasks/validate.yml (so `true`, `yes`, `"true"`,
+# and `-e asmb8_autoinstall_iso_confirm_destructive=true` on the command
+# line all count), and named so that grepping a playbook for it tells a
+# reviewer exactly what it authorizes.
+asmb8_autoinstall_iso_confirm_destructive: false
+
+# ---------------------------------------------------------------------------
+# Preparation tooling
+# ---------------------------------------------------------------------------
+
+# Prefer Proxmox's own proxmox-auto-install-assistant when it is present on
+# the controller's PATH. Set false to force the container/xorriso fallback
+# even when the vendor tool is available (useful for exercising the fallback
+# path deliberately).
+asmb8_autoinstall_iso_prefer_vendor_tool: true
+
+# Executable name or path for the vendor tool.
+asmb8_autoinstall_iso_vendor_tool_path: proxmox-auto-install-assistant
+
+# Container runtime for the xorriso fallback path. "docker" or "podman".
+asmb8_autoinstall_iso_container_runtime: docker
+
+# Container image used for the xorriso fallback rebuild. Must be a Debian- or
+# Ubuntu-family image with `apt-get install xorriso` available; the role
+# installs xorriso into the container at run time (see
+# templates/container_prepare.sh.j2), it does not assume a pre-built image.
+# This is the same base image (debian:bookworm-slim) used to prove the
+# xorriso-replay recipe below works at all -- see docs/proxmox-autoinstall.md.
+asmb8_autoinstall_iso_container_image: "debian:bookworm-slim"
+
+# Extra bind-mount options appended to the working-directory volume mount,
+# e.g. ":Z" on SELinux-enforcing hosts (Fedora/RHEL/CentOS controllers) so
+# podman/docker can read/write it under enforcing SELinux. Empty by default;
+# most controllers (including macOS, where this was developed) do not need
+# it.
+asmb8_autoinstall_iso_container_mount_options: ""
+
+# Directory the role uses to stage the rendered answer.toml,
+# auto-installer-mode.toml, and (for the container path) the ISO copies and
+# helper script. A subdirectory named after this role is created underneath
+# it and removed again at the end of a successful run. Defaults to a
+# same-filesystem temp dir next to the output ISO so an ISO-sized copy is
+# never made across a filesystem boundary as a side effect of staging.
+asmb8_autoinstall_iso_work_dir: "{{ (asmb8_autoinstall_iso_output | dirname) if asmb8_autoinstall_iso_output else '/tmp' }}"
+
+# Keep the staged working directory (rendered answer.toml, mode file, and for
+# the container path the intermediate ISO copies) after a successful run,
+# instead of cleaning it up. Useful for inspecting exactly what was baked in.
+asmb8_autoinstall_iso_keep_work_dir: false
+
+# Container-fallback path only. Path to a local grub.cfg to bake into the
+# ISO in place of its stock one. Only consulted when the stock ISO's own
+# grub.cfg does NOT already reference auto-installer-mode.toml (see
+# templates/container_prepare.sh.j2) -- on the stock Proxmox VE 9.2-1 ISO
+# this role was developed against, it does, so this is normally unused.
+# Empty by default: the container fallback path refuses (rather than
+# guesses a GRUB patch) if it ever encounters an ISO where this would be
+# needed and it is not set.
+asmb8_autoinstall_iso_grub_cfg_override: ""
+
+# ---------------------------------------------------------------------------
+# answer.toml -- [global]
+#
+# Key names and semantics below follow the current (kebab-case) schema as
+# documented at https://pve.proxmox.com/wiki/Automated_Installation for
+# Proxmox VE 8.4+/9.x. Proxmox accepted an older snake_case spelling of the
+# same keys (root_password, disk_list, reboot_on_error, ...) and that older
+# form still round-trips, but its own validator now warns that it is
+# deprecated (see the pve-devel patch "assistant: validate: warn if answer
+# file contains old snake_case keys", 2025-04) -- so this role emits the
+# current kebab-case form. If proxmox-auto-install-assistant's
+# validate-answer step (which this role always runs, see
+# tasks/render_answer.yml) starts rejecting a key below, treat that as the
+# schema having moved again, not this role guessing wrong twice.
+# ---------------------------------------------------------------------------
+
+# Keyboard layout. Confident: documented, e.g. "en-us", "de", "fr".
+asmb8_autoinstall_iso_answer_keyboard: en-us
+
+# Two-letter country code used to seed sensible defaults (mirror list,
+# timezone suggestion) in the installer. Confident: documented, e.g. "us".
+asmb8_autoinstall_iso_answer_country: us
+
+# Fully-qualified domain name of the installed system. Required -- no
+# sensible default exists for a specific host. Confident: documented as a
+# plain string. (The schema also accepts an object form
+# `{source: "from-dhcp", domain: ...}` to derive the FQDN from DHCP at
+# install time -- NOT implemented by this role's template; only the plain
+# string form is rendered. Say so rather than silently ignoring it if you
+# need that form.)
+asmb8_autoinstall_iso_answer_fqdn: ""
+
+# Administrator contact address, mailed installer notices. Optional in
+# Proxmox's own schema; omitted from the rendered file entirely when empty
+# rather than emitting mailto = "".
+asmb8_autoinstall_iso_answer_mailto: ""
+
+# tzdata timezone name, e.g. "Etc/UTC", "America/New_York". Required -- no
+# sensible default exists for a specific site.
+asmb8_autoinstall_iso_answer_timezone: ""
+
+# Plaintext root password. Prefer asmb8_autoinstall_iso_answer_root_password_hashed
+# instead -- see README.md "Generating a password hash". If both are set,
+# validate.yml fails rather than guessing which one you meant. no_log so it
+# never lands in a play recap or log.
+asmb8_autoinstall_iso_answer_root_password: ""
+
+# Pre-hashed root password (output of `mkpasswd -m sha-512` or equivalent).
+# Preferred over asmb8_autoinstall_iso_answer_root_password so a plaintext
+# password never has to exist in a playbook or vaulted variable file. no_log
+# so it never lands in a play recap or log, even though it is already a hash.
+asmb8_autoinstall_iso_answer_root_password_hashed: ""
+
+# Reboot automatically if the installer hits an error, instead of leaving the
+# machine sitting at the failure for a human to read. Default false: for a
+# genuinely unattended install you may want true, but the default favours
+# leaving diagnostic information on screen until you have watched at least
+# one install succeed end to end -- see docs/proxmox-autoinstall.md "Nothing
+# here has completed a real unattended install yet".
+asmb8_autoinstall_iso_answer_reboot_on_error: false
+
+# "reboot" or "power-off" once the install finishes. Confident: documented,
+# defaults to "reboot" in Proxmox's own schema too.
+asmb8_autoinstall_iso_answer_reboot_mode: reboot
+
+# ---------------------------------------------------------------------------
+# answer.toml -- [network]
+# ---------------------------------------------------------------------------
+
+# "from-dhcp" (default, simplest) or "from-answer" (static, requires cidr /
+# dns / gateway below).
+asmb8_autoinstall_iso_answer_network_source: from-dhcp
+
+# Required when asmb8_autoinstall_iso_answer_network_source == "from-answer".
+# IPv4 or IPv6 address in CIDR notation, e.g. "192.0.2.10/24".
+asmb8_autoinstall_iso_answer_network_cidr: ""
+
+# Required when asmb8_autoinstall_iso_answer_network_source == "from-answer".
+asmb8_autoinstall_iso_answer_network_dns: ""
+
+# Required when asmb8_autoinstall_iso_answer_network_source == "from-answer".
+asmb8_autoinstall_iso_answer_network_gateway: ""
+
+# Optional udev-property filter selecting which NIC "from-answer" configures,
+# for multi-NIC boards, e.g. {ID_NET_NAME_MAC: "24:8a:07:1e:05:bc"}. Empty
+# dict renders no [network.filter] table at all. UNVERIFIED which
+# udev-property keys the installer actually inspects for network filtering
+# specifically (disk filtering, immediately below, is better attested) --
+# treat any key here as something to confirm with `proxmox-auto-install-
+# assistant device-match` before relying on it, not as guaranteed by this
+# role.
+asmb8_autoinstall_iso_answer_network_filter: {}
+
+# ---------------------------------------------------------------------------
+# answer.toml -- [disk-setup]
+#
+# THIS IS THE DESTRUCTIVE SECTION. Read README.md "Disk safety" in full
+# before setting either targeting variable below.
+# ---------------------------------------------------------------------------
+
+# "ext4", "xfs", "zfs", or "btrfs" (btrfs is Proxmox VE-only, per Proxmox's
+# own docs). No default -- pick one deliberately; a wrong filesystem choice
+# is a much smaller mistake than a wrong disk, but it is still not something
+# this role should guess.
+asmb8_autoinstall_iso_answer_disk_filesystem: ""
+
+# Disk targeting, mechanism 1: an explicit list of KERNEL device names (as
+# Proxmox's own schema documents disk-list -- e.g. ["sda", "sdb"], NOT full
+# /dev paths and NOT /dev/disk/by-id paths; disk-list is documented to take
+# short kernel names only). NO DEFAULT. Mutually exclusive with
+# asmb8_autoinstall_iso_answer_disk_filter below -- validate.yml fails if both or
+# neither are set.
+#
+# Kernel device names are NOT stable across reboots on a board with more than
+# one storage controller enumerating in a non-deterministic order (exactly
+# the situation described for the target lab machine: a wipeable NVMe plus
+# additional drives of unknown, possibly-wanted content). Prefer
+# asmb8_autoinstall_iso_answer_disk_filter instead, keyed on a udev property such
+# as ID_SERIAL_SHORT, wherever the target board supports it -- filter is
+# Proxmox's own stable-identifier mechanism for this field, disk-list is not.
+# See README.md "Disk safety" for how to obtain a serial with
+# `proxmox-auto-install-assistant device-info` before trusting either.
+asmb8_autoinstall_iso_answer_disk_list: []
+
+# Disk targeting, mechanism 2 (preferred): a udev-property filter, e.g.
+# {ID_SERIAL_SHORT: "S3Z8NB0M123456"}. NO DEFAULT. Mutually exclusive with
+# asmb8_autoinstall_iso_answer_disk_list above.
+asmb8_autoinstall_iso_answer_disk_filter: {}
+
+# "any" (default) or "all": whether one matching property or every filter
+# key must match a disk for filter-based selection. Only meaningful when
+# asmb8_autoinstall_iso_answer_disk_filter is set.
+asmb8_autoinstall_iso_answer_disk_filter_match: any
+
+# ZFS options, applied only when asmb8_autoinstall_iso_answer_disk_filesystem ==
+# "zfs". Confident on key names (raid, ashift, arc-max, checksum, compress,
+# copies, hdsize) per Proxmox's documented schema; the dict is rendered as
+# dotted zfs.<key> = <value> lines under [disk-setup], which is the form
+# Proxmox's own example answer files use.
+#   raid: "raid0" | "raid1" | "raid10" | "raidz-1" | "raidz-2" | "raidz-3"
+#   ashift: int
+#   arc_max: int (MiB) -- rendered as the schema's zfs.arc-max
+#   checksum: "on" | "fletcher4" | "sha256"
+#   compress: "on" | "off" | "lzjb" | "lz4" | "zle" | "gzip" | "zstd"
+#   copies: int
+#   hdsize: number (GiB)
+asmb8_autoinstall_iso_answer_disk_zfs: {}
+
+# LVM options, applied only when asmb8_autoinstall_iso_answer_disk_filesystem is
+# "ext4" or "xfs". Confident on key names per Proxmox's documented schema.
+#   hdsize: number (GiB)
+#   swapsize: number (GiB)
+#   maxroot: number (GiB)
+#   maxvz: number (GiB)
+#   minfree: number (GiB)
+asmb8_autoinstall_iso_answer_disk_lvm: {}
+
+# Btrfs options, applied only when asmb8_autoinstall_iso_answer_disk_filesystem
+# == "btrfs" (Proxmox VE only). Confident on key names per Proxmox's
+# documented schema.
+#   raid: "raid0" | "raid1" | "raid10"
+#   hdsize: number (GiB)
+#   compress: "on" | "off" | "zlib" | "lzo" | "zstd"
+asmb8_autoinstall_iso_answer_disk_btrfs: {}

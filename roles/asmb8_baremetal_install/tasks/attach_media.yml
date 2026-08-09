@@ -1,0 +1,79 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# The session id is chosen and persisted BEFORE the attach, never after -- this
+# is the difference between "always detach" (tasks/main.yml's `always` block)
+# being a guarantee and being a hope. Mirrors the sibling james_crowley.intel_amt
+# collection's amt_baremetal_install role's identical reasoning for the exact
+# same failure mode:
+#
+# asmb8_media's own attach forks a detached background daemon that owns the
+# iUSB connection, then waits attach_timeout for it to report a verdict. If it
+# reports none in time the module fails -- and the daemon it forked is still
+# running, still holding the BMC's single media slot. It also generates its own
+# session_id when the caller passes none. Recording the id from the module's
+# *result* would mean recording nothing at all whenever the attach failed: run
+# state would keep session_id=null, tasks/detach_media.yml's `is truthy` guard
+# would skip, and this role would orphan the very daemon whose existence the
+# failure was reporting. Because this BMC's media slot is single-occupancy,
+# board-wide, with NO server-side reclaim timeout, that also wedges the
+# endpoint against every future attempt until a human intervenes -- see
+# README.md's single-media-session hazard section and its BMC-cold-reset escape
+# hatch.
+#
+# Generating the id here removes the whole class of problem: from this point on
+# this role owns a session id whatever asmb8_media does with it, so detach is
+# reachable on every path -- success, ordinary failure, or a timeout whose
+# outcome is indeterminate.
+
+- name: Claim a media session id before anything can be spawned against it
+  # Generated only when there is not already one to reuse -- the `true`
+  # (boolean) second argument to `default` is what makes that work: a prior
+  # run's id is explicitly null in a fresh state (see vars/main.yml's
+  # asmb8_baremetal_install_default_state), not merely undefined, so a plain
+  # `default` filter would keep the null and defeat the whole point. A resumed
+  # run must pass a prior run's live id through unchanged so asmb8_media
+  # confirms that session instead of starting a second one against a slot the
+  # BMC has only one connection to give.
+  #
+  # Restricted to characters that are safe in a filename, because asmb8_media
+  # keys its state file on this value.
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: >-
+      {{ asmb8_baremetal_install_run_state
+         | combine({'session_id': asmb8_baremetal_install_run_state.session_id
+                                  | default(lookup('ansible.builtin.password',
+                                                   '/dev/null length=32 chars=ascii_lowercase,digits'), true)}) }}
+
+- name: Persist the claimed session id before the attach, so the always-detach can find it
+  ansible.builtin.include_tasks: save_state.yml
+
+- name: Attach the installer ISO as virtual media over iUSB
+  james_crowley.asmb8_ikvm.asmb8_media:
+    image: "{{ asmb8_baremetal_install_iso_path }}"
+    session_id: "{{ asmb8_baremetal_install_run_state.session_id }}"
+    runtime_dir: "{{ asmb8_baremetal_install_media_runtime_dir }}"
+    cd_port: "{{ asmb8_baremetal_install_media_cd_port }}"
+    instance: "{{ asmb8_baremetal_install_media_instance }}"
+    attach_timeout: "{{ asmb8_baremetal_install_media_attach_timeout }}"
+    state: attached
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_media_attach_result
+
+- name: Record that media is genuinely attached
+  # session_id was already claimed and persisted above, so only media_attached
+  # changes here. media_attached answers a different question from session_id:
+  # "is media confirmed attached", which is only knowable after the attach
+  # returns -- conflating the two would make a failed attach look like a
+  # successful one in the state file a resumed run reads.
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: >-
+      {{ asmb8_baremetal_install_run_state
+         | combine({'media_attached': true,
+                     'session_id': asmb8_baremetal_install_media_attach_result.session_id}) }}
+
+- name: Persist run state after attaching media
+  ansible.builtin.include_tasks: save_state.yml

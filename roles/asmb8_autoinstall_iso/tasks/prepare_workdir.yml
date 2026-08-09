@@ -1,0 +1,27 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Create a unique working directory for this run
+  ansible.builtin.tempfile:
+    state: directory
+    path: "{{ asmb8_autoinstall_iso_work_dir }}"
+    prefix: asmb8-autoinstall-iso-
+  register: _asmb8_autoinstall_iso_workdir
+  delegate_to: localhost
+  run_once: true
+
+- name: Record the working directory path for later tasks
+  ansible.builtin.set_fact:
+    _asmb8_autoinstall_iso_work_path: "{{ _asmb8_autoinstall_iso_workdir.path }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Create the root/ subdirectory for files that get baked into the ISO root
+  ansible.builtin.file:
+    path: "{{ _asmb8_autoinstall_iso_work_path }}/root"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true

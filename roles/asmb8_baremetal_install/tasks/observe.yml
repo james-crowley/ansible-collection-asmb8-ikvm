@@ -1,0 +1,48 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# A bounded read-only postcondition probe, never a retry of the reset itself.
+# asmb8_power has no read-only "query" state (its `state` choices are on, off,
+# shutdown, reset, boot -- every one of them a potential mutation), unlike the
+# sibling james_crowley.intel_amt collection's amt_power, which has a dedicated
+# state=query. asmb8_info is this collection's read-only equivalent instead --
+# it never mutates IPMI state (see its DOCUMENTATION) -- so that is what this
+# probe polls.
+#
+# reset_confirmed only becomes true once this probe actually observes
+# power_state.powerstate == 'on'; that flag is what lets a future resumed run
+# treat the boot/reset as settled and start from a clean slate (see
+# tasks/state.yml).
+
+- name: Bounded postcondition probe of power state after the reset
+  james_crowley.asmb8_ikvm.asmb8_info:
+    ipmi_port: "{{ asmb8_baremetal_install_ipmi_port }}"
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_observe_result
+  until: (asmb8_baremetal_install_observe_result.asmb8.ipmi.power_state.powerstate | default('')) == 'on'
+  retries: "{{ asmb8_baremetal_install_observe_retries }}"
+  delay: "{{ asmb8_baremetal_install_observe_delay }}"
+  failed_when: false
+
+- name: Mark the reset as confirmed once the endpoint reports power on
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: "{{ asmb8_baremetal_install_run_state | combine({'reset_confirmed': true}) }}"
+  when: (asmb8_baremetal_install_observe_result.asmb8.ipmi.power_state.powerstate | default('')) == 'on'
+
+- name: Persist run state after the postcondition probe
+  ansible.builtin.include_tasks: save_state.yml
+
+- name: Warn when the postcondition probe never observed the endpoint powered on
+  ansible.builtin.debug:
+    msg: >-
+      Postcondition probe did not observe power_state=on for
+      {{ asmb8_baremetal_install_host }} within
+      {{ asmb8_baremetal_install_observe_retries }} retries. This does not
+      necessarily mean the reset failed -- this probe only reads, it never
+      retries the reset itself -- but reset_confirmed remains false, so a later
+      re-run of this role requires -e asmb8_baremetal_install_force_resume=true.
+      Verify the machine manually before retrying.
+  when: (asmb8_baremetal_install_observe_result.asmb8.ipmi.power_state.powerstate | default('')) != 'on'

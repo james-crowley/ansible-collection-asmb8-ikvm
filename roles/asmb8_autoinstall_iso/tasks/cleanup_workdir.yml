@@ -1,0 +1,11 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Remove the staged working directory
+  ansible.builtin.file:
+    path: "{{ _asmb8_autoinstall_iso_work_path }}"
+    state: absent
+  delegate_to: localhost
+  run_once: true

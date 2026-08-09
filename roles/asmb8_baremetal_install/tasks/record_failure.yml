@@ -1,0 +1,58 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Runs from tasks/main.yml's `rescue` block. ansible_failed_result is only
+# populated inside a rescue block, and only once asmb8_baremetal_install_run_state
+# exists (i.e. tasks/state.yml already ran) is there anywhere useful to persist
+# it -- a failure during validate.yml itself has nothing to persist.
+#
+# Every field named below comes from this collection's own
+# errors.IkvmError.to_result() shape (msg, error_class, endpoint, operation,
+# diagnostic, indeterminate) -- already redacted by errors.redact() before it
+# ever reached this module's fail_json(), so nothing here carries a credential.
+# asmb8_media's own failures additionally carry session_id/session_state/pid/
+# reclaimed_sessions/error at the top level (see its RETURN docs); those are
+# reported too, when present, because they are exactly what an operator needs
+# to clean up a stranded iUSB session by hand.
+
+- name: Report the redacted failure detail
+  ansible.builtin.debug:
+    msg:
+      error_class: "{{ ansible_failed_result.error_class | default('(none reported)') }}"
+      endpoint: "{{ ansible_failed_result.endpoint | default('(none reported)') }}"
+      operation: "{{ ansible_failed_result.operation | default('(none reported)') }}"
+      indeterminate: "{{ ansible_failed_result.indeterminate | default(false) }}"
+      message: "{{ ansible_failed_result.msg | default('(no message)') }}"
+      diagnostic: "{{ ansible_failed_result.diagnostic | default('(none)') }}"
+      media_session_id: "{{ asmb8_baremetal_install_run_state.session_id | default('(none claimed this run)') }}"
+      media_runtime_dir: "{{ asmb8_baremetal_install_media_runtime_dir }}"
+      manual_recovery_hint: >-
+        {{ ('if this run stranded an iUSB media session, detach it by running this role''s '
+            ~ 'tasks/detach_media.yml, or asmb8_media state=detached directly, with session_id='
+            ~ asmb8_baremetal_install_run_state.session_id ~ ' and runtime_dir='
+            ~ asmb8_baremetal_install_media_runtime_dir
+            ~ '. This BMC''s media slot is single-occupancy board-wide with NO server-side '
+            ~ 'reclaim timeout: if software detach does not work, the escape hatch is a BMC cold '
+            ~ 'reset (ipmitool mc reset cold, or the pyghmi/community.general.ipmi_power '
+            ~ 'equivalent) -- this does NOT power-cycle the host itself, only the BMC''s own '
+            ~ 'management controller.')
+           if asmb8_baremetal_install_run_state.session_id is truthy
+           else '(no media session was claimed this run, so none can have been stranded)' }}
+  when: asmb8_baremetal_install_run_state is defined
+
+- name: Record the failure reason for the next resumption attempt
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_fail_msg: >-
+      {{ ansible_failed_result.msg | default('unknown failure') }}
+      (error_class={{ ansible_failed_result.error_class | default('unknown') }},
+      indeterminate={{ ansible_failed_result.indeterminate | default(false) }})
+    asmb8_baremetal_install_run_state: >-
+      {{ asmb8_baremetal_install_run_state
+         | combine({'last_failure': ansible_failed_result.msg | default('unknown failure')}) }}
+  when: asmb8_baremetal_install_run_state is defined
+
+- name: Persist run state after a failure
+  ansible.builtin.include_tasks: save_state.yml
+  when: asmb8_baremetal_install_run_state is defined

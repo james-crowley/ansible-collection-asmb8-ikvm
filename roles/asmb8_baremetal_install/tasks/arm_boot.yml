@@ -1,0 +1,38 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Unlike the sibling james_crowley.intel_amt collection's amt_boot, asmb8_boot
+# carries no action-token concept: it is a plain IPMI get_bootdev()/
+# set_bootdev() compare, convergent like any other idempotent module (see its
+# DOCUMENTATION). Re-arming a selection that already reads back as
+# {device, uefi} is therefore a genuine no-op (changed=false), not merely
+# assumed safe -- there is nothing here that needs a fresh nonce to avoid being
+# mistaken for a replay. What this role still refuses to do unattended is the
+# RESET that consumes an armed selection (tasks/reset.yml), which is why
+# tasks/state.yml's resumability guard keys off boot_armed/reset_confirmed, not
+# off anything to do with this task being re-run.
+#
+# persistent is hardcoded false here, never sourced from a role variable --
+# see defaults/main.yml's comment on asmb8_baremetal_install_boot_device for
+# why persistent is deliberately not exposed as a variable at all. asmb8_boot
+# rejects persistent=true outright regardless, but this role does not even give
+# a caller the chance to try.
+
+- name: Arm the one-time optical boot selection
+  james_crowley.asmb8_ikvm.asmb8_boot:
+    ipmi_port: "{{ asmb8_baremetal_install_ipmi_port }}"
+    device: "{{ asmb8_baremetal_install_boot_device }}"
+    uefi: "{{ asmb8_baremetal_install_boot_uefi }}"
+    persistent: false
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_boot_result
+
+- name: Record that the boot selection is armed
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: "{{ asmb8_baremetal_install_run_state | combine({'boot_armed': true}) }}"
+
+- name: Persist run state after arming boot
+  ansible.builtin.include_tasks: save_state.yml

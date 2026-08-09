@@ -1,0 +1,70 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+- name: Render answer.toml from the asmb8_autoinstall_iso_answer_* variables
+  ansible.builtin.template:
+    src: answer.toml.j2
+    dest: "{{ _asmb8_autoinstall_iso_work_path }}/root/answer.toml"
+    mode: "0600"
+  no_log: true # answer.toml carries root-password/root-password-hashed; never let a --diff or verbose recap print it.
+  delegate_to: localhost
+  run_once: true
+
+- name: Check whether proxmox-auto-install-assistant is available on this controller
+  ansible.builtin.command:
+    argv:
+      - "{{ asmb8_autoinstall_iso_vendor_tool_path }}"
+      - --version
+  register: _asmb8_autoinstall_iso_vendor_tool_version
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Validate the rendered answer file with proxmox-auto-install-assistant validate-answer
+  ansible.builtin.command:
+    argv:
+      - "{{ asmb8_autoinstall_iso_vendor_tool_path }}"
+      - validate-answer
+      - "{{ _asmb8_autoinstall_iso_work_path }}/root/answer.toml"
+  register: _asmb8_autoinstall_iso_answer_validation
+  changed_when: false
+  failed_when: false
+  when: _asmb8_autoinstall_iso_vendor_tool_version.rc == 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the rendered answer file passed validate-answer
+  ansible.builtin.assert:
+    that:
+      - _asmb8_autoinstall_iso_answer_validation.rc == 0
+    fail_msg: >-
+      proxmox-auto-install-assistant validate-answer rejected the rendered
+      answer.toml (rc={{ _asmb8_autoinstall_iso_answer_validation.rc }}):
+      stdout={{ _asmb8_autoinstall_iso_answer_validation.stdout }}
+      stderr={{ _asmb8_autoinstall_iso_answer_validation.stderr }}
+      Inspect {{ _asmb8_autoinstall_iso_work_path }}/root/answer.toml (left
+      in place because asmb8_autoinstall_iso_keep_work_dir should be set
+      true while debugging this) and the asmb8_autoinstall_iso_answer_*
+      variables that produced it. This role's own idea of the answer.toml
+      schema (see defaults/main.yml comments) may be stale relative to the
+      installed assistant version -- trust validate-answer's verdict over
+      this role's.
+  when: _asmb8_autoinstall_iso_vendor_tool_version.rc == 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Note that the rendered answer file could not be validated against the vendor tool
+  ansible.builtin.debug:
+    msg: >-
+      proxmox-auto-install-assistant is not on this controller's PATH (as
+      '{{ asmb8_autoinstall_iso_vendor_tool_path }}'), so the rendered
+      answer.toml at {{ _asmb8_autoinstall_iso_work_path }}/root/answer.toml
+      has NOT been schema-validated by Proxmox's own tool. Review it by
+      hand, or install proxmox-auto-install-assistant, before trusting
+      whatever ISO this run produces.
+  when: _asmb8_autoinstall_iso_vendor_tool_version.rc != 0
+  delegate_to: localhost
+  run_once: true

@@ -1,0 +1,33 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Internal constants, not caller-facing knobs -- those live in defaults/main.yml.
+# vars/ has higher precedence than defaults/ specifically so a group_vars/host_vars
+# override of a defaults/ variable can never accidentally shadow one of these.
+
+# Fresh, unattached, unarmed run state. Used both for a target with no prior state
+# file at all, and to reset state cleanly once a prior run's reset was confirmed
+# complete (see tasks/state.yml) -- a fully finished prior run's session id refers
+# to a session that has already been detached, so nothing in it is worth carrying
+# forward.
+#
+# No action-token field here, unlike the sibling james_crowley.intel_amt
+# collection's amt_baremetal_install role: amt_boot arms a one-time boot with a
+# caller-supplied nonce specifically so re-arming is never mistaken for a no-op.
+# asmb8_boot has no such concept -- it is a plain IPMI get_bootdev()/set_bootdev()
+# compare, convergent like any other idempotent module (see its DOCUMENTATION).
+# Re-running tasks/arm_boot.yml against a target whose boot-device override
+# already reads back as optical/uefi is therefore genuinely a no-op
+# (changed=false), not merely assumed safe. What this role still refuses to do
+# unattended is the RESET that consumes that armed selection -- see
+# asmb8_baremetal_install_force_resume below and tasks/state.yml.
+asmb8_baremetal_install_default_state:
+  media_attached: false
+  session_id: null
+  boot_armed: false
+  reset_issued: false
+  reset_confirmed: false
+  detached: true
+  last_failure: null

@@ -1,0 +1,54 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# _asmb8_autoinstall_iso_vendor_tool_version was already computed in
+# render_answer.yml (it needed the same probe to decide whether to run
+# validate-answer); this file re-derives the container runtime's
+# availability and combines the two into a single tooling decision.
+#
+# Sequential-override rather than one big expression, on purpose: each step
+# below is independently readable, and the order of the three tasks IS the
+# precedence rule (default none -> container if present -> vendor if present
+# and not deprioritised), rather than a nested ternary that would need its
+# own comment to explain.
+
+- name: Check whether the configured container runtime is available
+  ansible.builtin.command:
+    argv:
+      - "{{ asmb8_autoinstall_iso_container_runtime }}"
+      - --version
+  register: _asmb8_autoinstall_iso_container_runtime_version
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Default to no usable preparation tooling
+  ansible.builtin.set_fact:
+    _asmb8_autoinstall_iso_tooling: none
+  delegate_to: localhost
+  run_once: true
+
+- name: Select the container fallback when the configured runtime is available
+  ansible.builtin.set_fact:
+    _asmb8_autoinstall_iso_tooling: container
+  when: _asmb8_autoinstall_iso_container_runtime_version.rc == 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Select the vendor tool when available, unless the container fallback is both available and preferred
+  ansible.builtin.set_fact:
+    _asmb8_autoinstall_iso_tooling: vendor
+  when:
+    - _asmb8_autoinstall_iso_vendor_tool_version.rc == 0
+    - asmb8_autoinstall_iso_prefer_vendor_tool or _asmb8_autoinstall_iso_container_runtime_version.rc != 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Report which preparation tooling was selected
+  ansible.builtin.debug:
+    msg: "Using the '{{ _asmb8_autoinstall_iso_tooling }}' ISO preparation path."
+  delegate_to: localhost
+  run_once: true
