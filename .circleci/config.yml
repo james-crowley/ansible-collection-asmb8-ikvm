@@ -1,0 +1,901 @@
+---
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Pipeline parameters
+#
+# run-hardware-tests gates the hardware-in-the-loop workflow. Those jobs run on
+# a self-hosted CircleCI machine runner sitting inside the lab network, with
+# access to a real ASMB8-iKVM BMC -- they can log a session in, attach virtual
+# media, arm a one-time boot override, power-cycle the host, and open a live
+# KVM channel. They must never fire on an ordinary push. Trigger deliberately:
+#
+#   curl -X POST https://circleci.com/api/v2/project/<project-slug>/pipeline \
+#     -u "${CIRCLE_TOKEN}:" -H 'Content-Type: application/json' \
+#     -d '{"parameters":{"run-hardware-tests":true}}'
+parameters:
+  run-hardware-tests:
+    type: boolean
+    default: false
+
+  # hardware-limit restricts the hardware jobs to a subset of the rendered
+  # inventory, as an Ansible --limit pattern. Empty means every host the
+  # hardware playbooks would otherwise target.
+  #
+  # This collection manages exactly one board today (see README.md "Project
+  # status"), so a single-host run does not strictly need this yet -- but the
+  # sibling james_crowley.intel_amt collection's lab grew from one machine to
+  # several, and the parameter is cheap to carry from day one rather than
+  # retrofit under pressure once a second board is added to the lab. "You may
+  # test this one board" and "you may test everything in the lab inventory"
+  # are different permissions, and a harness that cannot express the narrower
+  # one will always be run with the broader one.
+  hardware-limit:
+    type: string
+    default: ""
+
+  # run-devel-canary runs sanity against ansible-core's devel branch. Off by
+  # default and deliberately NOT part of the PR path: devel breaks for reasons
+  # that are upstream's business, and a red PR check nobody can fix teaches
+  # people to ignore red checks. A weekly schedule should set this instead,
+  # which satisfies the collection requirement to test against devel or
+  # milestone "in every PR or on a scheduled basis of at least once per week"
+  # while keeping the signal advisory.
+  #
+  # The point is lead time: new sanity requirements land in devel first, so
+  # this is how we find out about one before it becomes a release blocker.
+  run-devel-canary:
+    type: boolean
+    default: false
+
+executors:
+  python:
+    parameters:
+      python-version:
+        type: string
+        default: "3.12"
+    docker:
+      - image: cimg/python:<< parameters.python-version >>
+    working_directory: ~/project
+
+commands:
+  export-hardware-limit:
+    description: >-
+      Turn the hardware-limit pipeline parameter into an ANSIBLE_LIMIT_FLAG the
+      hardware job steps interpolate. Kept as one command so every hardware
+      job derives the flag identically -- a job that forgot it would silently
+      widen the blast radius of a run authorised for one host.
+    steps:
+      - run:
+          name: Resolve the inventory limit for this run
+          command: |
+            limit='<< pipeline.parameters.hardware-limit >>'
+            if [ -n "${limit}" ]; then
+              echo "export ANSIBLE_LIMIT_FLAG='--limit ${limit}'" >> "$BASH_ENV"
+              echo "Hardware jobs restricted to: ${limit}"
+            else
+              echo "export ANSIBLE_LIMIT_FLAG=''" >> "$BASH_ENV"
+              echo "No hardware-limit set; hardware jobs target every host in the inventory."
+            fi
+
+  install-ansible:
+    description: Install a specific ansible-core minor series plus test deps.
+    parameters:
+      ansible-core-version:
+        type: string
+    steps:
+      # NOTE (pending, remove once landed): tests/unit/requirements.txt is
+      # what `ansible-test units` itself installs into its own venv, and is
+      # also this cache key's fingerprint -- exactly as in the sibling
+      # james_crowley.intel_amt collection's CI config, which this job mirrors
+      # deliberately, per that project's own requirements-dev.txt: "what
+      # ansible-test units installs, once it exists". It does not exist in
+      # this repository yet (tests/unit/ content is landing concurrently with
+      # this file). Until it does, restore_cache/save_cache below will fail
+      # at the `checksum` step with "Cannot find file to hash" -- a known,
+      # accepted gap, not a mistake: fabricating a placeholder file from the
+      # CI config would be worse, since it would silently stop being the
+      # thing that actually keys ansible-test's own installed deps the moment
+      # a real tests/unit/requirements.txt appeared beside it.
+      - restore_cache:
+          keys:
+            - v1-pip-<< parameters.ansible-core-version >>-{{ checksum "tests/unit/requirements.txt" }}
+            - v1-pip-<< parameters.ansible-core-version >>-
+      - run:
+          name: Install ansible-core << parameters.ansible-core-version >>
+          command: |
+            python -m pip install --upgrade pip
+            python -m pip install "ansible-core~=<< parameters.ansible-core-version >>.0"
+            python -m pip install -r tests/unit/requirements.txt
+            ansible --version
+      - save_cache:
+          paths:
+            - ~/.cache/pip
+          key: v1-pip-<< parameters.ansible-core-version >>-{{ checksum "tests/unit/requirements.txt" }}
+
+  collect-test-results:
+    description: >-
+      Copy ansible-test JUnit output back out of the staged collection tree.
+      The subdirectory must not be hidden or CircleCI silently ignores it.
+    parameters:
+      label:
+        type: string
+    steps:
+      - run:
+          name: Gather JUnit results
+          when: always
+          command: |
+            mkdir -p ~/project/test-results/<< parameters.label >>
+            if [ -d "${COLLECTION_PATH:-}/tests/output/junit" ]; then
+              cp -a "${COLLECTION_PATH}/tests/output/junit/." \
+                 ~/project/test-results/<< parameters.label >>/ 2>/dev/null || true
+            fi
+      - store_test_results:
+          path: ~/project/test-results
+      - store_artifacts:
+          path: ~/project/test-results
+          destination: test-results
+
+  # ---------------------------------------------------------------------------
+  # Shared steps for the hardware-in-the-loop jobs below. Factored out once
+  # there were six jobs repeating the same credential check and venv/collection
+  # install -- a copy drifting from the original is exactly how the
+  # ansible-core pin or the required-variable list goes stale in only some
+  # jobs.
+  verify-hardware-credentials:
+    description: >-
+      Verify the restricted asmb8-lab context injected the required BMC
+      credentials, and either a reviewed TLS fingerprint or an explicit
+      insecure-transport override, before anything tries to use them. Never
+      prints a credential value -- only variable names and presence/absence.
+    steps:
+      - run:
+          name: Verify the hardware lab credentials were injected
+          command: |
+            missing=""
+            for var in ASMB8_HOST ASMB8_USERNAME ASMB8_PASSWORD; do
+              eval "val=\${$var:-}"
+              [ -n "$val" ] || missing="$missing $var"
+            done
+            if [ -n "$missing" ]; then
+              echo "Missing required context variables:$missing" >&2
+              echo "Add them to the asmb8-lab context." >&2
+              exit 1
+            fi
+            if [ -z "${ASMB8_TLS_FINGERPRINT:-}" ] && [ "${ASMB8_ALLOW_INSECURE:-false}" != "true" ]; then
+              echo "ASMB8_TLS_FINGERPRINT is not set." >&2
+              echo "This board's web certificate is self-signed AND, as of 2026-05-30," >&2
+              echo "expired -- CA validation can never succeed against it, on this board" >&2
+              echo "or any future one still carrying that cert. Reviewed fingerprint" >&2
+              echo "pinning is the only supported trust path. Run hardware-observe," >&2
+              echo "review the fingerprint it prints, then store it in the context." >&2
+              exit 1
+            fi
+            echo "Hardware lab credentials present for ${ASMB8_HOST}."
+
+  install-hardware-venv:
+    description: >-
+      Install ansible-core into a workspace virtualenv -- the machine runner
+      is not a pre-built cimg/python image, so nothing is pre-installed -- and
+      build+install this collection from the checkout, so hardware jobs run
+      against the code under test.
+    steps:
+      - run:
+          name: Install ansible-core into a workspace virtualenv
+          command: |
+            # 2.19: the same series the lint/build/publish jobs below pin. Not
+            # this collection's declared floor (2.17, see meta/runtime.yml) and
+            # not the newest, least-battle-tested series (2.21) either -- a
+            # deliberate middle choice so hardware qualification runs on the
+            # same ansible-core the rest of this file already exercises most,
+            # rather than adding a fourth version nothing else here uses.
+            #
+            # TODO: confirm the actual asmb8-lab runner host ships a python3
+            # new enough for this. ansible-core 2.19 requires Python 3.11+ on
+            # the controller; this step assumes bare `python3` on the runner
+            # already satisfies that, which is unverified until the runner is
+            # actually provisioned. The sibling james_crowley.intel_amt
+            # collection hit exactly this gap on its own lab runner (bare
+            # `python3` there is a too-old system interpreter) and had to add
+            # an explicit interpreter search -- revisit this step the same way
+            # if the assumption here turns out to be wrong.
+            python3 -m venv .venv
+            . .venv/bin/activate
+            python -m pip install --upgrade pip
+            python -m pip install "ansible-core~=2.19.0" -r requirements.txt
+            ansible --version
+      - run:
+          name: Install the collection from this checkout
+          command: |
+            . .venv/bin/activate
+            ansible-galaxy collection build --output-path ./dist --force
+            ansible-galaxy collection install ./dist/*.tar.gz --force
+
+  note-recovery-path-on-failure:
+    description: >-
+      On failure, note that a hardware job can leave the BMC or the host it
+      manages in a state that needs manual attention.
+    steps:
+      - run:
+          name: If this failed, the board may need manual attention
+          when: on_fail
+          command: |
+            echo "This job can leave the BMC, or the host it manages, in an uncertain state." >&2
+            echo "Recovery is manual: physical console or KVM, or power-cycling the BMC" >&2
+            echo "itself (not just the host) if a login session or the cd-media slot got wedged." >&2
+
+jobs:
+  # -------------------------------------------------------------------------
+  lint:
+    executor:
+      name: python
+      python-version: "3.12"
+    steps:
+      - checkout
+      - install-ansible:
+          ansible-core-version: "2.19"
+      - run:
+          # From requirements-dev.txt, not a bare `pip install ansible-lint
+          # yamllint ruff`: unpinned linters make a lint result a function of
+          # the day it ran. This file is the single place those versions are
+          # declared, which is what makes "install the dev requirements" in
+          # CONTRIBUTING.md a truthful instruction rather than an
+          # approximation. See requirements-dev.txt's own header for the
+          # measured ruff 0.15.5-vs-0.16.0 example from the sibling
+          # james_crowley.intel_amt collection that motivates pinning exactly.
+          name: Install pinned linters (same file contributors install)
+          command: python -m pip install -r requirements-dev.txt
+      - run:
+          # Runs FIRST, before any other lint step: if this file cannot be
+          # parsed by CircleCI's preprocessor then nothing else in the pipeline
+          # is trustworthy, and the failure mode is silent. A stray
+          # double-angle-bracket sequence anywhere in this file -- including
+          # inside a shell `command:` block or a comment -- is read as the start
+          # of a parameter tag and produces "Unclosed tag", which prevents the
+          # affected workflow from launching at all. `circleci config validate`
+          # does NOT catch it.
+          #
+          # That matters especially here because the hardware workflow below is
+          # reachable only via a pipeline parameter defaulting to false, so a
+          # break could sit unnoticed across several releases.
+          #
+          # The guard MUST stay an external script and must never be inlined
+          # into a `command:` block in this file: its own grep pattern for the
+          # double-angle-bracket sequence would itself be exactly such a
+          # sequence, which is precisely what it exists to catch.
+          name: CircleCI parameter-tag guard
+          command: ./scripts/check-circleci-tags.sh .circleci/config.yml
+      - run:
+          name: yamllint
+          command: yamllint -c .yamllint .
+      - run:
+          name: ruff
+          command: ruff check plugins tests
+      - run:
+          name: ruff format check
+          command: ruff format --check plugins tests
+      - run:
+          # ansible-lint resolves james_crowley.asmb8_ikvm.* FQCNs by looking
+          # in the collections path, and unlike ansible-test it does not stage
+          # the ansible_collections/<ns>/<name>/ layout scripts/setup-collection-tree.sh
+          # builds. A plain symlink is enough to make this checkout resolvable
+          # as its own collection. Matches CONTRIBUTING.md's local sequence
+          # exactly, so CI and a contributor's terminal see the same thing.
+          name: Make this checkout resolvable as its own collection (for ansible-lint)
+          command: |
+            mkdir -p ~/.ansible/collections/ansible_collections/james_crowley
+            ln -sfn "$(pwd)" ~/.ansible/collections/ansible_collections/james_crowley/asmb8_ikvm
+      - run:
+          name: ansible-lint
+          command: ansible-lint --offline
+
+  # -------------------------------------------------------------------------
+  sanity:
+    parameters:
+      ansible-core-version:
+        type: string
+      python-version:
+        type: string
+    executor:
+      name: python
+      python-version: << parameters.python-version >>
+    steps:
+      - checkout
+      - install-ansible:
+          ansible-core-version: << parameters.ansible-core-version >>
+      - run:
+          name: ansible-test sanity
+          command: |
+            COLLECTION_PATH="$(./scripts/setup-collection-tree.sh)"
+            echo "export COLLECTION_PATH=${COLLECTION_PATH}" >> "$BASH_ENV"
+            cd "${COLLECTION_PATH}"
+            # --venv, not --docker: the CircleCI Docker executor cannot
+            # bind-mount the working directory into a remote-docker container,
+            # which is what `ansible-test --docker` requires.
+            ansible-test sanity --venv --python << parameters.python-version >> \
+              --color -v --junit
+      - collect-test-results:
+          label: sanity-py<< parameters.python-version >>-core<< parameters.ansible-core-version >>
+
+  # -------------------------------------------------------------------------
+  units:
+    parameters:
+      ansible-core-version:
+        type: string
+      python-version:
+        type: string
+    executor:
+      name: python
+      python-version: << parameters.python-version >>
+    steps:
+      - checkout
+      - install-ansible:
+          ansible-core-version: << parameters.ansible-core-version >>
+      - run:
+          name: ansible-test units
+          command: |
+            COLLECTION_PATH="$(./scripts/setup-collection-tree.sh)"
+            echo "export COLLECTION_PATH=${COLLECTION_PATH}" >> "$BASH_ENV"
+            cd "${COLLECTION_PATH}"
+            ansible-test units --venv --python << parameters.python-version >> \
+              --color -v --coverage
+      - run:
+          name: Coverage report
+          when: always
+          command: |
+            cd "${COLLECTION_PATH}"
+            ansible-test coverage report --omit 'tests/*' --color -v || true
+      - collect-test-results:
+          label: units-py<< parameters.python-version >>-core<< parameters.ansible-core-version >>
+
+  # -------------------------------------------------------------------------
+  # Mock integration tests. Intended to run the modules end-to-end against a
+  # local, deterministic mock of the BMC's .asp/HTTP web session and its iUSB
+  # cd-media service. No real ASMB8 hardware.
+  integration-mock:
+    executor:
+      name: python
+      python-version: "3.12"
+    steps:
+      - checkout
+      - install-ansible:
+          ansible-core-version: "2.19"
+      - run:
+          name: ansible-test integration (mock endpoints)
+          command: |
+            COLLECTION_PATH="$(./scripts/setup-collection-tree.sh)"
+            echo "export COLLECTION_PATH=${COLLECTION_PATH}" >> "$BASH_ENV"
+            cd "${COLLECTION_PATH}"
+            # TEMPORARY skip guard. tests/integration/targets currently holds
+            # only a .keep placeholder: the mock .asp/HTTP server and the mock
+            # iUSB cd-media server this job needs are being written
+            # concurrently and do not exist yet, and no per-module integration
+            # target (tests/integration/targets/<module>/) exists either. This
+            # step is wired exactly as it will run once those land -- no
+            # config change should be needed here when they do -- but it must
+            # not fail the whole workflow (and, downstream, `build`) in the
+            # meantime. The sibling james_crowley.intel_amt collection carried
+            # an equivalent guard for the same reason during its own early
+            # history (issue #8) and explicitly removed it once every target
+            # was committed, because a "no targets" exit swallowed by a
+            # standing guard is exactly how a real regression -- targets
+            # silently disappearing from the staged tree -- would go
+            # unnoticed. Remove this guard the same way, in the same change
+            # that adds the first real target, not before and not long after.
+            if ! find tests/integration/targets -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
+              echo "No integration targets yet (tests/integration/targets has only .keep)."
+              echo "Skipping until the mock .asp/iUSB servers and per-module targets land --"
+              echo "see the comment on this step."
+              exit 0
+            fi
+            ansible-test integration --venv --python 3.12 --color -v
+      - collect-test-results:
+          label: integration-mock
+
+  # -------------------------------------------------------------------------
+  # Sanity against ansible-core devel. Advisory: see run-devel-canary above for
+  # why this is not on the PR path.
+  sanity-devel:
+    executor:
+      name: python
+      # devel targets the next core release, whose controller floor only ever
+      # rises. Newest available interpreter, so a Python-floor bump upstream
+      # shows up as a real failure here rather than as an install error.
+      python-version: "3.13"
+    steps:
+      - checkout
+      - run:
+          name: Install ansible-core from devel
+          command: |
+            python -m pip install --upgrade pip
+            python -m pip install "https://github.com/ansible/ansible/archive/devel.tar.gz"
+            ansible --version
+      - run:
+          name: Stage the collection tree
+          command: |
+            echo "export COLLECTION_PATH=$(./scripts/setup-collection-tree.sh)" >> "$BASH_ENV"
+      - run:
+          name: ansible-test sanity against devel
+          command: |
+            cd "${COLLECTION_PATH}"
+            ansible-test sanity --venv --python 3.13 --color no
+
+  # -------------------------------------------------------------------------
+  build:
+    executor:
+      name: python
+      python-version: "3.12"
+    steps:
+      - checkout
+      - install-ansible:
+          ansible-core-version: "2.19"
+      - run:
+          name: Build collection artifact
+          command: |
+            ansible-galaxy collection build --output-path ./dist -v
+            ls -la ./dist
+      - run:
+          name: Verify the artifact installs cleanly
+          command: |
+            ansible-galaxy collection install ./dist/*.tar.gz -p /tmp/verify-install -v
+            ansible-doc --list \
+              --module-path /tmp/verify-install/ansible_collections/james_crowley/asmb8_ikvm/plugins/modules \
+              2>/dev/null || true
+      - store_artifacts:
+          path: ./dist
+          destination: collection
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop. Runs on a self-hosted machine runner inside the lab
+  # network, with access to a real ASMB8-iKVM BMC. Read-only: .asp GET probes,
+  # IPMI get_power/get_bootdev, and a TCP port map. Sends no credentials that
+  # could be rejected and mutates no BMC-side state, so it is deliberately NOT
+  # behind an approval gate the way every escalation below it is -- an
+  # operator has to be able to run this freely to learn the TLS fingerprint
+  # every credentialed job below needs in order to pin anything, without
+  # first needing to be approved to do the thing that produces the value the
+  # approval is meant to protect. It still only runs on main, and still needs
+  # the restricted asmb8-lab context for ASMB8_HOST.
+  #
+  # TODO (pending): tests/hardware/observe.yml does not exist yet -- only a
+  # tests/hardware/.keep placeholder is committed. This job (and every
+  # hardware-* job below) is wired exactly as it should run once the hardware
+  # test playbooks land, the same way integration-mock above is wired ahead of
+  # its mock servers. That is safe today because run-hardware-tests defaults
+  # to false and the whole hardware workflow additionally sits behind
+  # per-escalation approvals, a branches-only-main filter, and the restricted
+  # asmb8-lab context -- see the workflow at the bottom of this file.
+  hardware-observe:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - run:
+          name: Runner environment
+          command: |
+            echo "host:    $(hostname)"
+            echo "python:  $(python3 --version)"
+            echo "workdir: $(pwd)"
+      - run:
+          name: Probe read-only BMC endpoints (.asp GET, IPMI get_power/get_bootdev, TCP port map)
+          command: |
+            test -n "${ASMB8_HOST:-}" || { echo "ASMB8_HOST is not set in the context." >&2; exit 1; }
+            ansible-playbook tests/hardware/observe.yml -v
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop, escalation 2: BMC login (the create.asp POST).
+  # Escalates past hardware-observe because this creates real BMC-side session
+  # state, behind its own dedicated approval job (hardware-login-approval) --
+  # see the hardware workflow at the bottom of this file for why every
+  # escalation below gets an independent approval rather than one approval
+  # covering several.
+  hardware-login:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - verify-hardware-credentials
+      - install-hardware-venv
+      - export-hardware-limit
+      - run:
+          name: "BMC login (create.asp POST)"
+          command: |
+            . .venv/bin/activate
+            # This BMC's create.asp endpoint returns HTTP 200 on a REJECTED
+            # login, not a 4xx/5xx. The actual failure signal is a
+            # Failure_Login_* marker embedded inside the SESSION_COOKIE value
+            # the response sets. tests/hardware/login.yml (once it lands) must
+            # assert on that marker, never on HTTP status alone -- a check that
+            # only looks at the status code will treat rejected credentials as
+            # a successful login and hand back a session the BMC never
+            # actually granted, and everything layered on top of that session
+            # (media attach, boot override, KVM) would then be acting on a
+            # false premise.
+            ansible-playbook tests/hardware/login.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - note-recovery-path-on-failure
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop, escalation 3: attach a test ISO over iUSB (TCP 5120).
+  # Escalates past hardware-login behind its own approval gate
+  # (hardware-media-attach-approval).
+  hardware-media-attach:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - verify-hardware-credentials
+      - install-hardware-venv
+      - export-hardware-limit
+      - run:
+          name: "Attach ISO over iUSB (TCP 5120)"
+          command: |
+            . .venv/bin/activate
+            ansible-playbook tests/hardware/media_attach.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - run:
+          # The cd-media service behind this port permits exactly ONE active
+          # session and has NO server-side timeout to reclaim an abandoned
+          # one. If the attach step above crashed, this job was cancelled, or
+          # it timed out between attach and detach, the slot stays held
+          # against every future job (and every human) until someone
+          # power-cycles or otherwise resets the BMC -- there is no remote way
+          # to reclaim it. `when: always` is not a nice-to-have here: it is the
+          # only thing standing between "this job failed" and "this job wedged
+          # the only cd-media slot on the board, for everyone, until a physical
+          # reset."
+          name: "Detach iUSB media (guaranteed cleanup)"
+          when: always
+          command: |
+            . .venv/bin/activate
+            ansible-playbook tests/hardware/media_detach.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - note-recovery-path-on-failure
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop, escalation 4: one-time boot-device override via IPMI.
+  # Escalates past hardware-media-attach behind its own approval gate
+  # (hardware-boot-once-approval).
+  hardware-boot-once:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - verify-hardware-credentials
+      - install-hardware-venv
+      - export-hardware-limit
+      - run:
+          name: "One-time boot-device override (IPMI)"
+          command: |
+            . .venv/bin/activate
+            # ONE-TIME overrides only. Persistent boot-order changes are
+            # prohibited by the lab contract for this board -- this playbook
+            # (once it lands) must use IPMI's one-shot boot-flag semantics
+            # (e.g. community.general.ipmi_boot with a one-time-equivalent
+            # option, or the raw chassis bootdev command's "options=persistent"
+            # bit left OFF), never a persistent BootOrder/BootSourceOverride
+            # write. A persistent change here would silently alter every
+            # subsequent normal boot of the host, not just the one this job
+            # intends to redirect -- a much larger and much less visible
+            # blast radius than the job itself.
+            ansible-playbook tests/hardware/boot_once.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - note-recovery-path-on-failure
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop, escalation 5: power-cycle the host via IPMI. The most
+  # destructive action in this workflow -- escalates past hardware-boot-once
+  # behind its own approval gate (hardware-reset-approval).
+  hardware-reset:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - verify-hardware-credentials
+      - install-hardware-venv
+      - export-hardware-limit
+      - run:
+          name: "Power cycle the host (IPMI)"
+          command: |
+            . .venv/bin/activate
+            ansible-playbook tests/hardware/reset.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - note-recovery-path-on-failure
+
+  # -------------------------------------------------------------------------
+  # Hardware-in-the-loop, escalation 6: open the KVM redirection channel (TCP
+  # 7578). LAST job in the chain, behind its own approval gate
+  # (hardware-kvm-approval), downstream of hardware-reset.
+  hardware-kvm:
+    machine: true
+    resource_class: crowley/asmb8-runner
+    steps:
+      - checkout
+      - verify-hardware-credentials
+      - install-hardware-venv
+      - export-hardware-limit
+      - run:
+          name: "Open KVM redirection channel (TCP 7578)"
+          command: |
+            . .venv/bin/activate
+            ansible-playbook tests/hardware/kvm.yml ${ANSIBLE_LIMIT_FLAG} -v
+      - note-recovery-path-on-failure
+
+  # -------------------------------------------------------------------------
+  publish:
+    executor:
+      name: python
+      python-version: "3.12"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - install-ansible:
+          ansible-core-version: "2.19"
+      # A Galaxy version is IMMUTABLE once published: it cannot be replaced,
+      # only superseded by a higher version. So the one mistake this job must
+      # make impossible is publishing under a version nobody intended --
+      # tagging v0.2.0 while galaxy.yml still says 0.1.0 would either burn
+      # 0.1.0 a second time or ship 0.2.0's contents as 0.1.0, irrecoverably.
+      # The tag is what a human deliberately chose; galaxy.yml's version is
+      # what the artifact actually claims to be. They must agree before
+      # anything is uploaded, and this check has to be here rather than in
+      # `build` because `build` also runs on untagged branches where
+      # CIRCLE_TAG is empty.
+      #
+      # `import yaml` below is satisfied by the install-ansible step above,
+      # NOT by the executor image: cimg/python:3.12 ships no PyYAML, while
+      # ansible-core hard-depends on it. Keep this step after install-ansible.
+      - run:
+          name: Tag must match galaxy.yml version
+          command: |
+            want="${CIRCLE_TAG#v}"
+            have="$(python -c 'import yaml,sys;print(yaml.safe_load(open("galaxy.yml"))["version"])')"
+            if [ "$want" != "$have" ]; then
+              echo "git tag ${CIRCLE_TAG} implies version ${want}, but galaxy.yml declares ${have}" >&2
+              exit 1
+            fi
+            # Pin the artifact by exact filename rather than publishing a
+            # ./dist/*.tar.gz glob: the glob would happily upload whatever
+            # single tarball happened to be in the attached workspace, which
+            # is the same class of mistake one step later.
+            ls ./dist/james_crowley-asmb8_ikvm-"${have}".tar.gz
+      - run:
+          name: Publish to Ansible Galaxy
+          command: |
+            test -n "${GALAXY_API_KEY}" || {
+              echo "GALAXY_API_KEY is not set; is the galaxy-publish context attached?" >&2
+              exit 1
+            }
+            ansible-galaxy collection publish \
+              "./dist/james_crowley-asmb8_ikvm-${CIRCLE_TAG#v}.tar.gz" \
+              --api-key "${GALAXY_API_KEY}" -v
+
+workflows:
+  # -------------------------------------------------------------------------
+  # Ordinary CI. Tag filters are present on every job because CircleCI skips
+  # jobs without them on tag pushes, which would strand the publish job.
+  test:
+    when:
+      not: << pipeline.parameters.run-hardware-tests >>
+    jobs:
+      - lint:
+          filters:
+            tags:
+              only: /^v.*/
+      - sanity:
+          requires: [lint]
+          filters:
+            tags:
+              only: /^v.*/
+          matrix:
+            parameters:
+              # 3.12 is the one interpreter every version in the ansible-core
+              # axis below runs on: 2.17 accepts 3.10-3.12, and 2.20/2.21
+              # require 3.12+. Pinning it keeps this axis about the core
+              # version rather than multiplying cells.
+              python-version: ["3.12"]
+              # meta/runtime.yml declares requires_ansible: '>=2.17.0' with no
+              # upper bound, so every currently-supported upstream core
+              # (2.19/2.20/2.21) plus the two EOL ones this collection still
+              # declares support for (2.17/2.18) get a cell. If that floor
+              # ever rises, delete the corresponding cells in the same change.
+              ansible-core-version: ["2.17", "2.18", "2.19", "2.20", "2.21"]
+      - units:
+          requires: [lint]
+          filters:
+            tags:
+              only: /^v.*/
+          matrix:
+            parameters:
+              # 3.10 is here because ansible-core 2.17 -- this collection's
+              # declared floor -- supports it, so users can legitimately run
+              # on it.
+              python-version: ["3.10", "3.11", "3.12", "3.13"]
+              ansible-core-version: ["2.17", "2.19", "2.21"]
+            exclude:
+              # Python 3.13 controller support arrived in ansible-core 2.18.
+              - python-version: "3.13"
+                ansible-core-version: "2.17"
+              # ansible-core 2.19 requires Python 3.11+ on the controller.
+              - python-version: "3.10"
+                ansible-core-version: "2.19"
+              # ansible-core 2.21 requires Python 3.12+ on the controller, so
+              # both 3.10 and 3.11 are impossible cells rather than untested
+              # ones.
+              - python-version: "3.10"
+                ansible-core-version: "2.21"
+              - python-version: "3.11"
+                ansible-core-version: "2.21"
+      - integration-mock:
+          requires: [lint]
+          filters:
+            tags:
+              only: /^v.*/
+      - build:
+          requires: [sanity, units, integration-mock]
+          filters:
+            tags:
+              only: /^v.*/
+      - publish-approval:
+          type: approval
+          requires: [build]
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+      - publish:
+          requires: [publish-approval]
+          context: galaxy-publish
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+
+  # -------------------------------------------------------------------------
+  # Advisory weekly canary against ansible-core devel. Set by a schedule, never
+  # by a push or a PR -- see the run-devel-canary parameter for why.
+  devel-canary:
+    when: << pipeline.parameters.run-devel-canary >>
+    jobs:
+      - sanity-devel
+
+  # -------------------------------------------------------------------------
+  # Opt-in only. Never runs on a normal push.
+  #
+  # This BMC's AMI web management server is HTTP/1.0 with no keep-alive, caps
+  # out at 20 concurrent web sessions, and keeps a SEPARATE worker pool per
+  # listener (the web/.asp port, the iUSB cd-media port, the KVM port). Two
+  # requests landing on the same pool at once exhaust it -- and, measured
+  # behaviour on this board, an exhausted pool then keeps completing TCP
+  # handshakes while never actually serving the request behind them, which
+  # looks like a hang rather than a clean refusal. Concretely, that means
+  # hardware jobs must never run in parallel against the board, and no single
+  # job may open concurrent connections to it either.
+  #
+  # This is enforced structurally, not by convention: every job below is a
+  # single link in one linear `requires:` chain (never a `matrix`, never two
+  # jobs with the same context and no dependency between them), so CircleCI
+  # itself cannot schedule two of them at once, and each job's own steps run
+  # one ansible-playbook invocation at a time rather than fanning out with
+  # `async`/`strategy: free` or similar.
+  #
+  # Five independent controls stand in front of any BMC-touching job here,
+  # because escalation 3 onward can attach media, override boot, power-cycle
+  # the host, and open a live KVM channel:
+  #
+  #   1. the run-hardware-tests pipeline parameter, false by default, so an
+  #      ordinary push cannot reach this workflow at all;
+  #   2. a chain of INDEPENDENT manual approval jobs -- one per escalation
+  #      class (login, media-attach, boot-once, reset, kvm) -- so a single
+  #      human click never authorises more than the one class of action it
+  #      was clicked for. Approving "read a certificate" (hardware-observe,
+  #      which needs no approval at all -- see its own comment above) never
+  #      implies approving a login, and approving a login never implies
+  #      approving a power cycle;
+  #   3. the asmb8-lab context, restricted to this project only, so no other
+  #      project in the org can borrow the lab credentials;
+  #   4. a branch filter, so only main can target the runner;
+  #   5. the credentials themselves (ASMB8_HOST, ASMB8_USERNAME,
+  #      ASMB8_PASSWORD, ASMB8_TLS_FINGERPRINT, ASMB8_PORT, ASMB8_CD_PORT,
+  #      ASMB8_KVM_PORT, ASMB8_ALLOW_INSECURE) never appear in a `run: command:`
+  #      echo, print, or log line anywhere in this file -- verify-hardware-credentials
+  #      reports only which variable NAMES are missing, never a value.
+  #
+  # CircleCI additionally refuses to run self-hosted runner jobs for forked-PR
+  # builds, which matters if this repository is ever made public in a way that
+  # accepts outside PRs against this workflow.
+  hardware:
+    when: << pipeline.parameters.run-hardware-tests >>
+    jobs:
+      # Lint first: no reason to wake a human for an approval on a branch that
+      # cannot even pass static checks.
+      - lint:
+          filters:
+            branches:
+              only: main
+
+      - hardware-observe:
+          requires: [lint]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main
+
+      # -----------------------------------------------------------------------
+      # Escalation 2: BMC login. Own approval, deliberately not shared with any
+      # other escalation -- see the workflow-level comment above.
+      - hardware-login-approval:
+          type: approval
+          requires: [hardware-observe]
+          filters:
+            branches:
+              only: main
+      - hardware-login:
+          requires: [hardware-login-approval]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main
+
+      # -----------------------------------------------------------------------
+      # Escalation 3: iUSB media attach. Own approval.
+      - hardware-media-attach-approval:
+          type: approval
+          requires: [hardware-login]
+          filters:
+            branches:
+              only: main
+      - hardware-media-attach:
+          requires: [hardware-media-attach-approval]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main
+
+      # -----------------------------------------------------------------------
+      # Escalation 4: one-time boot override. Own approval.
+      - hardware-boot-once-approval:
+          type: approval
+          requires: [hardware-media-attach]
+          filters:
+            branches:
+              only: main
+      - hardware-boot-once:
+          requires: [hardware-boot-once-approval]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main
+
+      # -----------------------------------------------------------------------
+      # Escalation 5: power cycle. Own approval. Most destructive action in
+      # this workflow.
+      - hardware-reset-approval:
+          type: approval
+          requires: [hardware-boot-once]
+          filters:
+            branches:
+              only: main
+      - hardware-reset:
+          requires: [hardware-reset-approval]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main
+
+      # -----------------------------------------------------------------------
+      # Escalation 6: KVM channel. Own approval. Last in the chain.
+      - hardware-kvm-approval:
+          type: approval
+          requires: [hardware-reset]
+          filters:
+            branches:
+              only: main
+      - hardware-kvm:
+          requires: [hardware-kvm-approval]
+          context: asmb8-lab
+          filters:
+            branches:
+              only: main

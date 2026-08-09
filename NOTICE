@@ -1,0 +1,247 @@
+james_crowley.asmb8_ikvm
+Copyright 2026 Jim Crowley
+
+This product includes software developed for out-of-band management of ASUS
+ASMB8-iKVM baseboard management controllers.
+
+This collection is licensed GPL-3.0-or-later. See LICENSE.
+
+
+================================================================================
+Third-party attributions
+================================================================================
+
+The AMI "iUSB" virtual-media protocol and the AMI IVTP console protocol are
+both proprietary and undocumented by their vendor. Everything this collection
+knows about them was assembled from the sources below. Each entry states the
+source's license, exactly which of its files were consulted, and precisely what
+was derived from it -- so that a reader can audit the provenance of any given
+line of protocol handling rather than taking a blanket "inspired by" on trust.
+
+
+1. BadCoder1337/rd450x-console
+   Copyright (c) 2026 Anton Musin
+   License: MIT (full text in licenses/MIT.txt)
+   Source: https://github.com/BadCoder1337/rd450x-console
+
+   This is the primary source from which this collection's iUSB implementation
+   derives, and the only source any code structure was taken from. It is a
+   clean-room Go client for a Lenovo RD450X's AMI MegaRAC BMC (firmware 2.36) --
+   a different vendor and firmware generation than ASMB8 (1.14 / aux 1.14.2),
+   but the same underlying AMI codebase.
+
+   Files consulted:
+     internal/kvm/vmedia/iusb.go
+     internal/kvm/vmedia/auth.go
+     internal/kvm/vmedia/scsi.go
+     internal/kvm/vmedia/session.go
+     internal/kvm/vmedia/cache.go
+     internal/kvm/vmedia/reader.go
+     internal/kvm/vmedia/{iusb,scsi,cache}_test.go
+     internal/kvm/vmediactl.go
+     docs/kvm-vmedia.md
+     docs/kvm-protocol.md
+
+   Specifically derived:
+     - the 32-byte iUSB header codec (marshal/parse, checksum, opcode and
+       kill-packet predicates), from iusb.go
+     - the authentication packet construction and ACK/connection-status
+       parsing, from auth.go
+     - the SCSI response envelope structure (request echo, response framing),
+       from scsi.go
+     - the windowed LRU sector cache, essentially unmodified, from cache.go.
+       No vendor source addresses caching at all; this is original work by that
+       project.
+     - the local-file sector source, from reader.go, with the write half removed
+       (a CD-ROM device is read-only; no dead code was kept)
+     - the transport/session split -- dialing, packet read, response write, and
+       the serve loop -- from session.go
+     - the overall Options/Session/Handler wiring, from vmediactl.go
+     - the AMI IVTP console framing understanding, from docs/kvm-protocol.md
+
+   Corrected relative to this source, using the vendor material in entry 5:
+     - `deviceType` is always 5, for floppy and hard-disk device classes too.
+       rd450x-console left this "TBD" with a comment guessing it reused the
+       CD-ROM value; the decompiled vendor client proves the guess correct but
+       for a different reason -- FloppyRedir and HarddiskRedir literally call
+       createCDROMHeader(). The BMC infers device kind from the port, not this
+       field.
+     - eject detection compares payload[13] for exact equality with 2. This
+       source uses a bitmask. The decompiled vendor client for this board uses
+       exact equality, and the vendor client is authoritative for this board.
+     - the set of SCSI opcodes the CD-ROM device class must implement. This
+       source's opcode set is wrong for this board. See entry 5.
+
+
+2. samozy/iusb
+   Copyright (c) 2015 the project's authors
+   License: NONE STATED. The repository carries no LICENSE file and makes no
+   grant of rights. It is therefore not open-source software, and no code,
+   comment, identifier, or code structure from it appears in this collection.
+   Source: https://github.com/samozy/iusb
+
+   This is the oldest public reverse-engineering artifact for the iUSB
+   protocol. It implements the FLOPPY device class only; it has no CD-ROM path.
+   Its author had neither decompiled vendor sources nor a live packet capture,
+   and its own code comments label several constants as guesses.
+
+   Files consulted, for protocol FACTS ONLY (byte offsets, field meanings, and
+   opcode values -- facts are not copyrightable):
+     iusb.lua          (Wireshark dissector)
+     iusb_spoof.py
+
+   What it contributed:
+     - independent third confirmation of the 32-byte header field offsets and
+       of the little-endian framing length, via the Wireshark dissector. A
+       formal dissector written by a third party is useful corroboration
+       precisely because it was authored without reference to our sources.
+     - its dissector's own header comment states that the floppy and CD-ROM
+       packet structures are identical, which supported reusing one framing
+       implementation across device classes.
+
+   Nothing was derived from its implementation. Where it disagreed with entry 1
+   or entry 5, it lost.
+
+
+3. sciapp/nojava-ipmi-kvm, and the fork nesvet/nojava-ipmi-kvm
+   Copyright 2018 Forschungszentrum Juelich GmbH
+   License: MIT (full text in licenses/MIT.txt)
+   Source: https://github.com/sciapp/nojava-ipmi-kvm
+           https://github.com/nesvet/nojava-ipmi-kvm
+
+   This project runs the legacy vendor Java applet sandboxed in a container. It
+   does not touch the iUSB wire protocol, so no protocol code derives from it.
+   Its contribution is at the HTTP/session layer, and one of its findings is
+   load-bearing for correctness.
+
+   Files and issues consulted:
+     the ASMB8-family host configuration (login_endpoint, download_endpoint)
+     issue #36 and PR #37  -- expired MD5withRSA JViewer jar signature
+     PR #39                -- the EXTRNIP/JNLPSTR JNLP fetch shape
+     PR #40                -- login-failure detection
+
+   Specifically derived:
+     - The knowledge, from PR #40, that this BMC answers a FAILED login with
+       HTTP 200 and a SESSION_COOKIE value containing a Failure_Login_* marker,
+       rather than any non-2xx status. plugins/module_utils/asp.py detects this
+       explicitly. A client that trusts the status code alone will treat a
+       rejected login as successful. This behaviour was independently confirmed
+       against real hardware during this collection's development.
+     - the EXTRNIP/JNLPSTR query shape used when fetching the JNLP.
+
+   As of this writing PRs #37-#40 are unmerged upstream; the nesvet fork is the
+   only place those fixes exist. Operators wanting the vendor applet to run at
+   all against firmware 1.14.2 should use that fork.
+
+
+4. estecker/jviewer-starter, arbu/jviewer-starter, ossobv/vcutil (ipmikvm)
+   estecker/jviewer-starter: no LICENSE file, no grant of rights.
+   arbu/jviewer-starter:     no LICENSE file, no grant of rights.
+   ossobv/vcutil:            Public Domain, per the project's own statement.
+   Sources: https://github.com/estecker/jviewer-starter
+            https://github.com/arbu/jviewer-starter
+            https://github.com/ossobv/vcutil
+
+   These automate obtaining and launching the vendor Java client. They do not
+   implement the wire protocol. Consulted for protocol facts only; no code was
+   taken from any of them.
+
+   What they contributed:
+     - the vendor applet's Java entry-point class name,
+       com.ami.kvm.jviewer.JViewer, which located the relevant classes inside
+       the decompiled archive in entry 5.
+     - corroboration of the .asp login sequence and JNLP argument parsing.
+     - estecker's wrapper branches its liveness probe on an ASUSTek
+       manufacturer ID, checking a different port for ASUS boards -- third-party
+       corroboration that ASUS boards differ here in a way worth handling.
+
+
+5. ASUS / American Megatrends, Inc. -- JViewer client (JViewer.jar,
+   JViewer-SOC.jar, and the per-platform native libraries)
+   Copyright American Megatrends, Inc. and/or ASUSTeK Computer Inc.
+   License: proprietary. All rights reserved by their owners.
+
+   These are the vendor's own client binaries, served from the BMC's embedded
+   web server. They were retrieved from the target hardware and decompiled and
+   disassembled LOCALLY, for the sole purpose of understanding an undocumented
+   protocol well enough to interoperate with it.
+
+   NEITHER THE BINARIES NOR ANY DECOMPILED OR DISASSEMBLED OUTPUT IS
+   REDISTRIBUTED IN THIS COLLECTION, in whole or in part. What this collection
+   contains is an independent implementation informed by protocol facts. No
+   vendor code, and no decompiler output, appears in this repository.
+
+   Classes and binaries examined:
+     com/ami/iusb/protocol/{IUSBHeader,IUSBSCSI,RedirHeader,RedirPacket,
+                            RedirProtocol,CDROMProtocol,FloppyProtocol,
+                            PacketMaster}.class
+     com/ami/iusb/{CDROMRedir,FloppyRedir,HarddiskRedir,IUSBRedirSession}.class
+     libjavacdromwrapper.so, libjavafloppywrapper.so
+
+   Protocol facts established from this source, and authoritative over every
+   other entry above because this is the vendor's own client for this exact
+   board and firmware:
+     - the CD-ROM device class implements EXACTLY six SCSI opcodes: TEST UNIT
+       READY (0x00), START/STOP UNIT (0x1B), READ CAPACITY(10) (0x25),
+       READ(10) (0x28), READ TOC/PMA/ATIP (0x43), and READ(12) (0xA8). This was
+       determined by disassembling the vendor's own native SCSI dispatcher, not
+       inferred. Every other opcode -- including INQUIRY, MODE SENSE, GET
+       CONFIGURATION, REQUEST SENSE and all WRITE commands -- reaches a hard
+       error in the vendor code. INQUIRY specifically is answered by the BMC
+       firmware itself and never forwarded to the client.
+     - the dedicated-port transport has no preamble: the socket carries iUSB
+       framing from byte 0.
+     - auth packet layout: opcode 0xF2 at payload offset 9, session token at
+       payload offset 31; server ACK 0xF1 with status at payload offset 30;
+       kill 0xF6.
+     - deviceType is always 5 (see entry 1).
+     - eject is exact equality on payload[13] == 2 (see entry 1).
+     - the framing layer is independent of the transport layer, which is why
+       supporting AMI "single port" mode later requires no change to framing.
+     - single-port mode is per-channel HTTP CONNECT tunnelling, not multiplexing
+       over one shared connection.
+
+
+6. pyghmi
+   License: Apache-2.0
+   Source: https://opendev.org/x/pyghmi
+
+   Used as a runtime dependency, not vendored. plugins/module_utils/ipmi.py
+   wraps it for power control and one-time boot-device selection.
+
+   pyghmi is also what community.general's ipmi_power and ipmi_boot modules use
+   internally. Their source was read to confirm this and to match their
+   idempotency semantics for power states; no code was copied, and this
+   collection does not depend on community.general.
+
+
+================================================================================
+Prior art NOT consulted
+================================================================================
+
+Documented deliberately. An omission is easy to mistake for a claim of
+originality, and the honest position is to name the implementations that exist
+even where nothing was taken from them.
+
+
+7. ya-mouse/redirector
+   Source: https://github.com/ya-mouse/redirector
+
+   Named by rd450x-console (entry 1) as a third reverse-engineering source it
+   relied on, apparently the origin of that project's 128 KiB maximum-transfer
+   and block-size constants. It was NOT fetched or read during this
+   collection's development. Any agreement between this collection and that
+   project on those constants is therefore transitive through entry 1, not
+   independent -- and readers should treat it as such rather than as
+   corroboration.
+
+
+8. Eclypsium, "USBAnywhere" (2019)
+   https://eclypsium.com/blog/virtual-media-vulnerability-in-bmc-opens-servers-to-remote-attack/
+
+   Read for context only. It analyses a materially different Supermicro
+   virtual-media implementation (a distinct port and packet format, with a
+   fixed RC4 key shared across a vendor's BMCs). Nothing about it transfers to
+   ASMB8's protocol, and nothing was derived from it. It is cited because a
+   reader comparing BMC virtual-media research would otherwise reasonably
+   wonder whether it had been used.
