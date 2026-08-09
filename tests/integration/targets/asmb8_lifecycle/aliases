@@ -1,0 +1,19 @@
+# Exercises the destructive bare-metal install lifecycle's IPMI leg for real,
+# through unmodified asmb8_boot/asmb8_power/asmb8_info modules run by a real
+# ansible-playbook process -- the one thing
+# tests/integration/targets/asmb8_baremetal_install_role's own aliases file
+# documents as impossible until an IPMI mock existed. See this target's
+# tasks/main.yml header comment for exactly how (a same-process
+# pyghmi.ipmi.command.Command double, imported instead of real pyghmi via a
+# generated fake pyghmi package placed first on PYTHONPATH -- see
+# tests/integration/mock_servers/ipmi_server.py's module docstring) and for
+# what is deliberately NOT covered here (the iUSB/.asp media leg, and the
+# fine-grained per-step ordering/detach-on-failure assertions, both of which
+# tests/unit/plugins/modules/test_asmb8_power_lifecycle.py already covers).
+#
+# context/controller: this target invokes the controller's own Python
+# interpreter directly (via ansible_playbook_python) to run
+# run_ipmi_mock.py, and points other tasks' PYTHONPATH at what it generates --
+# both need the controller's own environment, not a managed node's.
+context/controller
+skip/windows

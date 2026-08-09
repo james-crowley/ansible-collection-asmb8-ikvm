@@ -1,0 +1,16 @@
+# Integration test dependencies.
+#
+# The mock `.asp` HTTP server and the mock iUSB media server are implemented with
+# the standard library plus requests, so this mirrors runtime rather than adding a
+# test-only dependency surface. Deliberately no pytest here: the integration
+# targets are driven by `ansible-test integration`, not pytest.
+requests>=2.25.0
+
+# Needed by the asmb8_lifecycle target. Most of its scenarios run against a
+# generated fake `pyghmi` package (see tests/integration/mock_servers/
+# run_ipmi_mock.py) and need nothing installed -- but one scenario deliberately
+# exercises the REAL library's failure path against an unroutable address, to
+# prove our error classification matches what pyghmi actually raises rather than
+# what our own double pretends it raises. Without this, that scenario skips under
+# `ansible-test integration --venv` and the gap is silent.
+pyghmi>=1.5.0

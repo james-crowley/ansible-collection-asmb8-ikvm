@@ -1,0 +1,47 @@
+---
+# Helper included once per scenario from tasks/main.yml. Expects:
+#   scenario_name      -- short, filename-safe label for this scenario
+#   scenario_inventory -- path (under files/) to the inventory to use
+#   scenario_vars      -- dict of asmb8_baremetal_install_* variables for this run
+#
+# Runs files/nested_play.yml as a genuinely separate `ansible-playbook`
+# process, via `ansible.builtin.command` rather than `ansible.builtin.
+# include_playbook` (which does not exist) or `include_role` (which would run
+# the role IN this same play, defeating the fan_out_guard scenario's whole
+# point: ansible_play_hosts_all has to reflect a real, separate play's own
+# roster, not this integration target's).
+#
+# Sets scenario_rc / scenario_stdout / scenario_stderr as facts for
+# tasks/main.yml to assert against immediately after including this file.
+
+- name: Write this scenario's extra-vars file for {{ scenario_name }}
+  ansible.builtin.copy:
+    content: "{{ scenario_vars | to_nice_json }}\n"
+    dest: "{{ _scenario_tmp_dir.path }}/{{ scenario_name }}-vars.json"
+    mode: "0600"
+  delegate_to: localhost
+
+- name: Run the nested playbook as a separate ansible-playbook process for {{ scenario_name }}
+  # `ansible-playbook` itself, found on PATH -- context/controller (see this
+  # target's aliases file) guarantees the controller's own ansible-playbook and
+  # collection path are what a nested invocation needs, exactly as the sibling
+  # james_crowley.intel_amt collection's equivalent target relies on the same
+  # alias for the same reason.
+  ansible.builtin.command:
+    argv:
+      - ansible-playbook
+      - "{{ role_path }}/files/nested_play.yml"
+      - -i
+      - "{{ role_path }}/files/{{ scenario_inventory }}"
+      - --extra-vars
+      - "@{{ _scenario_tmp_dir.path }}/{{ scenario_name }}-vars.json"
+  delegate_to: localhost
+  register: _nested_result
+  failed_when: false
+  changed_when: false
+
+- name: Record this scenario's outcome for {{ scenario_name }}
+  ansible.builtin.set_fact:
+    scenario_rc: "{{ _nested_result.rc }}"
+    scenario_stdout: "{{ _nested_result.stdout | default('') }}"
+    scenario_stderr: "{{ _nested_result.stderr | default('') }}"

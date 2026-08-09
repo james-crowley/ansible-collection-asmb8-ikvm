@@ -1,0 +1,11 @@
+---
+# One-host inventory for the nested ansible-playbook runs tasks/run_nested.yml
+# drives. The host itself is never actually connected to -- every task in
+# roles/asmb8_baremetal_install is delegate_to: localhost -- so
+# ansible_connection: local here is just enough to let the nested play start
+# without ansible-core attempting a real SSH connection to a name that does not
+# resolve to anything.
+all:
+  hosts:
+    asmb8-baremetal-install-test-target:
+      ansible_connection: local

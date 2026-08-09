@@ -1,0 +1,12 @@
+---
+# Two-host inventory, used by exactly one scenario (fan_out_guard) to prove
+# roles/asmb8_baremetal_install/tasks/validate.yml refuses a play with more
+# than one host in its FULL roster, not merely in the current serial batch.
+# See that file's own comment for the ansible_play_hosts_all vs.
+# ansible_play_batch distinction this proves.
+all:
+  hosts:
+    asmb8-baremetal-install-test-target-a:
+      ansible_connection: local
+    asmb8-baremetal-install-test-target-b:
+      ansible_connection: local

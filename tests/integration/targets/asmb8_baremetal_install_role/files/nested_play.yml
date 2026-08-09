@@ -1,0 +1,16 @@
+# Nested playbook, run as a separate `ansible-playbook` process by
+# tasks/run_nested.yml (via `ansible.builtin.command`), never included directly
+# into the outer integration-test play. A separate process is what lets
+# tasks/run_nested.yml capture a genuine `ansible_play_hosts_all` roster
+# (needed for the fan_out_guard scenario) and a genuine process return code for
+# each scenario, without the outer test's own play identity leaking in.
+#
+# Every role variable a scenario needs is supplied via `--extra-vars @<file>`
+# by tasks/run_nested.yml, never hardcoded here -- this file is the same for
+# every scenario.
+---
+- name: Nested run of asmb8_baremetal_install for one integration-test scenario
+  hosts: all
+  gather_facts: false
+  roles:
+    - role: james_crowley.asmb8_ikvm.asmb8_baremetal_install

@@ -1,0 +1,292 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# What this target covers, and why that scope is exactly right today
+# --------------------------------------------------------------------
+# roles/asmb8_baremetal_install/tasks/validate.yml and tasks/state.yml are pure
+# Ansible logic -- assert/stat/file/include_vars/set_fact -- and never contact
+# the BMC at all. Every scenario below drives the REAL role, as a genuinely
+# separate `ansible-playbook` process (see tasks/run_nested.yml), against
+# 127.0.0.1 with deliberately-unreachable IPMI settings, and asserts on that
+# process's exit code and output. No mock server is needed for any of this, and
+# none is used: this is the real validate.yml/state.yml logic, exercised for
+# real, not a simulation of it.
+#
+# roles/asmb8_baremetal_install/tasks/probe.yml onward is where this role
+# starts talking real IPMI (asmb8_info/asmb8_power/asmb8_boot) and real iUSB
+# (asmb8_media). Two scenarios below (target_disk_forward_guard_accepts and
+# resumability_guard_unblocked) deliberately let the nested run reach
+# tasks/probe.yml, and assert only that it GOT there -- never that it
+# succeeded, because succeeding would require a real or mocked BMC, and this
+# target has neither. tests/integration/mock_servers/ currently has
+# asp_server.py/run_asp_mock.py and iusb_server.py/run_iusb_mock.py (the iUSB/
+# .asp media plane), but NOTHING for the IPMI/RMCP+ plane asmb8_info/
+# asmb8_power/asmb8_boot depend on -- confirmed by searching this repository;
+# there is no ipmi_server.py, no run_ipmi_mock.py, nothing RMCP+-shaped
+# anywhere in it. Without that, attach_media.yml/arm_boot.yml/reset.yml/
+# observe.yml/wait_for_handoff.yml cannot be driven end-to-end by this target
+# against anything but a real board -- and the one real board this collection
+# has is explicitly off-limits to automated tests (see the top-level task this
+# role was built under: "make NO network requests to any real BMC.
+# NONE."). The debug task at the end of this file says so explicitly, loudly,
+# rather than this target silently reporting green with that gap unstated.
+#
+# ABSOLUTE RULE upheld throughout: every host contacted below is 127.0.0.1.
+# Nothing here ever resolves or connects to any real
+# BMC.
+
+- name: Create a scratch directory for this target's scenario artefacts
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: asmb8-baremetal-install-role-test-
+  delegate_to: localhost
+  register: _scenario_tmp_dir
+
+- name: Compute this target's isolated state directories
+  ansible.builtin.set_fact:
+    _state_dir_disk_accept: "{{ _scenario_tmp_dir.path }}/state-disk-accept"
+    _state_dir_resume_blocked: "{{ _scenario_tmp_dir.path }}/state-resume-blocked"
+    _state_dir_resume_unblocked: "{{ _scenario_tmp_dir.path }}/state-resume-unblocked"
+
+- name: Baseline role variables shared by every scenario, overridden per scenario below
+  ansible.builtin.set_fact:
+    _base_vars:
+      # 127.0.0.1 with nothing listening on ipmi_port=1 (a privileged, normally
+      # closed port): any scenario that reaches tasks/probe.yml fails there
+      # promptly with an IPMI session error, never by actually reaching a real
+      # network host. use_tls is false + allow_insecure_transport true purely
+      # to satisfy tasks/validate.yml's connection-consistency assert without
+      # needing a certificate; no TLS connection is ever attempted by
+      # asmb8_info/asmb8_power/asmb8_boot regardless (see their DOCUMENTATION:
+      # those options are accepted for module_defaults-group compatibility and
+      # otherwise ignored).
+      asmb8_baremetal_install_host: 127.0.0.1
+      asmb8_baremetal_install_username: admin
+      asmb8_baremetal_install_password: not-a-real-password
+      asmb8_baremetal_install_use_tls: false
+      asmb8_baremetal_install_allow_insecure_transport: true
+      asmb8_baremetal_install_tls_fingerprint: null
+      asmb8_baremetal_install_ipmi_port: 1
+      asmb8_baremetal_install_confirm_destructive: true
+      asmb8_baremetal_install_iso_path: /nonexistent/does-not-matter.iso
+      asmb8_baremetal_install_wait_for_handoff: false
+      asmb8_baremetal_install_state_dir: "{{ _scenario_tmp_dir.path }}/state-unused"
+
+# --- validate.yml: fan-out guard -------------------------------------------
+
+- name: "[fan_out_guard] Run the role against a two-host play"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: fan_out_guard
+    scenario_inventory: inventory_two_hosts.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_confirm_destructive': false}) }}"
+
+- name: "[fan_out_guard] Assert the role refused a two-host play"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'targets 2 hosts' in scenario_stdout"
+    fail_msg: "Expected the fan-out guard to refuse a two-host play. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+# --- validate.yml: destructive-confirmation gate ---------------------------
+
+- name: "[destructive_confirm_gate] Run the role without confirm_destructive"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: destructive_confirm_gate
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_confirm_destructive': false}) }}"
+
+- name: "[destructive_confirm_gate] Assert the role refused to proceed"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'asmb8_baremetal_install_confirm_destructive' in scenario_stdout"
+    fail_msg: "Expected the destructive-confirmation gate to refuse. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+# --- validate.yml: connection settings ------------------------------------
+
+- name: "[connection_vars_gate] Run the role with no password set"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: connection_vars_gate
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_password': None}) }}"
+
+- name: "[connection_vars_gate] Assert the role refused missing connection settings"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'Missing or inconsistent connection settings' in scenario_stdout"
+    fail_msg: "Expected the connection-settings guard to refuse. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+# --- validate.yml: ISO required --------------------------------------------
+
+- name: "[iso_path_required_gate] Run the role with no ISO path set"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: iso_path_required_gate
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_iso_path': None}) }}"
+
+- name: "[iso_path_required_gate] Assert the role required an ISO path"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'asmb8_baremetal_install_iso_path is required' in scenario_stdout"
+    fail_msg: "Expected the ISO-required guard to refuse. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+# --- validate.yml: hand-off host required ----------------------------------
+
+- name: "[handoff_host_required_gate] Run the role with wait_for_handoff true and no handoff host"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: handoff_host_required_gate
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: >-
+      {{ _base_vars | combine({'asmb8_baremetal_install_wait_for_handoff': true,
+                                'asmb8_baremetal_install_handoff_host': None}) }}
+
+- name: "[handoff_host_required_gate] Assert the role required a hand-off host"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'asmb8_baremetal_install_handoff_host is not set' in scenario_stdout"
+    fail_msg: "Expected the hand-off-host guard to refuse. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+# --- validate.yml: forward-looking disk-safety guard (point 7) ------------
+
+- name: "[target_disk_forward_guard_rejects] Run the role with an unpinned target disk"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: target_disk_forward_guard_rejects
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_target_disk': '/dev/sda'}) }}"
+
+- name: "[target_disk_forward_guard_rejects] Assert the role refused a bare device node"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'is not a stable disk identifier' in scenario_stdout"
+    fail_msg: "Expected the disk-safety forward guard to refuse /dev/sda. rc={{ scenario_rc }}\n{{ scenario_stdout }}"
+
+- name: "[target_disk_forward_guard_accepts] Run the role with a by-id target disk"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: target_disk_forward_guard_accepts
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: >-
+      {{ _base_vars | combine({'asmb8_baremetal_install_target_disk': '/dev/disk/by-id/nvme-FAKE_SERIAL_NOT_REAL',
+                                'asmb8_baremetal_install_state_dir': _state_dir_disk_accept}) }}
+
+- name: "[target_disk_forward_guard_accepts] Assert the role accepted it and proceeded past validate/state"
+  ansible.builtin.assert:
+    that:
+      # Still fails overall -- 127.0.0.1:1 has no real IPMI listener -- but the
+      # failure must come from tasks/probe.yml, proven by that task's own name
+      # appearing in the nested run's output, never from the disk-safety guard.
+      - scenario_rc | int != 0
+      - "'is not a stable disk identifier' not in scenario_stdout"
+      - "'Read IPMI-observed capabilities and state' in scenario_stdout"
+    fail_msg: >-
+      Expected a by-id disk path to pass validate.yml and reach tasks/probe.yml.
+      rc={{ scenario_rc }}
+      {{ scenario_stdout }}
+
+# --- state.yml: resumability guard -----------------------------------------
+
+- name: "[resumability_guard] Ensure both isolated state directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  loop:
+    - "{{ _state_dir_resume_blocked }}"
+    - "{{ _state_dir_resume_unblocked }}"
+
+- name: "[resumability_guard] Hand-craft an interrupted prior-run state file in each"
+  # boot_armed=true, reset_issued=true, reset_confirmed=false: exactly the
+  # "armed and/or reset, outcome never confirmed" shape tasks/state.yml's
+  # resumability guard exists to catch. The filename matches
+  # tasks/state.yml's own computation for host "127.0.0.1" (no ':' or '/' to
+  # replace).
+  ansible.builtin.copy:
+    content: |
+      {
+        "media_attached": false,
+        "session_id": null,
+        "boot_armed": true,
+        "reset_issued": true,
+        "reset_confirmed": false,
+        "detached": true,
+        "last_failure": "simulated interruption for this integration test"
+      }
+    dest: "{{ item }}/127.0.0.1.json"
+    mode: "0600"
+  delegate_to: localhost
+  loop:
+    - "{{ _state_dir_resume_blocked }}"
+    - "{{ _state_dir_resume_unblocked }}"
+
+- name: "[resumability_guard_blocked] Run the role against the interrupted state, without force_resume"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: resumability_guard_blocked
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: "{{ _base_vars | combine({'asmb8_baremetal_install_state_dir': _state_dir_resume_blocked}) }}"
+
+- name: "[resumability_guard_blocked] Assert the role refused to resume automatically"
+  ansible.builtin.assert:
+    that:
+      - scenario_rc | int != 0
+      - "'never silently re-issues a reset of uncertain outcome' in scenario_stdout"
+      - "'Read IPMI-observed capabilities and state' not in scenario_stdout"
+    fail_msg: >-
+      Expected the resumability guard to refuse an unconfirmed prior run,
+      before ever reaching tasks/probe.yml. rc={{ scenario_rc }}
+      {{ scenario_stdout }}
+
+- name: "[resumability_guard_unblocked] Run the role against the same state, with force_resume=true"
+  ansible.builtin.include_tasks: run_nested.yml
+  vars:
+    scenario_name: resumability_guard_unblocked
+    scenario_inventory: inventory_one_host.yml
+    scenario_vars: >-
+      {{ _base_vars | combine({'asmb8_baremetal_install_state_dir': _state_dir_resume_unblocked,
+                                'asmb8_baremetal_install_force_resume': true}) }}
+
+- name: "[resumability_guard_unblocked] Assert force_resume unblocked the guard and the role reached probe.yml"
+  ansible.builtin.assert:
+    that:
+      # Still fails overall, for the same reason as target_disk_forward_guard_accepts
+      # above -- there is no real IPMI listener on 127.0.0.1:1 -- but it must be
+      # THAT failure, not the resumability guard's.
+      - scenario_rc | int != 0
+      - "'never silently re-issues a reset of uncertain outcome' not in scenario_stdout"
+      - "'Read IPMI-observed capabilities and state' in scenario_stdout"
+    fail_msg: >-
+      Expected asmb8_baremetal_install_force_resume=true to unblock the
+      resumability guard and let the role reach tasks/probe.yml.
+      rc={{ scenario_rc }}
+      {{ scenario_stdout }}
+
+# --- The gap this target does not, and currently cannot, cover ------------
+
+- name: State plainly what remains untested by this target
+  ansible.builtin.debug:
+    msg: >-
+      NOT COVERED by this integration target: tasks/attach_media.yml,
+      tasks/arm_boot.yml, tasks/reset.yml, tasks/observe.yml, and
+      tasks/wait_for_handoff.yml -- i.e. everything from the first real IPMI
+      call onward. This collection currently has NO mock IPMI/RMCP+ server
+      (only tests/integration/mock_servers/asp_server.py and iusb_server.py,
+      which mock the iUSB/.asp media plane asmb8_media speaks, not the IPMI
+      plane asmb8_info/asmb8_power/asmb8_boot speak). Once an IPMI mock exists,
+      this target should be extended with a scenario that drives the full
+      happy-path lifecycle against it. Until then, that lifecycle has been
+      exercised only by direct, manual, human-supervised runs against the real
+      lab board -- never by an automated test of any kind, mocked or
+      otherwise. See roles/asmb8_baremetal_install/README.md#verification-status.

@@ -1,0 +1,411 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# What this target covers, and why that scope is exactly right today
+# --------------------------------------------------------------------
+# tests/integration/targets/asmb8_baremetal_install_role's own tasks/main.yml
+# states plainly that its probe/arm_boot/reset/observe scenarios could only
+# ever prove a nested playbook REACHED tasks/probe.yml, never that the IPMI
+# calls beyond it succeeded -- because no IPMI mock existed. This target is
+# what closes that gap, for the modules directly (asmb8_boot/asmb8_power/
+# asmb8_info), driven by a real `ansible-playbook` process, unmodified.
+#
+# How, without a wire-level RMCP+ responder
+# -------------------------------------------
+# tests/integration/mock_servers/ipmi_server.py is a same-process TEST DOUBLE
+# for `pyghmi.ipmi.command.Command` -- see that file's own module docstring
+# for why a real RMCP+ responder was attempted first and found impractical.
+# `run_ipmi_mock.py` (same directory) generates a small, genuinely importable
+# fake `pyghmi` package backed by that double, and reports its directory.
+# Every task below that needs the double points that task's OWN
+# `environment: PYTHONPATH:` at one such generated directory, which was
+# verified directly (not assumed) to make AnsiballZ's module execution import
+# the fake package instead of the real one -- so the module code running is
+# the real, unmodified `plugins/modules/asmb8_*.py`, and only the pyghmi
+# layer beneath it is a double.
+#
+# ABSOLUTE RULE upheld throughout: every host contacted below is 127.0.0.1.
+# Nothing here ever resolves or connects to any real
+# BMC, and the IPMI double never binds a socket at all.
+#
+# What is deliberately NOT covered here
+# ---------------------------------------
+# The iUSB/`.asp` media leg (`asmb8_media`), and the fine-grained assertion
+# that attach/arm_boot/reset/observe/detach run in order with detach surviving
+# a failure at each individual step -- both already covered, thoroughly, by
+# `tests/unit/plugins/modules/test_asmb8_power_lifecycle.py`, which drives the
+# REAL `.asp`/iUSB mock servers together with this same IPMI double in one
+# process. Bringing that same combination through `ansible-test integration`
+# would additionally require `asmb8_media`'s real double-forked background
+# daemon to survive `run_iusb_mock.py`'s own fixed scripted exchange (probe,
+# then an unconditional kill packet -- see that script's own `--script`
+# documentation), which is designed for proving a client survives a short,
+# scripted SCSI conversation, not for holding a session open across several
+# separate module invocations the way a real attach/detach bracketing several
+# IPMI calls would need. `run_iusb_mock.py` is an existing fixture this task
+# does not own and must not modify to fit that shape. The last scenario below
+# still proves the general "detach always runs, even on failure" GUARANTEE --
+# Ansible's own block/rescue/always -- against a real failing module call
+# through this target's double, just not bracketing a real media attach.
+
+- name: Create a scratch directory for this target's scenario artefacts
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: asmb8-lifecycle-test-
+  delegate_to: localhost
+  register: _scenario_tmp_dir
+
+- name: Compute the mock_servers directory (sibling of this target's own directory)
+  ansible.builtin.set_fact:
+    _mock_servers_dir: "{{ (role_path | dirname | dirname) ~ '/mock_servers' }}"
+
+- name: Confirm ipmi_server.py/run_ipmi_mock.py actually exist where expected
+  ansible.builtin.stat:
+    path: "{{ _mock_servers_dir }}/{{ item }}"
+  delegate_to: localhost
+  loop:
+    - ipmi_server.py
+    - run_ipmi_mock.py
+  register: _mock_servers_stat
+
+- name: Assert the mock IPMI fixture is present before relying on it
+  ansible.builtin.assert:
+    that: "{{ _mock_servers_stat.results | map(attribute='stat.exists') | list }}"
+    fail_msg: "tests/integration/mock_servers/ipmi_server.py and/or run_ipmi_mock.py are missing at {{ _mock_servers_dir }}"
+
+# Every asmb8_* module in this collection does `from pyghmi import
+# exceptions`/`from pyghmi.ipmi import command` unconditionally at import
+# time (plugins/module_utils/ipmi.py) -- BEFORE any of this collection's own
+# logic runs, including the persistent=True refusal below. The IPMI double's
+# shim satisfies that import for every scenario that sets PYTHONPATH to one
+# (every scenario below except [unreachable_bmc], which deliberately wants
+# the REAL pyghmi on the wire); scenarios that do NOT point at a shim need
+# the real `pyghmi` package importable by the interpreter that will run
+# these modules. `tests/unit/requirements.txt` already lists `pyghmi>=1.5.0`
+# for exactly this reason on the units side; `tests/integration/
+# requirements.txt` does not currently list it for the integration side (a
+# pre-existing gap this task's own file-ownership rules do not permit fixing
+# from here -- see this file's own end for how [unreachable_bmc] reports
+# that plainly rather than failing confusingly if it is ever missing).
+- name: Check whether the REAL pyghmi is importable by the interpreter that will run these modules
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - import pyghmi
+  delegate_to: localhost
+  register: _real_pyghmi_check
+  failed_when: false
+  changed_when: false
+
+- name: Record whether the real pyghmi dependency is available
+  ansible.builtin.set_fact:
+    _real_pyghmi_available: "{{ _real_pyghmi_check.rc == 0 }}"
+
+# ===========================================================================
+# Scenario 1 -- persistent=true is rejected before any connection is opened.
+# Uses a shim purely so this scenario does not additionally depend on real
+# pyghmi being installed for ansible-test's controller venv (see the note
+# above) -- the double's own faults are irrelevant here, since this must
+# fail before ever calling Command() at all, real or fake.
+# ===========================================================================
+
+- name: "[persistent_rejected] Generate an IPMI double shim for this scenario"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ _mock_servers_dir }}/run_ipmi_mock.py"
+      - --mock-servers-dir
+      - "{{ _mock_servers_dir }}"
+      - --ready-file
+      - "{{ _scenario_tmp_dir.path }}/persistent-rejected-ready.json"
+  delegate_to: localhost
+  changed_when: false
+
+- name: "[persistent_rejected] Read the generated shim's location"
+  ansible.builtin.include_vars:
+    file: "{{ _scenario_tmp_dir.path }}/persistent-rejected-ready.json"
+    name: _persistent_rejected_shim
+
+- name: "[persistent_rejected] Attempt a persistent boot-order change"
+  james_crowley.asmb8_ikvm.asmb8_boot:
+    host: 127.0.0.1
+    username: admin
+    password: not-a-real-password
+    device: hd
+    persistent: true
+  environment:
+    PYTHONPATH: "{{ _persistent_rejected_shim.shim_path }}"
+  delegate_to: localhost
+  no_log: true
+  register: _persistent_result
+  ignore_errors: true
+
+- name: "[persistent_rejected] Assert it failed with unsupported_capability, not a connection attempt"
+  ansible.builtin.assert:
+    that:
+      - _persistent_result is failed
+      - _persistent_result.error_class == 'unsupported_capability'
+    fail_msg: "Expected asmb8_boot persistent=true to be refused up front. Got: {{ _persistent_result }}"
+
+# ===========================================================================
+# Scenario 2 -- a genuinely unreachable BMC (127.0.0.1 with nothing listening
+# on the IPMI port), through the REAL pyghmi, no mock involved. Proves
+# ipmi.py's own connection classification end to end, over a real (refused)
+# UDP round trip. The one scenario in this target that needs real pyghmi
+# installed for the controller -- see the note above this file's Scenario 1.
+# ===========================================================================
+
+- name: "[unreachable_bmc] Contact 127.0.0.1 on a port nothing listens on"
+  james_crowley.asmb8_ikvm.asmb8_power:
+    host: 127.0.0.1
+    ipmi_port: 1 # a privileged, normally-closed port -- never a real BMC's listener
+    username: admin
+    password: not-a-real-password
+    state: "on"
+  delegate_to: localhost
+  no_log: true
+  register: _unreachable_result
+  ignore_errors: true
+  when: _real_pyghmi_available
+
+- name: "[unreachable_bmc] Assert a real, correctly-classified connection failure"
+  ansible.builtin.assert:
+    that:
+      - _unreachable_result is failed
+      # Observed directly against this collection's own dev environment as
+      # 'connection' (pyghmi's session raises with no message at all after
+      # its own internal retries here); a platform whose UDP stack instead
+      # surfaces this as pyghmi's literal "timeout" marker text would
+      # classify as 'timeout' instead -- ipmi.py's own docstring treats
+      # both as the safe, non-indeterminate case, so either is correct here.
+      - _unreachable_result.error_class in ['connection', 'timeout']
+      - not (_unreachable_result.indeterminate | default(false))
+    fail_msg: "Expected a plain connection/timeout failure, never indeterminate. Got: {{ _unreachable_result }}"
+  when: _real_pyghmi_available
+
+- name: "[unreachable_bmc] Report why this scenario did not run"
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPED [unreachable_bmc]: real pyghmi is not importable by
+      {{ ansible_playbook_python }} ({{ _real_pyghmi_check.stderr | default('no stderr captured') }}).
+      This is the one scenario in this target that exercises the real
+      pyghmi wire path rather than this target's own IPMI double, and it
+      genuinely needs the real dependency installed to mean anything.
+      Remedy: add "pyghmi>=1.5.0" to tests/integration/requirements.txt
+      (mirroring tests/unit/requirements.txt's own entry) so ansible-test's
+      controller venv installs it.
+  when: not _real_pyghmi_available
+
+# ===========================================================================
+# Scenario 3 -- authentication failure through the IPMI double, over a real
+# ansible-playbook module invocation.
+# ===========================================================================
+
+- name: "[auth_failure] Generate an IPMI double shim for this scenario"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ _mock_servers_dir }}/run_ipmi_mock.py"
+      - --mock-servers-dir
+      - "{{ _mock_servers_dir }}"
+      - --ready-file
+      - "{{ _scenario_tmp_dir.path }}/auth-failure-ready.json"
+      - --username
+      - admin
+      - --password
+      - correct-password-for-this-scenario
+  delegate_to: localhost
+  changed_when: false
+
+- name: "[auth_failure] Read the generated shim's location"
+  ansible.builtin.include_vars:
+    file: "{{ _scenario_tmp_dir.path }}/auth-failure-ready.json"
+    name: _auth_failure_shim
+
+- name: "[auth_failure] Read facts with the WRONG password"
+  james_crowley.asmb8_ikvm.asmb8_info:
+    host: 127.0.0.1
+    username: admin
+    password: definitely-the-wrong-password
+  environment:
+    PYTHONPATH: "{{ _auth_failure_shim.shim_path }}"
+  delegate_to: localhost
+  no_log: true
+  register: _auth_failure_result
+  ignore_errors: true
+
+- name: "[auth_failure] Assert a real, module-level authentication failure"
+  ansible.builtin.assert:
+    that:
+      - _auth_failure_result is failed
+      - _auth_failure_result.error_class == 'authentication'
+    fail_msg: "Expected asmb8_info to fail with error_class=authentication against the wrong password. Got: {{ _auth_failure_result }}"
+
+# ===========================================================================
+# Scenario 4 -- the happy-path IPMI lifecycle: arm a one-time boot override,
+# issue the boot transition, then observe the override having reverted --
+# each step a SEPARATE ansible-playbook module invocation (a separate OS
+# process under AnsiballZ), proving the double's cross-process persistence
+# genuinely carries state the way a real multi-task lifecycle needs it to.
+# ===========================================================================
+
+- name: "[lifecycle] Generate an IPMI double shim starting powered off"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ _mock_servers_dir }}/run_ipmi_mock.py"
+      - --mock-servers-dir
+      - "{{ _mock_servers_dir }}"
+      - --ready-file
+      - "{{ _scenario_tmp_dir.path }}/lifecycle-ready.json"
+      - --initial-power-state
+      - "off"
+  delegate_to: localhost
+  changed_when: false
+
+- name: "[lifecycle] Read the generated shim's location"
+  ansible.builtin.include_vars:
+    file: "{{ _scenario_tmp_dir.path }}/lifecycle-ready.json"
+    name: _lifecycle_shim
+
+- name: "[lifecycle] Arm a one-time optical boot override"
+  james_crowley.asmb8_ikvm.asmb8_boot:
+    host: 127.0.0.1
+    username: admin
+    password: test-password-not-real
+    device: optical
+  environment:
+    PYTHONPATH: "{{ _lifecycle_shim.shim_path }}"
+  delegate_to: localhost
+  no_log: true
+  register: _lifecycle_boot_result
+
+- name: "[lifecycle] Assert the override was actually armed"
+  ansible.builtin.assert:
+    that:
+      - _lifecycle_boot_result.operation.changed
+      - _lifecycle_boot_result.operation.observed.bootdev == 'optical'
+
+- name: "[lifecycle] Issue the boot transition (off -> on)"
+  james_crowley.asmb8_ikvm.asmb8_power:
+    host: 127.0.0.1
+    username: admin
+    password: test-password-not-real
+    state: boot
+    wait_timeout: 5
+  environment:
+    PYTHONPATH: "{{ _lifecycle_shim.shim_path }}"
+  delegate_to: localhost
+  no_log: true
+  register: _lifecycle_power_result
+
+- name: "[lifecycle] Assert the transition was issued"
+  ansible.builtin.assert:
+    that:
+      - _lifecycle_power_result.changed
+      # state=boot is never in asmb8_power's own _CONFIRMABLE_STATES (see its
+      # DOCUMENTATION: "Always issued... never confirmed by pyghmi's own wait
+      # loop"), so `observed` here is pyghmi's own unconfirmed
+      # `{'pendingpowerstate': ...}` shape, not `{'powerstate': ...}` -- the
+      # very next task's asmb8_info read is what confirms the transition
+      # actually landed.
+      - _lifecycle_power_result.observed.pendingpowerstate == 'on'
+
+- name: "[lifecycle] Observe post-boot facts"
+  james_crowley.asmb8_ikvm.asmb8_info:
+    host: 127.0.0.1
+    username: admin
+    password: test-password-not-real
+  environment:
+    PYTHONPATH: "{{ _lifecycle_shim.shim_path }}"
+  delegate_to: localhost
+  no_log: true
+  register: _lifecycle_observe_result
+
+- name: "[lifecycle] Assert the one-time override reverted, across three separate module processes"
+  ansible.builtin.assert:
+    that:
+      - _lifecycle_observe_result.asmb8.ipmi.power_state.powerstate == 'on'
+      - _lifecycle_observe_result.asmb8.ipmi.boot_device.bootdev == 'default'
+      - not _lifecycle_observe_result.asmb8.ipmi.boot_device.persistent
+    fail_msg: >-
+      Expected the one-time boot override armed above to have reverted to
+      'default' after the boot transition, observed by a THIRD separate
+      module invocation -- this is the cross-process persistence
+      run_ipmi_mock.py's generated shim exists for. Got:
+      {{ _lifecycle_observe_result.asmb8.ipmi }}
+
+# ===========================================================================
+# Scenario 5 -- Ansible's own block/rescue/always guarantee, against a real
+# failing module call through the double. See this file's header comment for
+# why this does not also bracket a real media attach.
+# ===========================================================================
+
+- name: "[detach_always] Generate an IPMI double shim that fails every call"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ _mock_servers_dir }}/run_ipmi_mock.py"
+      - --mock-servers-dir
+      - "{{ _mock_servers_dir }}"
+      - --ready-file
+      - "{{ _scenario_tmp_dir.path }}/detach-always-ready.json"
+      - --force-generic-exception
+      - "simulated mid-lifecycle failure for this integration test"
+  delegate_to: localhost
+  changed_when: false
+
+- name: "[detach_always] Read the generated shim's location"
+  ansible.builtin.include_vars:
+    file: "{{ _scenario_tmp_dir.path }}/detach-always-ready.json"
+    name: _detach_always_shim
+
+- name: "[detach_always] Run a lifecycle-shaped block against the failing shim"
+  environment:
+    PYTHONPATH: "{{ _detach_always_shim.shim_path }}"
+  block:
+    - name: "[detach_always] Arm a one-time boot override (this will fail)"
+      james_crowley.asmb8_ikvm.asmb8_boot:
+        host: 127.0.0.1
+        username: admin
+        password: test-password-not-real
+        device: hd
+      delegate_to: localhost
+      no_log: true
+      register: _detach_always_boot_result
+  rescue:
+    - name: "[detach_always] Record that the rescue path ran"
+      ansible.builtin.set_fact:
+        _detach_always_rescue_ran: true
+  always:
+    - name: "[detach_always] Always-detach surrogate -- must run whether or not the block above failed"
+      ansible.builtin.set_fact:
+        _detach_always_ran: true
+
+- name: "[detach_always] Assert the block failed and both rescue and always still ran"
+  ansible.builtin.assert:
+    that:
+      - _detach_always_rescue_ran | default(false)
+      - _detach_always_ran | default(false)
+    fail_msg: >-
+      Expected the deliberately-failing boot-arm call to trigger rescue, and
+      the always block (this lifecycle's detach-equivalent) to run
+      regardless -- the same guarantee
+      roles/asmb8_baremetal_install/tasks/main.yml's own block/rescue/always
+      relies on for "always detach, even on failure".
+
+- name: State plainly what remains untested by this target
+  ansible.builtin.debug:
+    msg: >-
+      NOT COVERED by this integration target: a real asmb8_media attach/detach
+      bracketing the IPMI calls above (see this file's header comment for why
+      run_iusb_mock.py's fixed scripted-kill exchange is not a fit for that
+      without modifying a fixture this task does not own), and the
+      fine-grained per-step ordering/detach-on-failure assertions for each
+      individual lifecycle phase. Both are covered, thoroughly, by
+      tests/unit/plugins/modules/test_asmb8_power_lifecycle.py, which drives
+      the real .asp/iUSB mock servers together with this same IPMI double in
+      one process.

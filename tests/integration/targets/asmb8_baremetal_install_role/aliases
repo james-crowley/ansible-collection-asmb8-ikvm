@@ -1,0 +1,22 @@
+# Exercises roles/asmb8_baremetal_install's own logic -- the fan-out guard,
+# destructive-confirmation gate, required-variable checks, the forward-looking
+# disk-safety guard, and the resumability guard -- entirely on localhost, with
+# no network access beyond 127.0.0.1 and no privilege escalation. See
+# tasks/main.yml's header comment for exactly what is and is not covered here,
+# and why: this role's validate.yml/state.yml phases are pure Ansible logic
+# (assert/stat/file/include_vars) that never touch the BMC at all, so they can
+# be tested today without any mock server. Its probe/attach_media/arm_boot/
+# reset/observe phases talk real IPMI (asmb8_info/asmb8_power/asmb8_boot) and
+# real iUSB (asmb8_media), and NEITHER of those has a mock server in this
+# collection yet that this target can drive -- tests/integration/mock_servers/
+# currently has asp_server.py/iusb_server.py (the iUSB/.asp media plane) but
+# nothing at all for the IPMI/RMCP+ plane this role's probe/arm_boot/reset/
+# observe depend on. tasks/main.yml's final scenario documents that gap loudly
+# rather than silently passing over it.
+#
+# context/controller because every task this role runs is `delegate_to:
+# localhost` (see roles/asmb8_baremetal_install/meta/main.yml), and the nested
+# ansible-playbook runs this target drives need the controller's
+# ansible-playbook and collection path.
+context/controller
+skip/windows
