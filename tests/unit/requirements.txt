@@ -1,0 +1,16 @@
+# Unit test dependencies, installed by ansible-test units and by CI.
+#
+# Floors, not pins: ansible-test resolves these inside its own per-python venv
+# across the whole units matrix (py3.10 through py3.13), and exact pins would
+# make that matrix unsatisfiable. The exact-pin discipline applies to
+# requirements-dev.txt, where linter output must be byte-reproducible.
+requests>=2.25.0
+pytest>=7.0.0
+pytest-mock>=3.10.0
+# module_utils/ipmi.py (asmb8_power/asmb8_boot/asmb8_info) wraps this directly
+# rather than shelling out to community.general.ipmi_power/ipmi_boot -- see
+# that module's docstring. tests/unit/plugins/module_utils/test_ipmi.py mocks
+# pyghmi's Command class rather than ever opening a real IPMI session, but it
+# still needs the real pyghmi.exceptions types to construct realistic
+# failures, so the dependency is real here too, not just at runtime.
+pyghmi>=1.5.0
