@@ -567,6 +567,41 @@ class TestSocketTransport:
         sock.recv.side_effect = recv_side_effect
         return iusb.SocketTransport(sock)
 
+    def test_nagle_is_disabled_on_the_transport_socket(self):
+        """TCP_NODELAY must be set. This is a performance regression guard.
+
+        iUSB is strictly synchronous request/response, which is the traffic shape
+        Nagle's algorithm handles worst. Each reply is written in one sendall, so
+        most of it leaves as full-MSS segments -- but the final partial segment is
+        exactly what Nagle withholds, waiting for either more data (which cannot
+        come, since we are now blocked reading the next request) or the peer's
+        ACK, which the peer delays.
+
+        Measured on real hardware with Nagle left enabled: 16,451 reads in 1800
+        seconds -- 9.1 reads/second, ~109 ms each -- against a BMC answering ICMP
+        in ~5 ms. A full OS install needs roughly 23,000 reads, so that overhead
+        alone turned a few minutes of work into roughly forty.
+
+        Python does not set this for you; socket.create_connection leaves Nagle
+        on. Hence a test rather than trusting the call site to stay correct.
+        """
+        sock = Mock(spec=socket.socket)
+        iusb.SocketTransport(sock)
+        sock.setsockopt.assert_called_once_with(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def test_a_socket_that_refuses_tcp_nodelay_degrades_to_slow_not_broken(self):
+        """Setting the option must never be fatal.
+
+        Some socket families cannot take TCP_NODELAY at all -- an AF_UNIX
+        socketpair, which this suite's own end-to-end tests use, raises OSError.
+        Failing to disable Nagle costs throughput; refusing to construct the
+        transport would cost the feature entirely. Suppress, do not raise.
+        """
+        sock = Mock(spec=socket.socket)
+        sock.setsockopt.side_effect = OSError("Protocol not available")
+        transport = iusb.SocketTransport(sock)  # must not raise
+        assert transport is not None
+
     def test_timeout_with_zero_bytes_read_is_idle_not_an_error(self):
         def _raise(_n):
             raise TimeoutError

@@ -928,6 +928,41 @@ class SocketTransport:
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
+        self._disable_nagle(sock)
+
+    @staticmethod
+    def _disable_nagle(sock: socket.socket) -> None:
+        """Set ``TCP_NODELAY``.
+
+        iUSB is strictly synchronous request/response: the BMC asks for one SCSI
+        command's worth of data and waits for the reply before asking again.
+        Nagle's algorithm is precisely wrong for that shape of traffic. Each
+        response is built and written in a single ``sendall``, so most of it goes
+        out as full-MSS segments -- but the final *partial* segment is exactly
+        what Nagle holds back, waiting either for more data (which will never
+        come, because we are now blocked reading the next request) or for the
+        peer's ACK. The peer meanwhile uses delayed ACK and may wait tens of
+        milliseconds before sending one. The two algorithms stall each other once
+        per response.
+
+        Measured on real hardware before this was set: 16,451 reads took 1800
+        seconds, i.e. 9.1 reads/second or ~109 ms per read, against a BMC that
+        answers ICMP in ~5 ms. Roughly 99 ms of every read was dead waiting. A
+        full OS install needs on the order of 23,000 reads, so that overhead
+        alone accounted for ~40 minutes of a ~4 minute job.
+
+        Python does not set this by default: ``socket.create_connection`` leaves
+        Nagle enabled. Failure to set it is not fatal -- some platforms or
+        wrapped sockets may refuse the option -- so this degrades to slow rather
+        than broken, and deliberately does not raise.
+
+        Note this is a latency fix, not necessarily THE latency fix: the BMC's
+        own USB-to-TCP relay turnaround is an independent candidate for part of
+        that ~99 ms, and setting this option cannot improve that half. See
+        ``docs/hardware-evidence-2026-08-08.md``.
+        """
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     @classmethod
     def connect(cls, host: str, port: int, timeout: float = DEFAULT_DIAL_TIMEOUT) -> SocketTransport:
