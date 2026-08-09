@@ -275,6 +275,60 @@ class TestCDROMDeviceGolden:
         req = _packet_from_payload_hex(CD_READ_TOC_REQ_HEX)
         assert device.handle(req) == bytes.fromhex(CD_READ_TOC_RESP_HEX)
 
+    def test_read_toc_honours_the_cdb_allocation_length(self):
+        """READ TOC must never return more data than the CDB's allocation length.
+
+        Regression test for a bug observed against real hardware on 2026-08-09. A
+        Linux initrd probing this emulated drive issued READ TOC with an
+        allocation length of 12 (CDB[7:9] == 0x000c). The implementation ignored
+        the CDB entirely and returned its full 20-byte response. Over-running the
+        allocation length is a SCSI protocol violation, and the host's response
+        was to conclude the disc held no valid medium -- surfacing as an installer
+        reporting "no device with valid ISO found" and dropping to a debug shell.
+
+        The golden vector above cannot catch this: its allocation length is 0,
+        which correctly means "no limit stated" and returns everything. So the
+        real-world path had no coverage at all until this test.
+
+        Note a bootloader never issues READ TOC, which is why firmware-stage
+        booting worked perfectly with the bug present and only a real OS tripped
+        over it.
+        """
+        device = _device()
+
+        def toc_request(alloc: int) -> iusb.Packet:
+            payload = bytearray(29)
+            payload[8] = 0x01  # envelope marker
+            cdb = bytearray(10)
+            cdb[0] = iusb.SCSI_READ_TOC
+            cdb[7:9] = alloc.to_bytes(2, "big")
+            payload[9 : 9 + len(cdb)] = cdb
+            return _packet_from_payload_hex(bytes(payload).hex())
+
+        # The untruncated response is 20 bytes: a 4-byte header plus two 8-byte
+        # track descriptors. Establish that first so the assertions below are
+        # anchored to the implementation rather than a magic number.
+        full = device.handle(toc_request(0))
+        full_data_len = len(full) - 29
+        assert full_data_len == 20
+
+        # The exact allocation length the real host asked for.
+        twelve = device.handle(toc_request(12))
+        assert len(twelve) - 29 == 12, "must truncate to the allocation length"
+
+        # Truncation must not corrupt the header: the two-byte TOC data-length
+        # field still reports the FULL available length, so an initiator that
+        # under-allocated can tell and retry with a bigger buffer.
+        assert twelve[29:31] == full[29:31]
+        assert int.from_bytes(twelve[29:31], "big") == full_data_len - 2
+
+        # An allocation length at or above the real length changes nothing.
+        for alloc in (20, 64):
+            assert len(device.handle(toc_request(alloc))) - 29 == full_data_len
+
+        # A tiny allocation must still be respected rather than rounded up.
+        assert len(device.handle(toc_request(4))) - 29 == 4
+
     def test_start_stop_unit_eject_golden(self):
         device = _device()
         req = _packet_from_payload_hex(CD_START_STOP_EJECT_REQ_HEX)

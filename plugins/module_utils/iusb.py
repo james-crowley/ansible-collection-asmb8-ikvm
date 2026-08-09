@@ -727,9 +727,37 @@ class CDROMDevice:
         return self.last_lba.to_bytes(4, "big") + CD_BLOCK_SIZE.to_bytes(4, "big")
 
     def _read_toc(self, cdb: bytes) -> bytes:
-        """Minimal single-data-track TOC (formatted, MSF=0). ``cdb`` is unused
-        for now (this does not yet branch on the CDB's format field) but kept
-        for future MSF-format handling.
+        """Minimal single-data-track TOC (formatted, MSF=0), truncated to the
+        CDB's allocation length.
+
+        Honouring the allocation length is not optional politeness -- it is what
+        SCSI requires, and getting it wrong here was observed to break a real
+        installer on real hardware in a way that looked like something else
+        entirely.
+
+        Observed 2026-08-09: a Linux initrd probing this emulated drive issued
+        TEST UNIT READY followed by READ TOC with an allocation length of 12
+        bytes (CDB[7:9] == 0x000c). This method previously ignored the CDB
+        completely and always returned the full 20-byte response -- a 4-byte
+        header plus two 8-byte track descriptors. Returning more data than the
+        initiator budgeted for is a protocol violation, and the consequence was
+        that the host mis-parsed the TOC and concluded the disc contained no
+        valid medium. The installer then reported "no device with valid ISO
+        found" and dropped to a debug shell.
+
+        That symptom is badly misleading. It is indistinguishable from a missing
+        USB-storage driver, a wrong answer file, or unbootable media, and it was
+        misdiagnosed as each of those in turn. The tell is in the opcode trace:
+        the host DID probe the device, and it never sent REQUEST SENSE -- so it
+        was not reporting an error, it simply believed what our malformed TOC
+        told it. Note also that a bootloader never asks for a TOC at all, so
+        firmware-stage booting works perfectly with this bug present; only a
+        real OS trips over it.
+
+        Per SCSI: the two-byte TOC data-length field still reports the FULL
+        available length (total minus its own two bytes) even when the returned
+        data is truncated, so the initiator can tell it under-allocated and
+        retry with a larger buffer.
         """
 
         def track(no: int, lba: int) -> bytes:
@@ -745,6 +773,13 @@ class CDROMDevice:
         out[2] = 1  # first track
         out[3] = 1  # last track
         out[4:] = body
+
+        # CDB[7:9] is the big-endian allocation length. A short CDB or a zero
+        # allocation length means "no limit stated"; return everything rather
+        # than nothing, since returning nothing would look like an empty TOC.
+        alloc = int.from_bytes(cdb[7:9], "big") if len(cdb) >= 9 else 0
+        if alloc and alloc < len(out):
+            return bytes(out[:alloc])
         return bytes(out)
 
 
