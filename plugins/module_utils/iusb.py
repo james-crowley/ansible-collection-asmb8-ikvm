@@ -430,10 +430,10 @@ class Reader(Protocol):
     """
 
     def read_at(self, n: int, offset: int) -> bytes:
-        ...
+        raise NotImplementedError
 
     def size(self) -> int:
-        ...
+        raise NotImplementedError
 
 
 class FileReader:
@@ -791,7 +791,7 @@ class Handler(Protocol):
     """
 
     def handle(self, req: Packet) -> bytes | None:
-        ...
+        raise NotImplementedError
 
 
 def process_frame(handler: Handler, frame: bytes, device_type: int = DEVICE_CDROM) -> bytes | None:
@@ -869,16 +869,16 @@ class Transport(Protocol):
     """
 
     def recv_exact(self, n: int) -> bytes:
-        ...
+        raise NotImplementedError
 
     def send_all(self, data: bytes) -> None:
-        ...
+        raise NotImplementedError
 
     def set_timeout(self, seconds: float | None) -> None:
-        ...
+        raise NotImplementedError
 
     def close(self) -> None:
-        ...
+        raise NotImplementedError
 
 
 class SocketTransport:

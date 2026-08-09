@@ -527,16 +527,16 @@ class Transport(Protocol):
     """The minimum a byte-stream carrier must support to drive this module's handshake/read loop."""
 
     def recv_exact(self, n: int) -> bytes:
-        ...
+        raise NotImplementedError
 
     def send_all(self, data: bytes) -> None:
-        ...
+        raise NotImplementedError
 
     def set_timeout(self, seconds: float | None) -> None:
-        ...
+        raise NotImplementedError
 
     def close(self) -> None:
-        ...
+        raise NotImplementedError
 
 
 class SocketTransport:
