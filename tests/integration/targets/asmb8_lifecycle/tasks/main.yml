@@ -57,9 +57,57 @@
   delegate_to: localhost
   register: _scenario_tmp_dir
 
-- name: Compute the mock_servers directory (sibling of this target's own directory)
+# `ansible-test integration` stages this target's OWN directory into a
+# per-target scratch tree under tests/output/.tmp/integration/
+# <target>-<random>-<unicode>/, but does NOT copy tests/integration/
+# mock_servers/ into that tree -- so the naive sibling-of-role_path guess
+# below only resolves when this target happens to run some other way (e.g. a
+# bare `ansible-playbook` invocation straight out of a checkout, not through
+# `ansible-test`).
+#
+# ANSIBLE_TEST_CONTENT_ROOT is NOT a fix here: it is only ever set in the
+# environment of ansible-test's own delegation re-exec (see
+# ansible_test._internal.delegation.generate_command), never in the
+# environment of the `ansible-playbook` child process ansible-test spawns to
+# actually run this target (ansible_test._internal.ansible_util.
+# ansible_environment() builds that process's environment from scratch and
+# never copies this var in) -- confirmed directly against a real
+# `ansible-test integration --venv` run, which showed `lookup('env',
+# 'ANSIBLE_TEST_CONTENT_ROOT')` as empty from inside this exact task.
+#
+# ANSIBLE_COLLECTIONS_PATH, in contrast, IS set on that ansible-playbook
+# process whenever the tested content is a collection (same source file,
+# ansible_environment(): `if data_context().content.collection: env.update(
+# ANSIBLE_COLLECTIONS_PATH=data_context().content.collection.root)`) -- and
+# collection.root is the directory that CONTAINS `ansible_collections/`, not
+# the collection directory itself. This was likewise confirmed directly: a
+# debug task placed right here printed the real, unstaged build root that
+# `tests/integration/mock_servers/` lives under. Joining that with
+# `ansible_collections/james_crowley/asmb8_ikvm/tests/integration/
+# mock_servers` (this collection's own well-known namespace/name -- the
+# magic `ansible_collection_name` var was observed empty in this plain
+# playbook task context, so it is not a usable substitute) gives the real
+# location. `first_found` (skip=True, so a total miss returns '' rather than
+# erroring) picks whichever candidate actually has ipmi_server.py in it, so
+# this keeps working both under ansible-test and run directly from a
+# checkout; if neither candidate has it, fall back to the last candidate
+# purely so the assertion below still names a sensible path in its failure
+# message.
+- name: Compute candidate mock_servers directories (collection content root first, sibling fallback)
   ansible.builtin.set_fact:
-    _mock_servers_dir: "{{ (role_path | dirname | dirname) ~ '/mock_servers' }}"
+    _mock_servers_dir_candidates: >-
+      {{
+        ([lookup('env', 'ANSIBLE_COLLECTIONS_PATH').split(':')[0]
+          ~ '/ansible_collections/james_crowley/asmb8_ikvm/tests/integration/mock_servers']
+         if lookup('env', 'ANSIBLE_COLLECTIONS_PATH') else [])
+        + [(role_path | dirname | dirname) ~ '/mock_servers']
+      }}
+
+- name: Pick the first candidate mock_servers directory that actually contains ipmi_server.py
+  ansible.builtin.set_fact:
+    _mock_servers_dir: "{{ (_found_ipmi_server_py | dirname) if _found_ipmi_server_py else _mock_servers_dir_candidates[-1] }}"
+  vars:
+    _found_ipmi_server_py: "{{ lookup('first_found', dict(files=['ipmi_server.py'], paths=_mock_servers_dir_candidates, skip=True)) }}"
 
 - name: Confirm ipmi_server.py/run_ipmi_mock.py actually exist where expected
   ansible.builtin.stat:

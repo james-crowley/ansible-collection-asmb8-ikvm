@@ -31,7 +31,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+: tomllib is stdlib from here on.
+except ModuleNotFoundError:  # Python 3.10 (still in this collection's units matrix): no stdlib tomllib yet.
+    import tomli as tomllib  # Same read-only API surface as tomllib; test-only backport, see tests/unit/requirements.txt.
 import yaml
 from jinja2 import Environment, StrictUndefined
 

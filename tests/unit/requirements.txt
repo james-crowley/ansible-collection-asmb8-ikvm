@@ -14,3 +14,12 @@ pytest-mock>=3.10.0
 # still needs the real pyghmi.exceptions types to construct realistic
 # failures, so the dependency is real here too, not just at runtime.
 pyghmi>=1.5.0
+# tomllib entered the standard library in Python 3.11. tests/unit/roles/
+# test_autoinstall_answer_template.py parses rendered TOML to prove
+# roles/asmb8_autoinstall_iso's answer.toml.j2 output is valid, and needs a
+# tomllib-compatible reader on Python 3.10 (still in this collection's units
+# matrix) where the stdlib module does not exist yet. This is a stdlib
+# backport for that one test file, not a new runtime dependency -- the
+# collection itself never imports TOML at runtime. The marker keeps it out of
+# the 3.11+ venvs entirely, where the stdlib module already covers it.
+tomli>=2.0.0; python_version < "3.11"
