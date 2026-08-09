@@ -1,0 +1,57 @@
+# Tooling configuration only. This collection is distributed via
+# ansible-galaxy, not as a Python package, so there is no [project] table.
+
+[tool.ruff]
+line-length = 160
+target-version = "py310"
+extend-exclude = ["dist", "tests/output", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "C4",   # flake8-comprehensions
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit
+]
+ignore = [
+    # Ansible modules legitimately use broad excepts to convert any failure into
+    # a classified module failure via fail_json.
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Ansible module convention requires DOCUMENTATION/EXAMPLES/RETURN string
+# literals at the top of the file, before any import -- ansible-doc and the
+# sanity toolchain both depend on that ordering, so the imports that follow
+# are legitimately not at the top of the file.
+"plugins/modules/*.py" = ["E402"]
+# Tests use asserts and construct fixture data freely. S603
+# (subprocess-without-shell-equals-true) is ignored for tests that deliberately
+# spawn a helper process (e.g. a mock iUSB/virtual-media server) with a literal,
+# fully-controlled argv and no shell -- the case S603 exists to distinguish
+# from. RUF012: class-level constant dicts are the normal way to hold a
+# fixture shared by every method in a test class. RUF012 exists to catch a
+# mutable default on a dataclass field, where the instance would silently
+# share it; a test class that never mutates its own constants is not that
+# hazard.
+#
+# TODO: this per-file-ignore list is carried over from the sibling
+# james_crowley.intel_amt collection as a sensible starting point. It has not
+# yet been verified against this collection's own test suite (which does not
+# exist yet) or against the pinned ruff version below -- revisit once
+# tests/unit has real content, the way requirements-dev.txt's comment
+# describes for intel_amt's S603 finding being ruff-version-sensitive.
+"tests/**" = ["S101", "S105", "S106", "S311", "S603", "RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ansible_collections"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"

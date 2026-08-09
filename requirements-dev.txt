@@ -1,0 +1,30 @@
+# Development and CI tooling. Once CI exists, it should install from THIS file
+# so that a contributor running `pip install -r requirements-dev.txt` is
+# running exactly the linter versions that will judge the pull request.
+#
+# Pinned exactly, on purpose. Unpinned linters make the outcome of a lint run a
+# function of when it happened: a new ruff release adding or widening a rule
+# turns main red with no code change, and a contributor whose cache happens to
+# hold an older release sees a green local run and a red CI run (or worse, the
+# reverse). The sibling james_crowley.intel_amt collection measured exactly
+# this: ruff 0.15.5 reported findings in its unit tests that 0.16.0 did not.
+#
+# Bumping these is a deliberate act: change the pin, run the full local
+# verification sequence in CONTRIBUTING.md, and fix (or justify) whatever the
+# new version finds -- in the same pull request.
+#
+# Versions below are copied from james_crowley.intel_amt's current pins as a
+# starting point, not independently re-validated against this repository yet
+# (there are no plugins or tests here to lint against).
+#
+# Runtime and test-run dependencies live elsewhere and are NOT duplicated here:
+#   requirements.txt                    -- controller runtime (requests)
+#   tests/unit/requirements.txt         -- what ansible-test units installs, once it exists
+#   tests/integration/requirements.txt  -- what ansible-test integration installs, once it exists
+
+ansible-lint==26.6.0
+antsibull-changelog==0.35.1
+pytest==9.1.1
+pytest-mock==3.15.1
+ruff==0.16.0
+yamllint==1.38.0

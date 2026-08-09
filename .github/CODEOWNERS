@@ -1,0 +1,18 @@
+# Default owner for everything.
+*                                       @james-crowley
+
+# Wire-protocol and security-sensitive areas, re-listed explicitly even though
+# the default owner above already covers them. This board's iUSB virtual-media
+# protocol is proprietary and undocumented -- it is being reverse engineered,
+# not implemented from a spec -- so a plausible-looking change here is exactly
+# the kind of thing that turns out wrong against real firmware. See
+# docs/protocol-notes.md once it exists.
+/docs/protocol-notes.md                @james-crowley
+/plugins/module_utils/                 @james-crowley
+/SECURITY.md                           @james-crowley
+
+# Anything that can power-cycle, reboot, force a boot device, or reimage real
+# hardware.
+/.circleci/config.yml                  @james-crowley
+/tests/hardware/                       @james-crowley
+/roles/asmb8_baremetal_install/        @james-crowley

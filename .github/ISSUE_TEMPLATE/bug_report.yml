@@ -1,0 +1,122 @@
+---
+name: Bug report
+description: Something in this collection behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Please do not report security problems here — see
+        [SECURITY.md](../blob/main/SECURITY.md) for the private channel. BMC
+        credentials are equivalent to physical access to a machine, so also
+        double-check that nothing you paste below contains a password, an IPMI
+        session key, or an HTTP `Authorization` header.
+
+        This collection is pre-1.0 and nothing is hardware-qualified yet (see
+        README.md "Project status"), so a report against real ASMB8 hardware
+        is exactly the kind of evidence that moves it forward.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: input
+    id: error_class
+    attributes:
+      label: error_class
+      description: >-
+        If the module failed, the `error_class` it reported. This is normally
+        the single most useful field in a bug report, because it says which
+        layer failed.
+        TODO: this collection's plugins/module_utils/errors.py does not exist
+        yet, so this exact taxonomy is a placeholder carried over from the
+        sibling james_crowley.intel_amt collection: connection,
+        authentication, unsupported_capability, invalid_state, timeout,
+        protocol, remote_operation, identity_mismatch. Report whatever string
+        the module actually printed if it differs from this list.
+      placeholder: protocol
+    validations:
+      required: false
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Which module or role
+      multiple: true
+      options:
+        - asmb8_info
+        - asmb8_power
+        - asmb8_boot
+        - asmb8_media
+        - asmb8_redirection
+        - asmb8_baremetal_install (role)
+        - other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: firmware_version
+    attributes:
+      label: ASMB8 / MegaRAC firmware version
+      description: >-
+        From the BMC web UI or `asmb8_info` once it exists. Behaviour can
+        differ across firmware builds, so a report without this is often not
+        actionable. This collection currently targets exactly one firmware
+        version: main 1.14, aux 1.14.2. A report against a different version is
+        still useful, but note the mismatch.
+      placeholder: "1.14 (aux 1.14.2)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      description: >-
+        This board is normally run in plaintext, single-port mode rather than
+        with TLS on a separate port -- select whichever plane the bug actually
+        involves.
+      options:
+        - "IPMI (ipmitool lanplus) -- asmb8_power / asmb8_boot"
+        - "iUSB / BMC web management port, plaintext single-port mode"
+        - "iUSB / BMC web management port, HTTPS (if you have enabled it)"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: ansible-core and Python version on the controller
+      description: >-
+        Output of `ansible --version`. These modules are intended to run
+        controller-side, so the controller's Python is what matters, not the
+        BMC's.
+      placeholder: "ansible-core 2.17.14, Python 3.10.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Playbook or task that reproduces it
+      description: Redact credentials. Keep it as small as you can.
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: >-
+        Run with `-vvv` if you can. Note that `no_log: true` will censor the
+        result -- if so, whatever redacted fields the module does report are
+        what to capture instead.
+      render: shell
+    validations:
+      required: false

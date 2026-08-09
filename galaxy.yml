@@ -1,0 +1,83 @@
+---
+namespace: james_crowley
+name: asmb8_ikvm
+version: 0.1.0
+readme: README.md
+
+authors:
+  - Jim Crowley (https://github.com/james-crowley)
+
+description: >-
+  Out-of-band management of ASUS ASMB8-iKVM BMCs (AMI MegaRAC firmware on an
+  ASPEED AST2400) from Ansible: power control and one-time boot selection
+  wrapping the IPMI path, plus native streaming of a local ISO to the BMC's
+  virtual CD-ROM over AMI's proprietary iUSB protocol, for unattended
+  bare-metal operating system installs with no PXE/DHCP/TFTP/NFS/CIFS
+  infrastructure required.
+
+# Pre-1.0 and honest about it: unlike the sibling james_crowley.intel_amt
+# collection (1.0.0, hardware-qualified), nothing here has been proven against
+# real ASMB8 hardware yet, and the virtual-media path is under active reverse
+# engineering. See README.md "Project status" for exactly what is and is not
+# verified.
+license:
+  - GPL-3.0-or-later
+
+tags:
+  - asus
+  - asmb8
+  - ikvm
+  - ami
+  - megarac
+  - ipmi
+  - iusb
+  - outofband
+  - baremetal
+  - provisioning
+  - system
+  - tools
+
+dependencies: {}
+
+repository: https://github.com/james-crowley/ansible-collection-asmb8-ikvm
+documentation: https://github.com/james-crowley/ansible-collection-asmb8-ikvm/tree/main/docs
+homepage: https://github.com/james-crowley/ansible-collection-asmb8-ikvm
+issues: https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues
+
+# What is deliberately NOT ignored: CODE_OF_CONDUCT.md and SECURITY.md ship with
+# the collection, the way community.general and community.docker ship theirs. A
+# consumer who has only ever run `ansible-galaxy collection install` should still
+# be able to find the vulnerability-reporting policy without first locating the
+# source repository -- the whole point of SECURITY.md is to be reachable at the
+# moment someone needs it.
+build_ignore:
+  - .circleci
+  - .github
+  # Repository tooling and maintainer-only material, not collection content.
+  # Shipping these to Galaxy would put files a consumer can neither use nor act
+  # on into every install.
+  - renovate.json
+  - .gitignore
+  - .yamllint
+  - .ansible-lint
+  - .ruff_cache
+  - .pytest_cache
+  - pyproject.toml
+  - requirements-dev.txt
+  - scripts
+  # Release-process instructions for this repository's maintainer, once
+  # written (Galaxy API key, tagging, context setup). Meaningless to a
+  # consumer.
+  - docs/maintainer-setup.md
+  # antsibull-changelog working state. CHANGELOG.md/CHANGELOG.rst are the
+  # rendered artefacts consumers want; the generated plugin cache and the
+  # unreleased fragments that feed the next render are not.
+  - changelogs/.plugin-cache.yaml
+  - changelogs/fragments
+  - dist
+  - .venv
+  - '*.tar.gz'
+  - tests/hardware
+  - tests/output
+  - __pycache__
+  - '*.pyc'

@@ -1,0 +1,37 @@
+# Runtime dependencies for the controller host.
+#
+# These modules execute on the Ansible controller (delegate_to: localhost), not
+# on the managed node. An ASMB8 BMC is out-of-band firmware; it cannot run a
+# Python payload. Install these wherever the playbook runs.
+
+# The .asp RPC surface (login, session token, JNLP retrieval) is ordinary HTTP,
+# so plugins/module_utils/asp.py is built on requests. Note that asp.py also
+# ships a custom TLS adapter: this BMC's listener offers TLS 1.2 only with the
+# single ciphersuite AES256-GCM-SHA384, which is static-RSA key exchange and is
+# therefore excluded from modern OpenSSL's default cipher list. That needs
+# urllib3's create_urllib3_context, which requests already depends on -- no
+# additional dependency, but it is why the floor is not lower.
+requests>=2.25.0
+
+# IPMI, used by asmb8_power / asmb8_boot / asmb8_info.
+#
+# Why pyghmi directly rather than community.general.ipmi_power / ipmi_boot:
+# those modules are themselves thin wrappers over pyghmi, so depending on them
+# would mean taking a whole-collection dependency on community.general in order
+# to reach a library we would end up importing anyway. It would also fragment
+# this collection's own conventions -- community.general's modules do not
+# return our OperationReceipt, do not use our ErrorClass taxonomy, and do not
+# share the connection doc fragment, so wrapping them would make asmb8_power
+# behave visibly differently from every other module here.
+#
+# Verified against the target hardware: pyghmi establishes an IPMI 2.0 session
+# with this BMC over UDP 623 using the default cipher suite, and get_power() /
+# get_bootdev() / set_bootdev(persist=False) all behave correctly. One quirk
+# worth knowing: get_mci() returns a string, not a mapping.
+pyghmi>=1.5.0
+
+# NOTE: the iUSB virtual-media transport (plugins/module_utils, asmb8_media)
+# deliberately adds NO dependency. It is a raw TCP socket protocol implemented
+# against the standard library only -- see docs/protocol-notes.md. Keeping it
+# dependency-free matters because asmb8_media forks a long-lived daemon that
+# must survive independently of the Ansible run that started it.

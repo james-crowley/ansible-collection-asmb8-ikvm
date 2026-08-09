@@ -1,0 +1,63 @@
+---
+name: Feature request
+description: Propose new functionality or a new module
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: >-
+        The operational problem, not the proposed API. It is often possible to
+        solve it with what already exists, and if not, knowing the goal shapes a
+        better interface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like this collection to do
+    validations:
+      required: true
+
+  - type: dropdown
+    id: plane
+    attributes:
+      label: Which capability does this need
+      description: >-
+        This collection deliberately does not reinvent power/boot control --
+        `asmb8_power` and `asmb8_boot` are intended to wrap the already-working
+        `community.general.ipmi_power` / `ipmi_boot` modules. The genuinely new
+        work is the iUSB virtual-media path, which is far more involved because
+        it is a proprietary, undocumented protocol being reverse engineered.
+      options:
+        - "IPMI-backed (power, boot device) -- wraps community.general"
+        - "iUSB virtual media (proprietary AMI protocol, streams an ISO to the virtual CD-ROM)"
+        - "Both"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Protocol evidence, if you have any
+      description: >-
+        A packet capture, a firmware response, or a reference implementation
+        (e.g. `BadCoder1337/rd450x-console`, a Go client for a similar AMI
+        MegaRAC iUSB implementation). This collection tries hard not to guess
+        at wire formats for a protocol with no public specification, so
+        evidence moves a request along considerably.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hardware
+    attributes:
+      label: Hardware access
+      options:
+        - label: >-
+            I have an ASUS ASMB8-iKVM board I can test against, and can report
+            its firmware version
+          required: false

@@ -1,0 +1,44 @@
+---
+# ansible-lint configuration.
+#
+# `production` from the start, unlike leaving the default profile and
+# tightening it later: this collection is pre-1.0 and has no existing content
+# whose style would need retrofitting, so there is no cost to starting at the
+# strictest profile and only relaxing a rule when a genuine, justified
+# conflict shows up -- rather than discovering the gap once a laxer profile
+# has already let something through.
+
+profile: production
+
+exclude_paths:
+  # Generated or vendored, not authored Ansible content.
+  - .git/
+  - .circleci/
+  - dist/
+  - tests/output/
+  - .venv/
+  - licenses/
+  # Changelog fragments are antsibull-changelog's format, not Ansible content.
+  # Its convention is one long single line per entry, ending in a PR/issue URL,
+  # which unavoidably exceeds any sane line-length limit. `antsibull-changelog
+  # lint` is the correct validator for these and runs separately; ansible-lint
+  # scanning them only produces noise about a rule they cannot satisfy.
+  - changelogs/
+
+# Keep this list short and justified. Every entry is a rule we are choosing not
+# to enforce, so each one needs a reason that survives review.
+skip_list:
+  # Our own .yamllint sets line-length to 160 as a warning, deliberately: module
+  # DOCUMENTATION blocks and long resource identifiers do not usefully wrap.
+  # yamllint still runs as its own CI step and is the authority on YAML style
+  # here.
+  - yaml[line-length]
+
+# Rules that must never be skipped, even if a future profile change would
+# otherwise relax them. yaml[truthy] is listed because in YAML, bare
+# on/off/yes/no become booleans, so an unquoted option value in a documented
+# example (e.g. `state: on`) can silently become the wrong type for anyone
+# copying it -- exactly the class of bug this collection's sibling,
+# james_crowley.intel_amt, caught with this rule enabled.
+enable_list:
+  - yaml[truthy]
