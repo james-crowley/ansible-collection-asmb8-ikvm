@@ -6,12 +6,29 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # Ansible Collection: `james_crowley.asmb8_ikvm`
 
-Out-of-band management of **ASUS ASMB8-iKVM** BMCs (AMI MegaRAC firmware on an
-ASPEED AST2400) from Ansible: power control and one-time boot selection
-wrapping IPMI, plus **streaming a local ISO straight from the Ansible
-controller to the BMC's virtual CD-ROM** over AMI's proprietary iUSB protocol
-— so a bare-metal host can boot from it with **no PXE, DHCP, TFTP, NFS, or
-CIFS infrastructure required.**
+<!-- Badges must stay on ONE line. GitHub renders the soft line break between two
+     badge links as a <br>, which stacks them vertically instead of forming a row.
+     The Galaxy badge reads the v3 published-collection index, not the v2 API:
+     v2 no longer returns JSON for this path, so shields.io would render "resource
+     not found" against it. Verified against the actual published collection.
+
+     The CircleCI badge is STATIC, matching the sibling james_crowley.intel_amt
+     collection, and for the same reason: a live dl.circleci.com badge 404s for
+     anonymous visitors unless the project's "Free and Open Source" flag is on, and
+     that flag makes build logs AND artifacts world-readable. This project's own
+     hardware-evidence redaction (tests/hardware/redact-evidence.py) covers logs and
+     playbook output, but store_artifacts content has not been audited to the same
+     standard, so the flag stays off and the badge stays static rather than live. -->
+[![Galaxy](https://img.shields.io/badge/dynamic/json?label=galaxy&query=%24.highest_version.version&url=https%3A%2F%2Fgalaxy.ansible.com%2Fapi%2Fv3%2Fplugin%2Fansible%2Fcontent%2Fpublished%2Fcollections%2Findex%2Fjames_crowley%2Fasmb8_ikvm%2F&color=blue)](https://galaxy.ansible.com/ui/repo/published/james_crowley/asmb8_ikvm/) [![CI: CircleCI](https://img.shields.io/badge/CI-CircleCI-343434?logo=circleci&logoColor=white)](https://app.circleci.com/pipelines/github/james-crowley/ansible-collection-asmb8-ikvm) [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE) [![ansible-core](https://img.shields.io/badge/ansible--core-%3E%3D2.17-blue.svg)](https://docs.ansible.com/) [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/) [![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)](#project-status)
+
+Out-of-band management of **ASUS ASMB8-iKVM** baseboard management
+controllers — AMI MegaRAC firmware on an ASPEED AST2400 — from Ansible: power
+control and one-time boot selection over IPMI, plus this collection's
+headline feature, a **native, pure-Python implementation of AMI's
+proprietary iUSB virtual-media protocol**. It streams a local ISO straight
+from the Ansible controller to the BMC's virtual CD-ROM, so a bare-metal host
+can boot from it with **no PXE, DHCP, TFTP, NFS, or CIFS infrastructure**, and
+**no Java runtime or JViewer applet** anywhere in the path.
 
 The motivating use case is the same shape as PXE-based bare-metal
 provisioning, without needing to stand up or maintain that infrastructure:
@@ -21,285 +38,74 @@ Ansible roles once the OS is up.
 
 ## Why this exists
 
-This board has **no Redfish.** That is not a firmware gap to be fixed — it is
-generational: Redfish arrived with the AST2500/ASMB9 family, and the target
-hardware here is an AST2400/ASMB8. Standard IPMI, in turn, has no
-virtual-media capability at all. Between those two facts there is no standard
-API for attaching boot media to this board, which is the entire reason the
-protocol work in this collection exists: AMI's **iUSB** protocol, layered on
-top of the BMC's legacy `.asp` web-management session, is the only path to
-virtual media this generation of hardware offers, and AMI has never published
-a specification for it.
+This board generation has **no Redfish** — that arrived with the
+AST2500/ASMB9 family, one generation later than the AST2400/ASMB8 hardware
+this collection targets. Standard IPMI, in turn, has no virtual-media
+capability at all. Between those two facts there is no standard API for
+attaching boot media to this board, which is the entire reason the protocol
+work in this collection exists: AMI's **iUSB** protocol, layered on top of
+the BMC's legacy `.asp` web-management session, is the only path to virtual
+media this generation of hardware offers, and AMI has never published a
+specification for it.
 
-Power control and one-time boot selection are a different story: IPMI
-(chassis control, boot-flags) is well supported, well understood, and already
-correctly implemented by `pyghmi` (which is also what
-`community.general.ipmi_power`/`ipmi_boot` use internally). This collection
-does not reinvent that path — `asmb8_power` and `asmb8_boot` are thin,
-classified wrappers over it. All of the genuinely new work in this collection
-is in the iUSB virtual-media client.
+Power control and one-time boot selection are a different story: IPMI is
+well understood and already correctly implemented by `pyghmi` (the same
+library `community.general.ipmi_power`/`ipmi_boot` use internally). This
+collection does not reinvent that path — `asmb8_power` and `asmb8_boot` are
+thin, classified wrappers over it. All of the genuinely new work here is the
+iUSB virtual-media client.
 
-**What is genuinely new here, and what is not.** This collection is not the
-first tool to speak iUSB. Its implementation was built by reverse engineering,
-informed by a third-party Go client for a related AMI MegaRAC board
-(`BadCoder1337/rd450x-console`, MIT-licensed), an older Lua/Python
-reverse-engineering artifact for a different device class
-(`samozy/iusb`), and — decisively, for the facts those two got wrong for this
-specific board — a local, non-redistributed decompilation of the vendor's own
-JViewer client retrieved from the target hardware. See [NOTICE](NOTICE) for
-the full, per-file provenance accounting: which files were consulted, what was
-taken from each, and where they disagreed and which one won. What is new: a
-pure-Python iUSB client, callable directly from an Ansible module, with no
-external binary, no Java runtime, and no JViewer applet anywhere in the path.
-
-See [`docs/protocol-notes.md`](docs/protocol-notes.md) for the normative wire
-format this implementation is built against.
-
-## Project status
-
-**0.2.0 — not hardware-qualified.** This is not a hedge; it is the accurate
-description of where this collection is. Read
-[`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
-for the full, dated, falsifiable record everything below is drawn from, and
-[`docs/capability-matrix.md`](docs/capability-matrix.md) for the complete
-claim-by-claim accounting.
-
-**What is proven**, against one ASUS Z10PE-D16 WS / ASMB8-iKVM board on
-firmware 1.14 (aux 1.14.2), on 2026-08-08:
-
-- The iUSB authentication handshake, byte-exact: the 32-byte header, the
-  128-byte auth payload, the ACK, and the connection-status semantics.
-- A full CD-ROM emulation exchange over that session — `TEST UNIT READY`,
-  `READ CAPACITY(10)` (verified byte-exact against a 1052-sector test image),
-  `READ(10)`/`READ(12)` — with no Java anywhere in the path.
-- The El Torito boot chain actually followed by the firmware: LBA 0, 1, 16,
-  17, the boot catalog at LBA 4660, the terminator at 18, then the BIOS image
-  at LBA 6025 and the UEFI image at LBA 156 — matching `xorriso
-  -report_el_torito` on the same image exactly.
-- The bootloader then loading and streaming a real Proxmox VE 9.2-1 ISO:
-  multi-block reads up to 16 blocks (32 KiB). The final tally for that run was
-  2,839 read requests and 33,038 sectors (~71.0 MiB) served.
-- Correct handling of a high LBA (832,880 of an 833,095-sector image) — ruling
-  out a 16-bit truncation bug.
-- A one-time IPMI boot-device override, and confirmation that it reverted to
-  `default` after the following reset (true one-time semantics, not a
-  persistent change).
-- The media session **surviving a host power cycle** — it stayed
-  authenticated across a reset and kept serving.
-- IPMI power state and boot-device reads/writes over `pyghmi`, working
-  cleanly with no special flags.
-
-**What is not proven** — and must not be claimed as working until it is:
-
-- **A completed unattended OS install.** The furthest this collection has
-  reached is the installer streaming its squashfs; no install has been driven
-  to completion.
-- **Whether the guest OS can obtain its own media session.** Linux
-  re-enumerates USB storage with its own driver once it boots, and this
-  board's `cd-media` service allows exactly **one** session with **no**
-  server-side timeout to reclaim an abandoned one. If this collection's own
-  daemon is still holding that slot, the guest OS may be unable to reach its
-  own media — a failure that would surface *after* the installer appears to
-  start. Untested.
-- **KVM video decoding.** The IVTP greeting and framing are understood; no
-  console frame has been decoded from this board.
-- **The virtual floppy and virtual hard-disk device classes.** Their ports
-  bind, but only CD-ROM has been exercised.
-- **Any board other than this one.** One machine, one firmware version. This
-  is repeatability at best, not a compatibility guarantee.
-
-## Known limitations
-
-Each of these is a measured or reasoned limit, sourced from
-[`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
-unless stated otherwise, not a hedge.
-
-### The factory certificate cannot be chain-validated, ever
-
-The BMC's TLS certificate is self-signed *and* already expired: subject and
-issuer are both `C=US, O=American Megatrends Inc, OU=Service Processors,
-CN=AMI`, valid 2016-06-01 to **2026-05-30**. Chain validation (`ca_path`,
-`validate_certs=true`) cannot succeed against this board's factory
-certificate under any circumstances. Fingerprint pinning
-(`tls_fingerprint`) is the only trust mode that actually works here without
-replacing the certificate on the BMC.
-
-### TLS 1.2 with one static-RSA cipher — Python fails, `curl` misleadingly succeeds
-
-The BMC's TLS listener offers **TLS 1.2 only** (1.0, 1.1, and 1.3 are all
-refused at the handshake) and **exactly one ciphersuite**,
-`AES256-GCM-SHA384` — static-RSA key exchange, no forward secrecy. Modern
-OpenSSL/Python builds exclude non-forward-secret ciphersuites from their
-default list, so a plain `requests.get(...)` against this BMC fails the
-handshake outright. `curl` is more permissive by default and will *appear* to
-work against the same endpoint — that is not evidence of a bug in this
-collection; it is a difference in default cipher policy between HTTP clients.
-This collection's own client (`plugins/module_utils/asp.py`) restores the
-required cipher itself, so this is transparent to a playbook.
-
-### The BMC's clock is wrong
-
-The BMC reported `Thu Jan 25 17:40:30 2018` while actually running in 2026.
-Never trust a BMC-supplied timestamp for anything — including its own view of
-whether its (already-expired) certificate is currently valid.
-
-### The web server hangs rather than refuses when its worker pool saturates
-
-The BMC's web server is HTTP/1.0 with no keep-alive, caps at 20 concurrent
-sessions, and runs a **separate worker pool per listener** (plain web UI,
-`.asp` RPC, iUSB/media). Concurrent load exhausted the port-80 pool during
-testing: the BMC kept completing TCP handshakes while never serving a single
-request on that pool, for several minutes, while port 443 stayed perfectly
-responsive throughout. This is a hang, not a clean refusal, and it is the
-reason `ErrorClass.BMC_BUSY` exists (see [Error handling](#error-handling))
-and why this collection serializes every request to a given BMC rather than
-issuing them concurrently. It is also why HTTPS, not plaintext HTTP, is this
-collection's supported transport — nothing about the worker-pool behaviour is
-specific to one listener, but only the TLS listener has actually been proven
-resilient to it.
-
-### The virtual-media slot is single-occupancy, board-wide, with no timeout
-
-The `cd-media` service allows **exactly one active session** for the entire
-board, and has **no server-side timeout** to reclaim an abandoned one. A
-session left open by an unclean shutdown holds that slot forever until
-something closes its TCP connection — there is no remote "kick the current
-holder" call this collection can send, because none exists in the observed
-protocol. `asmb8_media`'s attach flow always attempts to reclaim every session
-its own `runtime_dir` still has a record of before opening a new one (see
-[Virtual media](#virtual-media)), but that can only reclaim what it knows
-about. A BMC cold reset (`ipmitool mc reset cold`, or the `pyghmi`/
-`community.general.ipmi_power` equivalent) is the operator's escape hatch when
-nothing else clears it — it resets the management controller only, not host
-power.
-
-### Idle is normal and has no meaningful upper bound
-
-A healthy, attached media session went completely silent for **130
-consecutive seconds** while the host sat at a bootloader menu, then resumed
-serving reads normally with no intervention. There is no idle duration this
-collection treats as failure — a host can sit at an installer prompt or a
-firmware setup screen indefinitely, and a long, quiet wait is not evidence of
-a hang.
-
-### Throughput is slow: budget minutes, not seconds
-
-Measured throughput was **≈800–900 KB/s** with 16-block (32 KiB) reads.
-Proxmox's own `pve-installer.squashfs` is **614 MB** on its own — that is
-**13+ minutes of streaming for one file**, before the installer even starts
-running against it. Every timeout in this collection that touches the media
-path is sized with that in mind; do not shrink `attach_timeout`,
-`handoff_timeout`, or similar values casually.
-
-### A stock installer ISO will NOT install unattended — the GRUB menu trap
-
-**Booting an unprepared installer ISO does not produce an unattended
-install.** A stock Proxmox VE ISO's own `grub.cfg` sets its boot `timeout`
-only inside a conditional that is true only when `auto-installer-mode.toml`
-is present at the ISO root:
-
-```
-if [ -f auto-installer-mode.toml ]; then
-    set timeout-style=menu
-    set timeout=10
-    menuentry 'Install Proxmox VE (Automated)' ... proxmox-start-auto-installer
-fi
-```
-
-A stock ISO lacks that file, so there is **no timeout at all** — the boot menu
-waits forever, confirmed both from the iUSB read trace (loading halted after
-~2.8 MB) and by direct observation of the console. The supported unattended path is
-an ISO already prepared with `proxmox-auto-install-assistant prepare-iso`
-(which bakes in an answer file and flips the ISO's own GRUB config to boot its
-`Install Proxmox VE (Automated)` entry without a keypress) — point
-`asmb8_media`'s `image` option at the *output* of that command, never at the
-stock ISO. `asmb8_media` has no answer-file/floppy slot of its own; the answer
-file must already be inside the ISO you hand it. The
-[`asmb8_autoinstall_iso`](roles/asmb8_autoinstall_iso/README.md) role
-automates exactly that preparation step (rendering and validating an
-`answer.toml`, then baking it into a copy of the ISO via the vendor tool or a
-container-based `xorriso` fallback) — see
-[`docs/proxmox-autoinstall.md`](docs/proxmox-autoinstall.md) for the evidence
-behind it.
-
-### The KVM console channel opens, but nothing decodes video — and part of its own documentation is unverified
-
-`asmb8_console` completes the real IVTP handshake and can save one raw
-video frame's still-encoded bytes, but this collection implements **no** part
-of the AMI/ASPEED video codec — `capture=decoded_frame` fails outright with
-`error_class=unsupported_capability` rather than faking a decode. Unlike
-every other module, `asmb8_console` has **zero** live-hardware evidence
-and **zero** unit/mock test coverage of its handshake state machine behind
-it: everything it does is sourced from decompiled vendor client analysis
-alone, including at least one specific wire-format detail (a `pktSize` field
-this collection writes as 324 bytes, where the decompiled client itself
-inconsistently writes 332) that is flagged in its own source as unverified
-against real hardware. Its claimed KVM service capacity — 4 concurrent
-sessions, an 1800-second inactivity timeout — is also unsourced beyond the
-module's own documentation. See [`docs/asmb8_console.md`](docs/asmb8_console.md)
-and [`docs/capability-matrix.md`](docs/capability-matrix.md) Tier 4 for the
-full accounting.
-
-### `asmb8_redirection` cannot toggle a service's enablement — only report it
-
-No sourced RPC exists on this BMC's `.asp` surface for toggling whether a
-service (`web`, `kvm`, `cd-media`, `fd-media`, `hd-media`, `ssh`, `telnet`) is
-enabled — see [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md).
-Passing `state` to `asmb8_redirection` always fails with
-`error_class=unsupported_capability`, deliberately, rather than mutating
-through a guessed endpoint. Use the BMC's own web UI to change a service's
-enablement until a real RPC is confirmed and a future release can add it.
+This collection is not the first tool to speak iUSB. Its implementation was
+built by reverse engineering, informed by a third-party client for a related
+AMI MegaRAC board and an independent Wireshark dissector, and — for the
+facts those got wrong for this specific board — a local, non-redistributed
+decompilation of the vendor's own JViewer client retrieved from the target
+hardware. What is new: a pure-Python iUSB client, callable directly from an
+Ansible module, with no external binary, no Java runtime, and no JViewer
+applet anywhere in the path. See [NOTICE](NOTICE) for the full, per-file
+provenance accounting, and [`docs/protocol-notes.md`](docs/protocol-notes.md)
+for the normative wire format this implementation is built against.
 
 ## Requirements
 
 - **Controller**: Python 3.10+ with `requests>=2.25.0` and `pyghmi>=1.5.0`.
   Install with `pip install -r requirements.txt`.
 - **ansible-core >= 2.17.** The sanity-test boilerplate requirement changed
-  incompatibly at 2.17 — no single module form is sanity-clean on both an
-  older and a newer `ansible-core`, so 2.17 is the floor rather than a choice.
+  incompatibly at 2.17, so no single module form is sanity-clean on both an
+  older and a newer `ansible-core` — 2.17 is the floor rather than a choice.
 - **Target**: nothing. No agent, no SSH, no Python interpreter on the managed
   node. The BMC is firmware, reachable independently of the host OS.
 - An ASMB8-iKVM BMC that is **reachable and has a known admin credential**.
   This collection manages the BMC; it does not provision or factory-reset it.
-- `community.general` is **not** a dependency (`galaxy.yml`'s `dependencies:
-  {}` is intentional). This collection calls `pyghmi` directly rather than
-  wrapping `community.general.ipmi_power`/`ipmi_boot`, specifically so it does
-  not need a whole other collection as a dependency just to reach a library
-  it would end up importing anyway.
 
 ## Installation
 
-Not yet published to Ansible Galaxy. Install from source:
+```bash
+ansible-galaxy collection install james_crowley.asmb8_ikvm
+pip install -r requirements.txt
+```
+
+To track `main` instead of a published release:
 
 ```bash
 ansible-galaxy collection install git+https://github.com/james-crowley/ansible-collection-asmb8-ikvm.git
-pip install -r requirements.txt
 ```
 
 ## Modules
 
-| Module | Purpose | Mutates? | Status |
-|---|---|---|---|
-| [`asmb8_info`](docs/asmb8_info.md) | IPMI-observed capability/state facts, plus optional read-only `.asp` diagnostics | No | Implemented |
-| [`asmb8_power`](docs/asmb8_power.md) | Power control over IPMI, wrapping `pyghmi` directly | Yes | Implemented |
-| [`asmb8_boot`](docs/asmb8_boot.md) | One-time IPMI boot-device override; persistent changes are refused outright | Yes | Implemented |
-| [`asmb8_media`](docs/asmb8_media.md) | Stream a local ISO to the BMC's virtual CD-ROM over iUSB | Yes | Implemented |
-| [`asmb8_redirection`](docs/asmb8_redirection.md) | Report (and, once a real RPC is confirmed, toggle) whether this BMC's own services (`web`, `kvm`, `cd-media`, `fd-media`, `hd-media`, `ssh`, `telnet`) are enabled and reachable | No (`changed` is always `false`; `state` is accepted but always fails honestly) | Implemented |
-| [`asmb8_console`](docs/asmb8_console.md) | Open the iKVM console (IVTP) session headlessly: confirm the channel is live, or save one raw (undecoded) video frame | No (`changed` is always `false`) | Implemented, but **less proven than the other four** — see below |
+| Module | Purpose | Mutates BMC? |
+|---|---|---|
+| [`asmb8_info`](docs/asmb8_info.md) | IPMI-observed capability/state facts, plus optional read-only `.asp` diagnostics | No |
+| [`asmb8_power`](docs/asmb8_power.md) | Power control over IPMI, wrapping `pyghmi` directly | Yes |
+| [`asmb8_boot`](docs/asmb8_boot.md) | One-time IPMI boot-device override; persistent changes are refused outright | Yes |
+| [`asmb8_media`](docs/asmb8_media.md) | Stream a local ISO to the BMC's virtual CD-ROM over iUSB | Yes |
+| [`asmb8_redirection`](docs/asmb8_redirection.md) | Report whether this BMC's own services (web, KVM, media, SSH, telnet) are enabled and reachable | No (`state` is accepted but always fails honestly — see [Known limitations](#known-limitations)) |
+| [`asmb8_console`](docs/asmb8_console.md) | Open the iKVM console (IVTP) session headlessly: confirm the channel is live, or save one raw (undecoded) video frame | No |
+| [`asmb8_reset`](plugins/modules/asmb8_reset.py) | Cold/warm-reset the BMC's management controller over IPMI — the recovery escape hatch for a wedged media session | Yes (BMC only; host power is unaffected) |
+| [`asmb8_http_origin`](plugins/modules/asmb8_http_origin.py) | Run (or stop) an ephemeral, path-confined, lifetime-capped local HTTP file server, for installers that fetch bulk files over LAN-speed HTTP instead of the slower iUSB path | No (local process only; does not touch the BMC) |
 
-**Naming note.** `asmb8_console` is what `asmb8_redirection` used to be, before
-the first Galaxy release, when it opened a session under a name borrowed from
-the sibling `james_crowley.intel_amt` collection's `amt_redirection` module —
-which only reports and toggles service enablement and never opens a session
-at all. That mismatch was fixed by splitting the module in two, before
-publishing, specifically so it would never need fixing *after* publishing
-(renaming a module post-release is a breaking change). See
-[`docs/asmb8_redirection.md`](docs/asmb8_redirection.md)'s "Why this module
-exists" section for the full story.
-
-All six are named in `meta/runtime.yml`'s `asmb8_ikvm` action group and
-implemented. Set their shared connection options centrally with
-`module_defaults`:
+All eight are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
+their shared connection options centrally with `module_defaults`:
 
 ```yaml
 module_defaults:
@@ -310,80 +116,18 @@ module_defaults:
     tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
 ```
 
-`asmb8_power` and `asmb8_boot` accept every option in that fragment (for
-`module_defaults` compatibility with the group above) but only actually use
-`host`, `username`, `password`, and `ipmi_port` — the rest describe the `.asp`
-web-management surface, which IPMI does not touch. See each module's own
-`DOCUMENTATION` for the exact split.
+`asmb8_power`, `asmb8_boot`, and `asmb8_reset` accept every option in that
+fragment (for `module_defaults` compatibility) but only actually use `host`,
+`username`, `password`, and `ipmi_port` — the rest describe the `.asp`
+web-management surface, which IPMI does not touch.
 
-## Transport and trust
+## Quickstart: unattended bare-metal install
 
-The `.asp`/JNLP web-management plane (used by `asmb8_info`'s optional
-`include_web_session` and by `asmb8_media`'s attach flow) defaults to HTTPS on
-port 443, and requires an explicit trust decision:
-
-- **`tls_fingerprint`** — SHA-256 leaf pinning. **This is the recommended, and
-  in practice the only working, trust mode for this board**: its factory
-  certificate is self-signed and already expired (see [Known
-  limitations](#the-factory-certificate-cannot-be-chain-validated-ever)), so
-  chain validation cannot succeed against it regardless of `ca_path`.
-- **`ca_path`** — ordinary chain and hostname verification. Kept as a real,
-  working mode for the day this board's factory certificate has been replaced
-  with one issued by an actual CA — not the expected posture for the hardware
-  this collection targets today.
-- **`allow_insecure_transport=true`** paired with `use_tls=false` — plaintext
-  HTTP, never selected implicitly. The session cookie and the iUSB/KVM media
-  token both cross the network recoverable by an on-path attacker when this is
-  set; only use it on an isolated management VLAN.
-
-IPMI (`asmb8_power`, `asmb8_boot`, and `asmb8_info`'s IPMI facts) has no TLS
-layer of its own and is unaffected by any of the above — it is plain
-UDP 623, using `pyghmi`'s defaults, with its own `ipmi_port` option.
-
-This collection's HTTP client re-enables the cipher this board's TLS listener
-actually requires (see [Known
-limitations](#tls-12-with-one-static-rsa-cipher--python-fails-curl-misleadingly-succeeds))
-transparently — you do not need to do anything for it to work once TLS is
-otherwise configured correctly.
-
-## Virtual media
-
-`asmb8_media` streams a local ISO from the controller to the BMC's virtual
-CD-ROM over iUSB. Three things to know before using it:
-
-1. **It is always read-only.** The CD-ROM channel this collection speaks has
-   no write opcode at all in the BMC's own firmware (confirmed by
-   disassembling the vendor's own SCSI dispatcher — see
-   [NOTICE](NOTICE)); there is no writable-image option to offer, unlike the
-   sibling `james_crowley.intel_amt` collection's floppy/USB-R slot.
-2. **A session is long-lived and the module call is not.** `state=attached`
-   forks a detached background process that owns the connection and streams
-   the ISO for as long as the install takes (potentially over an hour); the
-   module invocation itself returns once that process reports `attached` or
-   an early failure. `session_id` is how you refer to it again later —
-   capture it if you will need to `state=detached` it.
-3. **The single-session hazard is real and always handled, not just
-   documented.** Every `state=attached` call attempts to reclaim every *other*
-   session this collection's own `runtime_dir` still has a record of against
-   the same endpoint before ever opening a new connection — live or stale,
-   whether or not this particular call is the one that ends up failing. See
-   [Known
-   limitations](#the-virtual-media-slot-is-single-occupancy-board-wide-with-no-timeout)
-   for what that reclamation can and cannot reach.
-
-`cd_port` (default 5120) is a *separate* TCP listener from `port` (the
-BMC's HTTPS web-management port, default 443): `port` is used to log in and
-fetch the JNLP document that mints a media session token; `cd_port` is where
-the ISO bytes actually stream. On the target hardware, `cd_port` refuses
-connections outright until a JNLP fetch allocates a session — a closed
-`cd_port` before any attach is normal, not a fault.
-
-## Example: unattended bare-metal install
-
-Every module and option name below is real and exists in this collection's
-code today. Note `delegate_to: localhost` on every task: an ASMB8-iKVM BMC is
-firmware and cannot execute a Python payload, so every module in this
-collection runs on the **controller**, never on the managed node.
+Every module and option name below is real. Note `delegate_to: localhost` on
+every task: an ASMB8-iKVM BMC is firmware and cannot execute a Python
+payload, so every module in this collection runs on the **controller**,
+never on the managed node. Replace the placeholder values with your own BMC
+and target host.
 
 ```yaml
 - name: Install an operating system onto bare metal via virtual media
@@ -393,17 +137,17 @@ collection runs on the **controller**, never on the managed node.
   connection: local
   module_defaults:
     group/james_crowley.asmb8_ikvm.asmb8_ikvm:
-      host: "{{ asmb8_host }}"
+      host: 192.0.2.10           # replace with your BMC's address
       username: "{{ asmb8_username }}"
       password: "{{ asmb8_password }}"
       tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
 
   tasks:
     - name: Attach an already-prepared installer ISO to the virtual CD-ROM
-      # See "A stock installer ISO will NOT install unattended" above --
-      # this must be the output of `proxmox-auto-install-assistant prepare-iso`
+      # This must be the output of `proxmox-auto-install-assistant prepare-iso`
       # (or the asmb8_autoinstall_iso role, which automates that step), never
-      # a stock ISO.
+      # a stock ISO -- see "A stock installer ISO will not install unattended"
+      # below.
       james_crowley.asmb8_ikvm.asmb8_media:
         image: /srv/images/proxmox-ve-auto.iso
         state: attached
@@ -425,9 +169,9 @@ collection runs on the **controller**, never on the managed node.
 
     - name: Wait for the installed OS to come up
       ansible.builtin.wait_for:
-        host: "{{ provisioned_host }}"
+        host: 198.51.100.20       # replace with the target host's address
         port: 22
-        timeout: 3600     # budget minutes, not seconds -- see Known limitations
+        timeout: 3600              # budget minutes, not seconds -- see below
         delay: 120
 
     - name: Detach the media
@@ -438,54 +182,233 @@ collection runs on the **controller**, never on the managed node.
       no_log: true
 ```
 
-The `asmb8_baremetal_install` role (see [`roles/asmb8_baremetal_install/README.md`](roles/asmb8_baremetal_install/README.md))
+The [`asmb8_baremetal_install`](roles/asmb8_baremetal_install/README.md) role
 wraps this same sequence with a fan-out guard, an explicit destructive-action
 confirmation, resumability across interrupted runs, and a guaranteed media
-detach on failure — read that role's own README before pointing it at real
-hardware; **nothing in that role has completed a full, real OS install yet
-either.**
+detach on failure. The
+[`asmb8_autoinstall_iso`](roles/asmb8_autoinstall_iso/README.md) role
+prepares the stock ISO this example depends on — see
+[`docs/proxmox-autoinstall.md`](docs/proxmox-autoinstall.md) for why that
+preparation step is necessary at all. **Neither role, nor the modules above,
+have completed a full real OS install yet** — see
+[Project status](#project-status) below for exactly how far this has been
+taken.
+
+## Transport and trust
+
+The `.asp`/JNLP web-management plane (used by `asmb8_info`'s optional
+`include_web_session` and by `asmb8_media`'s attach flow) defaults to HTTPS
+on port 443 and requires an explicit trust decision:
+
+- **`tls_fingerprint`** — SHA-256 leaf pinning. This is the trust mode most
+  ASMB8-generation boards need in practice: their factory TLS certificate is
+  typically self-signed, and some ship already expired, so chain validation
+  cannot succeed against it regardless of `ca_path`.
+- **`ca_path`** — ordinary chain and hostname verification, for a board whose
+  factory certificate has been replaced with one issued by a real CA.
+- **`allow_insecure_transport=true`** paired with `use_tls=false` — plaintext
+  HTTP, never selected implicitly. The session cookie and the iUSB/KVM media
+  token both cross the network recoverable by an on-path attacker when this
+  is set; only use it on an isolated management VLAN.
+
+IPMI (`asmb8_power`, `asmb8_boot`, `asmb8_reset`, and `asmb8_info`'s IPMI
+facts) has no TLS layer of its own and is unaffected by any of the above —
+it is plain UDP 623, using `pyghmi`'s defaults, with its own `ipmi_port`
+option.
+
+Some ASMB8-generation boards' TLS listeners offer a limited, non-forward-secret
+ciphersuite that modern OpenSSL/Python builds exclude by default, which makes
+a plain `requests.get(...)` fail the handshake outright while `curl` appears
+to work — a difference in default cipher policy between HTTP clients, not a
+bug. This collection's HTTP client re-enables the required cipher itself, so
+this is transparent to a playbook. See
+[`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
+for the specifics observed on the board this was tested against.
+
+## Virtual media
+
+`asmb8_media` streams a local ISO from the controller to the BMC's virtual
+CD-ROM over iUSB.
+
+1. **It is always read-only.** The CD-ROM channel this collection speaks has
+   no write opcode at all in the BMC's own firmware; there is no
+   writable-image option to offer.
+2. **A session is long-lived and the module call is not.** `state=attached`
+   forks a detached background process that owns the connection and streams
+   the ISO for as long as the install takes (potentially over an hour); the
+   module invocation itself returns once that process reports `attached` or
+   an early failure. `session_id` is how you refer to it again later —
+   capture it if you will need to `state=detached` it.
+3. **The virtual-media slot is single-occupancy, board-wide, with no
+   timeout.** The BMC allows exactly one active media session for the entire
+   board and has no server-side timeout to reclaim an abandoned one. Every
+   `state=attached` call attempts to reclaim every *other* session this
+   collection's own `runtime_dir` still has a record of against the same
+   endpoint before opening a new connection — live or stale. That can only
+   reclaim what it knows about; if nothing clears a wedged slot, `asmb8_reset`
+   (a BMC-only cold/warm reset, host power unaffected) is the escape hatch.
+4. **Budget minutes, not seconds.** Measured throughput on the one board this
+   has been tested against is **≈790 KB/s** over the bulk-streaming phase —
+   USB Mass Storage over this relay is strictly serial, one command
+   outstanding at a time, roughly 32 KB per read at roughly 30 ms round trip.
+   A 1.6 GB installer ISO is on the order of **35 minutes** of streaming
+   alone. `TCP_NODELAY` was tried on the media socket as an obvious first fix
+   and measured **no change** in a controlled A/B test — the bottleneck is
+   structural, not a client-side tuning problem. See
+   [`docs/netboot-design.md`](docs/netboot-design.md) for a design (not yet
+   implemented) that routes the bulk of an installer's own payload over
+   `asmb8_http_origin` and plain LAN-speed HTTP instead, using iUSB only for a
+   small boot bootstrap.
+
+`cd_port` (default 5120) is a *separate* TCP listener from `port` (the BMC's
+HTTPS web-management port, default 443): `port` is used to log in and fetch
+the JNLP document that mints a media session token; `cd_port` is where the
+ISO bytes actually stream. A closed `cd_port` before any attach is normal —
+it only binds once a JNLP fetch allocates a session.
+
+### A stock installer ISO will not install unattended
+
+Booting an unprepared installer ISO does not produce an unattended install.
+A stock Proxmox VE ISO's own `grub.cfg` only sets a boot timeout inside a
+conditional that is true only when `auto-installer-mode.toml` is present at
+the ISO root — a stock ISO lacks that file, so its boot menu waits forever
+with no timeout at all. The supported unattended path is an ISO already
+prepared with `proxmox-auto-install-assistant prepare-iso` (which bakes in an
+answer file and flips the ISO's own GRUB config to boot automatically); point
+`asmb8_media`'s `image` option at the *output* of that command, never at a
+stock ISO. The [`asmb8_autoinstall_iso`](roles/asmb8_autoinstall_iso/README.md)
+role automates exactly that preparation step — see
+[`docs/proxmox-autoinstall.md`](docs/proxmox-autoinstall.md) for the full
+detail and the evidence behind it.
 
 ## Idempotence and check mode
 
 | Module | Reads before writing | `changed` fires when | Check mode |
 |---|---|---|---|
-| `asmb8_info` | n/a (read-only) | never (`changed=false` always) | Full read, identical to normal mode |
-| `asmb8_power` | Yes (`get_power_state`) | Requested state differs from observed (`on`/`off`); always for `shutdown`/`reset`/`boot`, which can never compare equal to a reported state | Reports the plan; never sends the IPMI command |
+| `asmb8_info` | n/a (read-only) | never | Full read, identical to normal mode |
+| `asmb8_power` | Yes (`get_power_state`) | Requested state differs from observed; always for `shutdown`/`reset`/`boot` | Reports the plan; never sends the IPMI command |
 | `asmb8_boot` | Yes (`get_boot_device`) | Requested `device`/`uefi` differs from the current override | Reports the plan; never sends `set_bootdev()` |
-| `asmb8_media` attach | Yes (session state file) | A new background process was actually forked (or, in check mode, would be) | Validates the image and reports the plan; never forks, signals another session, or contacts the BMC |
-| `asmb8_media` detach | Yes (session state file) | A live process was actually asked to stop (or, in check mode, would be) | Reports whether a live session would be stopped; never signals it |
+| `asmb8_media` attach | Yes (session state file) | A new background process was actually forked | Validates the image and reports the plan; never forks or contacts the BMC |
+| `asmb8_media` detach | Yes (session state file) | A live process was actually asked to stop | Reports whether a live session would be stopped; never signals it |
+| `asmb8_reset` | No | Always, on a successful IPMI reset command | Reports the plan; never issues the reset |
+| `asmb8_http_origin` | Yes (session state file) | A background server was actually started or stopped | Reports the plan; never forks or signals |
 
 Two design commitments that hold across every module here:
 
 - **An uncertain mutation is never retried automatically.** A timeout *after*
-  a request was transmitted is reported with `indeterminate=true`, so a caller
-  re-probes rather than blindly retrying a reset or attach that may have
-  already taken effect.
+  a request was transmitted is reported with `indeterminate=true`, so a
+  caller re-probes rather than blindly retrying a reset or attach that may
+  have already taken effect.
 - **One-shot boot is never silently re-armed persistently.** `asmb8_boot`
-  refuses `persistent=true` outright, before any IPMI session is even opened
-  — see its own documentation.
+  refuses `persistent=true` outright, before any IPMI session is even opened.
 
 ## Error handling
 
-Every failure carries a stable, machine-readable `error_class`
-(`plugins/module_utils/errors.py`):
+Every failure carries a stable, machine-readable `error_class`:
 
 `connection`, `tls_validation`, `authentication`, `unsupported_capability`,
 `invalid_state`, `timeout`, `protocol`, `remote_operation`,
-`identity_mismatch`, and **`bmc_busy`** — the one class this collection added
+`identity_mismatch`, and `bmc_busy` — the one class this collection adds
 beyond the taxonomy it shares with the sibling `james_crowley.intel_amt`
-collection, specifically because this board's web server hangs rather than
-refuses under load (see [Known
-limitations](#the-web-server-hangs-rather-than-refuses-when-its-worker-pool-saturates)),
-and because the single-occupancy media slot's rejection is a distinct,
-nameable condition rather than an ordinary timeout.
+collection, because this board's web server can hang rather than refuse
+under load, and because the single-occupancy media slot's rejection is a
+distinct, nameable condition rather than an ordinary timeout.
 
-Every user-visible message and diagnostic is passed through
-`errors.redact()` before it reaches a module result: session cookies, the
-`WEBVAR_PASSWORD` login field, iUSB/KVM tokens, `Authorization`/`Cookie`
-headers, and generic `password=`/`token=`-shaped values are all stripped.
-Diagnostics are also length-bounded so a full HTTP body or JNLP document never
-lands in a task result verbatim.
+Every user-visible message and diagnostic is redacted before it reaches a
+module result: session cookies, login fields, iUSB/KVM tokens,
+`Authorization`/`Cookie` headers, and generic `password=`/`token=`-shaped
+values are all stripped, and diagnostics are length-bounded so a full HTTP
+body never lands in a task result verbatim.
+
+## Project status
+
+**0.2.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
+hedge; it is an accurate description of where this collection is today.
+
+On one ASUS Z10PE-D16 WS / ASMB8-iKVM board (firmware 1.14, aux 1.14.2), this
+collection has verified: the full iUSB authentication handshake byte-exact;
+CD-ROM emulation and the real El Torito boot chain, matching `xorriso
+-report_el_torito` on the same image; a bootloader streaming a real Proxmox
+VE ISO across thousands of read requests; a media session surviving a host
+power cycle; and IPMI power/boot-device control over `pyghmi` with true
+one-time-boot semantics.
+
+What is **not yet proven**, and must not be assumed:
+
+- **A completed, unattended OS install, start to finish.** The furthest a
+  real attempt has reached is the installer streaming its own files — one
+  early run failed outright on virtual-CD I/O errors before a fix landed; a
+  later run streamed well past that point but was not carried to completion.
+  No install has finished on any module or on the `asmb8_baremetal_install`
+  role.
+- **Whether a booted guest OS can obtain its own media session.** The BMC's
+  media slot allows exactly one session with no server-side timeout; if this
+  collection's own process is still holding it when the guest OS
+  re-enumerates USB storage, the guest may be unable to reach its own media —
+  untested.
+- **KVM video decoding.** The IVTP handshake is understood and exercised;
+  no console frame has ever been decoded from this board, and
+  `asmb8_console`'s `capture=decoded_frame` deliberately fails with
+  `error_class=unsupported_capability` rather than approximating a decode.
+- **Any board other than the one tested.** One machine, one firmware version.
+  This is repeatability at best, not a compatibility guarantee.
+
+See [`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
+for the full, dated, falsifiable record everything above is drawn from, and
+[`docs/capability-matrix.md`](docs/capability-matrix.md) for the complete
+claim-by-claim accounting — including exactly what rests on real firmware
+evidence, what rests only on reading someone else's source, and what rests
+on nothing yet.
+
+## Known limitations
+
+Each of these is a measured or reasoned limit, not a hedge. Full detail and
+sourcing live in the linked docs; this is the skimmable version.
+
+- **IPMI Serial-over-LAN does not work on the tested board.** A SOL session
+  opens cleanly via `pyghmi`, the channel-level SOL payload was enabled,
+  per-user SOL access was already granted, and both plausible bitrates were
+  tried — three configurations, zero bytes received in every case. This
+  collection does not depend on SOL for anything; media-channel read patterns
+  were used instead to diagnose installer behaviour. See
+  [`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
+  ("Serial-over-LAN") for what was tried.
+- **`asmb8_console` has the least evidence of any module here.** It completes
+  a real IVTP handshake and can save one raw, still-encoded video frame, but
+  has **zero** live-hardware evidence and **zero** unit/mock coverage of its
+  handshake state machine — everything it does is sourced from decompiled
+  vendor-client analysis alone, including at least one wire-format detail
+  flagged in its own source as unverified. `capture=decoded_frame` fails
+  outright with `error_class=unsupported_capability`; this collection
+  implements no part of the AMI/ASPEED video codec and does not plan to fake
+  one. See [`docs/asmb8_console.md`](docs/asmb8_console.md).
+- **`asmb8_redirection` can report service state but never toggle it.** No
+  sourced RPC exists on this BMC's `.asp` surface for toggling whether a
+  service is enabled, so passing `state` always fails with
+  `error_class=unsupported_capability` rather than mutating through a guessed
+  endpoint — deliberately, and matching the sibling `james_crowley.intel_amt`
+  collection's `amt_redirection` module. Its `known`/`enabled` signals come
+  from a static catalog read from the BMC's web UI once, not a live query;
+  only its `reachable` signal is a genuine live probe. See
+  [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md).
+- **Throughput is slow, and client-side tuning does not help.** See
+  [Virtual media](#virtual-media) above — budget minutes, not seconds, and do
+  not expect `TCP_NODELAY` or similar socket tuning to change that; it was
+  tried and measured to make no difference.
+- **The factory TLS certificate cannot be chain-validated on some boards.**
+  Fingerprint pinning (`tls_fingerprint`) is the trust mode to use unless a
+  board's certificate has been replaced. See [Transport and trust](#transport-and-trust).
+- **Never trust a BMC-supplied timestamp.** The tested board's own clock read
+  nearly a decade off from actual time. That is relevant beyond cosmetics: it
+  is also the BMC's own view of whether its (already-expired) certificate is
+  currently valid, so a BMC-reported "certificate OK" is not to be trusted
+  either.
+- **The virtual-media slot is single-occupancy, board-wide, with no
+  timeout.** See point 3 under [Virtual media](#virtual-media).
+
+See [`docs/roadmap.md`](docs/roadmap.md) for capability gaps that are tracked
+but not yet built (network-boot design work, additional device classes, and
+more).
 
 ## Testing
 
@@ -508,37 +431,32 @@ BMC credentials are equivalent to physical access to the machine: someone
 holding them can power the machine on or off, force a boot-device override,
 and — with `asmb8_media` — boot it from media of their own choosing,
 regardless of what the installed OS wants. See [SECURITY.md](SECURITY.md) for
-the full policy. Specific to this collection's current state:
+the full policy, and how to report a vulnerability privately. In brief:
 
-- The factory TLS certificate cannot be chain-validated (see [Known
-  limitations](#the-factory-certificate-cannot-be-chain-validated-ever));
-  fingerprint pinning is the only trust mode that actually works, and
-  plaintext transport requires an explicit, never-implicit opt-in.
 - `password` is `no_log` in every module's argument spec; every example in
   this repository also sets task-level `no_log: true` as defence in depth.
 - Credentials, session cookies, and iUSB/KVM tokens are never written to
-  operation receipts, facts, or the `asmb8_media` session state file — see
-  `plugins/module_utils/models.py`'s `JnlpSession` docstring for exactly which
-  fields are secret-shaped and how this collection avoids letting them leak
-  into a return value.
+  operation receipts, facts, or the `asmb8_media` session state file.
+- Fingerprint pinning is the only trust mode that works against a factory
+  certificate that cannot be chain-validated; plaintext transport requires an
+  explicit, never-implicit opt-in.
 - The iUSB protocol's own authentication and confidentiality properties are
   not independently verified beyond what riding on top of the `.asp` web
-  session provides — see `docs/protocol-notes.md` for exactly what has and has
-  not been established about the wire format itself.
+  session provides.
 
 ## License and attribution
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-This collection's iUSB implementation draws on
-[`BadCoder1337/rd450x-console`](https://github.com/BadCoder1337/rd450x-console)
-(MIT-licensed — see [`licenses/MIT.txt`](licenses/MIT.txt)) and on a local,
-non-redistributed decompilation of the vendor's own JViewer client retrieved
-from the target hardware, used solely to understand an undocumented protocol
-well enough to interoperate with it. **Neither the vendor binaries nor any
-decompiled output is redistributed in this collection.** Full per-file
-provenance — which sources were consulted, what was taken from each, and
-every point where they disagreed and which one won — is in [NOTICE](NOTICE).
+This collection's iUSB implementation draws on a third-party MIT-licensed
+client for a related AMI MegaRAC board, an independent Wireshark dissector,
+and a local, non-redistributed decompilation of the vendor's own JViewer
+client retrieved from the target hardware, used solely to understand an
+undocumented protocol well enough to interoperate with it. **Neither the
+vendor binaries nor any decompiled output is redistributed in this
+collection.** Full per-file provenance — which sources were consulted, what
+was taken from each, and every point where they disagreed and which one won —
+is in [NOTICE](NOTICE).
 
 ## Contributing
 
@@ -548,37 +466,46 @@ Conventional commits; every user-facing change needs a changelog fragment in
 `changelogs/fragments/`.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local verification sequence
-and the practical tooling traps this project shares with
-`james_crowley.intel_amt`, and [`SECURITY.md`](SECURITY.md) for why this
-collection warrants unusual care with credentials.
+and the practical tooling traps this project shares with the sibling
+`james_crowley.intel_amt` collection, and [SECURITY.md](SECURITY.md) for why
+this collection warrants unusual care with credentials.
 
-## Further reading
+## Documentation
 
 - [`docs/asmb8_info.md`](docs/asmb8_info.md),
   [`docs/asmb8_power.md`](docs/asmb8_power.md),
   [`docs/asmb8_boot.md`](docs/asmb8_boot.md),
   [`docs/asmb8_media.md`](docs/asmb8_media.md),
   [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md),
-  [`docs/asmb8_console.md`](docs/asmb8_console.md) — per-module
-  reference: options, return values, error classes, and examples.
+  [`docs/asmb8_console.md`](docs/asmb8_console.md) — per-module reference:
+  options, return values, error classes, and examples. `asmb8_reset` and
+  `asmb8_http_origin` are documented in full in their own `DOCUMENTATION`
+  block (`ansible-doc james_crowley.asmb8_ikvm.asmb8_reset`, and likewise for
+  `asmb8_http_origin`) pending a standalone reference page.
 - [`docs/capability-matrix.md`](docs/capability-matrix.md) — exactly what is
   verified against real firmware evidence, what is only unit/mock-tested, and
   what remains unproven, claim by claim.
-- [`docs/protocol-notes.md`](docs/protocol-notes.md) — the normative iUSB/IVTP
-  wire-format reference this implementation is built against, with
+- [`docs/protocol-notes.md`](docs/protocol-notes.md) — the normative
+  iUSB/IVTP wire-format reference this implementation is built against, with
   provenance for every field.
-- [`docs/testing.md`](docs/testing.md) — how to run everything, including the
-  mock servers' fault-injection modes and the CI layout.
 - [`docs/hardware-evidence-2026-08-08.md`](docs/hardware-evidence-2026-08-08.md)
   — the authoritative, dated record of what was actually observed on real
-  hardware, including what is explicitly *not* proven yet.
+  hardware, including what is explicitly not proven yet.
+- [`docs/testing.md`](docs/testing.md) — how to run everything, including the
+  mock servers' fault-injection modes and the CI layout.
+- [`docs/proxmox-autoinstall.md`](docs/proxmox-autoinstall.md) — preparing a
+  stock Proxmox VE ISO so it actually installs unattended, and the evidence
+  behind why that preparation step is necessary at all.
+- [`docs/netboot-design.md`](docs/netboot-design.md) — design research (not
+  yet implemented) for routing the bulk of an install over LAN-speed HTTP via
+  `asmb8_http_origin` instead of the slower native iUSB path.
+- [`docs/roadmap.md`](docs/roadmap.md) — capability gaps and what is planned
+  next, evidenced to the same standard as the rest of this documentation set.
 - [`roles/asmb8_baremetal_install/README.md`](roles/asmb8_baremetal_install/README.md)
   — the end-to-end install role built on top of these modules.
 - [`roles/asmb8_autoinstall_iso/README.md`](roles/asmb8_autoinstall_iso/README.md)
-  and [`docs/proxmox-autoinstall.md`](docs/proxmox-autoinstall.md) — preparing
-  a stock Proxmox VE ISO so it actually installs unattended, and the evidence
-  behind why that preparation step is necessary at all.
-- [SECURITY.md](SECURITY.md) — why this collection warrants unusual care with
-  credentials.
+  — preparing a stock Proxmox VE ISO for genuinely unattended installation.
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability, and why this
+  collection warrants unusual care with credentials.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — local verification sequence and
   tooling traps shared with the sibling collection.

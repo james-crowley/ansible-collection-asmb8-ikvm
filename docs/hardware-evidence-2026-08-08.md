@@ -456,6 +456,70 @@ not been taken yet: a timestamp immediately before and after the client's own
 and the next inbound request arriving (BMC-side turnaround). Whichever side
 that gap lands on is the next real lead — not another socket option.
 
+## A real installer reached 70% and then failed on media read timeouts
+
+Observed 2026-08-09, from the physical console. **The furthest any install has
+got, and the most informative failure recorded here.** Serving the
+vendor-prepared auto-install ISO (`proxmox-auto-install-assistant prepare-iso
+--fetch-from iso`, 1,628 MiB):
+
+```
+INFO: progress  70.2 % - extracting pve-firmware_3.18-3_all.deb
+[  882.138239] I/O error, dev sr0, sector 1662408 op 0x0:(READ) flags 0x80700 phys_seg 2
+[  882.142976] I/O error, dev sr0, sector 1662648 op 0x0:(READ) flags 0x84700 phys_seg 2
+[  882.146847] I/O error, dev sr0, sector 1662888 op 0x0:(READ) flags 0x80700 phys_seg 2
+[  882.149722] I/O error, dev sr0, sector 1662168 op 0x0:(READ) flags 0x800000 phys_seg 1
+installation of package pve-firmware_3.18-3_all.deb failed
+ERROR: Installation failed: low level installer returned early
+Auto-installation failed (exit-code 1) - see above for errors.
+root@pve-test:/#
+```
+
+**What this proves, and it is a lot.** The shell prompt reads `root@pve-test` —
+the `fqdn` from `answer.toml`, applied by the installer. So the answer file was
+found, parsed and acted on; disk targeting was reached; and several hundred
+packages extracted successfully. This is **not** a configuration or answer-file
+problem, and the earlier rounds of answer-file iteration are vindicated rather
+than suspect.
+
+**What failed: media reads went unanswered.** The decisive detail is an absence
+— across the entire 60-minute session the client logged **zero
+`REQUEST_SENSE` (0x03)** commands. When a SCSI device returns an error *status*,
+Linux immediately issues `REQUEST_SENSE` to ask why. It never did. So the guest
+was never told "error"; it simply never got replies in time and its SCSI layer
+timed out. That distinguishes this sharply from the `READ TOC` bug above, where
+we returned *wrong bytes*: here the bytes never arrived.
+
+The sectors are in range and unremarkable. The kernel reports `sr0` in 512-byte
+units, so sector 1662408 is LBA 415602 of an 833,632-LBA image — mid-image, not
+past the end.
+
+Session-side, the same run recorded **32,741 reads, 2,662 MiB served, `err=None`,
+and zero unknown opcodes**. From our side it looked healthy throughout.
+
+**Unexplained, and left unexplained on purpose.** The kernel timestamped those
+errors at **882 s** — about 14.7 minutes after the installer kernel started — but
+the console was observed showing 70% roughly **46 minutes** into the run, and our
+reads continued to flow until minute 60. Those two facts have never been
+reconciled. Do not construct a story that fits one and ignores the other; the
+discriminator would be `dmesg` in full plus `date; cat /proc/uptime` from the
+installer shell, mapping kernel time to wall clock. That was not captured.
+
+**One contributing factor found later.** The host has **no Ethernet link on any
+NIC** — the onboard Intel reports `PXE-E61: Media test failure, check cable` and
+both ConnectX-3 Pro ports report `Link:down`. So `source = "from-dhcp"` in the
+answer file could never have succeeded. That does **not** explain the `sr0`
+errors, which are the media path, not the network — but it would have broken a
+later stage regardless, and it explains why the partially-installed system was
+never reachable afterwards.
+
+**Why this failure class is worth engineering away rather than debugging.**
+Proxmox's own netboot support (`prepare-iso --pxe --pxe-loader ipxe`) loads the
+installer image into RAM as a second initrd before the kernel starts, so an
+install performs **no CD reads at all**. A read timeout mid-extraction stops
+being a bug to explain and becomes impossible by construction. See
+[`netboot-design.md`](netboot-design.md).
+
 ## A sub-megabyte iPXE bootstrap boots over iUSB — confirmed
 
 Observed 2026-08-09. This is the finding the "small bootstrap, bulk over HTTP"
