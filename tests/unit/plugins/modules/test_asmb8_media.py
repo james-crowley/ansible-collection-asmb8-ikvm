@@ -212,6 +212,60 @@ class TestAttachIdempotency:
         spawn.assert_called_once()
 
 
+class TestIdleStreakReporting:
+    """The idle-versus-broken-connection forensic fields (see media_session.py's
+    module docstring and asmb8_media's DOCUMENTATION) must survive the round
+    trip from the daemon's state file through to this module's own result --
+    both via `_status_fields()` and via `operation.observed`, which carries
+    the raw state dict verbatim.
+    """
+
+    def test_status_fields_surfaces_idle_streak_data(self):
+        state = {
+            "state": "attached",
+            "idle_polls": 7,
+            "current_idle_streak": {"started_at": "t0", "polls": 7, "seconds": 14.0},
+            "last_idle_streak": None,
+        }
+        fields = asmb8_media._status_fields(state)
+        assert fields["idle_polls"] == 7
+        assert fields["current_idle_streak"] == {"started_at": "t0", "polls": 7, "seconds": 14.0}
+        assert fields["last_idle_streak"] is None
+
+    def test_status_fields_defaults_idle_polls_to_zero_when_absent(self):
+        fields = asmb8_media._status_fields(None)
+        assert fields["idle_polls"] == 0
+        assert fields["current_idle_streak"] is None
+        assert fields["last_idle_streak"] is None
+
+    def test_polling_an_existing_session_surfaces_idle_streak_via_operation_observed(self, runtime_dir, image):
+        session_id = "idle-reporting-session"
+        media_session._write_state_atomic(
+            runtime_dir,
+            session_id,
+            {
+                "session_id": session_id,
+                "pid": os.getpid(),
+                "state": "attached",
+                "error": None,
+                "bytes_read": 0,
+                "idle_polls": 12,
+                "current_idle_streak": None,
+                "last_idle_streak": {"started_at": "t0", "ended_at": "t1", "polls": 12, "seconds": 24.0},
+            },
+        )
+        _set_module_args(_attach_args(runtime_dir=runtime_dir, image=image, session_id=session_id))
+        with patch("ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.media_session.spawn_session") as spawn:
+            with pytest.raises(AnsibleExitJson) as excinfo:
+                asmb8_media.main()
+        result = excinfo.value.kwargs
+        spawn.assert_not_called()
+        observed = result["operation"]["observed"]
+        assert observed["idle_polls"] == 12
+        assert observed["last_idle_streak"]["polls"] == 12
+        assert observed["last_idle_streak"]["seconds"] == 24.0
+
+
 class TestSingleSessionReclamation:
     """The "eject/reset before insert" step: always run, never a fallback."""
 

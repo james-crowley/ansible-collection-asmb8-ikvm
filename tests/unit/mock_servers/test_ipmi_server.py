@@ -342,6 +342,44 @@ class TestGetMcInfo:
         assert command.get_mci() is None
 
 
+class TestResetBmc:
+    def test_cold_reset_succeeds_with_no_error(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        command.reset_bmc()  # must not raise
+        assert fixture.state.reset_count == 1
+        assert fixture.state.last_reset_mode == "cold"
+
+    def test_warm_reset_via_raw_command_succeeds_with_an_empty_response(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        assert command.raw_command(netfn=0x06, command=0x03, retry=False) == {}
+        assert fixture.state.reset_count == 1
+        assert fixture.state.last_reset_mode == "warm"
+
+    def test_force_reset_rejected_makes_cold_reset_raise(self):
+        fixture = FakeIpmiBmc()
+        fixture.faults.force_reset_rejected = "reset request rejected"
+        command = _connect(fixture)
+        with pytest.raises(real_ipmi_exceptions.IpmiException, match="reset request rejected"):
+            command.reset_bmc()
+        assert fixture.state.reset_count == 0
+
+    def test_force_reset_rejected_makes_warm_reset_return_an_error_key(self):
+        fixture = FakeIpmiBmc()
+        fixture.faults.force_reset_rejected = "reset request rejected"
+        command = _connect(fixture)
+        response = command.raw_command(netfn=0x06, command=0x03, retry=False)
+        assert response == {"error": "reset request rejected"}
+        assert fixture.state.reset_count == 0
+
+    def test_an_unmodelled_raw_command_raises(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        with pytest.raises(real_ipmi_exceptions.IpmiException, match="not modelled"):
+            command.raw_command(netfn=0x04, command=0x2D, retry=False)
+
+
 class TestCommandFactory:
     def test_factory_matches_the_real_command_constructor_signature(self):
         fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
@@ -509,6 +547,29 @@ class TestRealIpmiClientAgainstDouble:
         client = _make_client(monkeypatch, fixture)
         with pytest.raises(RemoteOperationError):
             client.set_boot_device("zzz")
+
+    def test_cold_reset_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        client = _make_client(monkeypatch, fixture)
+        result = client.reset_bmc("cold")
+        assert result == {"mode": "cold"}
+        assert fixture.state.reset_count == 1
+        assert fixture.state.last_reset_mode == "cold"
+
+    def test_warm_reset_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        client = _make_client(monkeypatch, fixture)
+        result = client.reset_bmc("warm")
+        assert result == {"mode": "warm"}
+        assert fixture.state.reset_count == 1
+        assert fixture.state.last_reset_mode == "warm"
+
+    def test_rejected_reset_becomes_remote_operation_error_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        fixture.faults.force_reset_rejected = "reset request rejected"
+        client = _make_client(monkeypatch, fixture)
+        with pytest.raises(RemoteOperationError):
+            client.reset_bmc("cold")
 
     def test_credentials_never_leak_through_a_failure_raised_by_this_double(self, monkeypatch):
         fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)

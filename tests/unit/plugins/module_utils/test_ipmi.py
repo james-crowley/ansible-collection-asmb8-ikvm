@@ -240,6 +240,58 @@ class TestGetMcInfo:
             client.get_mc_info()
 
 
+class TestResetBmc:
+    def test_cold_reset_calls_pyghmis_own_reset_bmc(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.reset_bmc.return_value = None
+        client = make_client(monkeypatch, fake_command)
+        assert client.reset_bmc("cold") == {"mode": "cold"}
+        fake_command.reset_bmc.assert_called_once_with()
+        fake_command.raw_command.assert_not_called()
+
+    def test_warm_reset_uses_raw_command_since_pyghmi_has_no_wrapper(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.raw_command.return_value = {}
+        client = make_client(monkeypatch, fake_command)
+        assert client.reset_bmc("warm") == {"mode": "warm"}
+        fake_command.raw_command.assert_called_once_with(netfn=0x06, command=0x03, retry=False)
+        fake_command.reset_bmc.assert_not_called()
+
+    def test_cold_reset_pyghmi_exception_becomes_remote_operation_error(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.reset_bmc.side_effect = real_ipmi_exceptions.IpmiException("bad completion code")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError):
+            client.reset_bmc("cold")
+
+    def test_warm_reset_pyghmi_exception_becomes_remote_operation_error(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.raw_command.side_effect = real_ipmi_exceptions.IpmiException("bad completion code")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError):
+            client.reset_bmc("warm")
+
+    def test_warm_reset_returned_error_key_becomes_remote_operation_error(self, monkeypatch):
+        # pyghmi's raw_command() does not always raise -- an IPMI-level
+        # completion-code failure is *returned* as {'error': ...} instead,
+        # exactly the shape set_bootdev() also has to handle (see ipmi.py's
+        # docstring). reset_bmc(mode='warm') must handle it the same way.
+        fake_command = Mock()
+        fake_command.raw_command.return_value = {"error": "bad completion code"}
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError, match="rejected"):
+            client.reset_bmc("warm")
+
+    def test_reset_never_leaks_the_password(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.reset_bmc.side_effect = real_ipmi_exceptions.IpmiException(f"rejected password={PASSWORD}")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError) as excinfo:
+            client.reset_bmc("cold")
+        assert PASSWORD not in str(excinfo.value)
+        assert "[REDACTED]" in str(excinfo.value)
+
+
 class TestNoCredentialLeakage:
     def test_operation_failures_never_carry_the_password(self, monkeypatch):
         fake_command = Mock()

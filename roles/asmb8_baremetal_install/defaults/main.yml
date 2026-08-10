@@ -200,14 +200,31 @@ asmb8_baremetal_install_observe_delay: 15
 # value to pass -- but the caller still has to say so.
 #
 # HARDWARE REALITY, decisive for how you set the timeout: this board streams
-# the ISO to the target over iUSB at roughly 800 KB/s with 16-block (32 KB)
+# the ISO to the target over iUSB at roughly 790-800 KB/s with 16-block (32 KB)
 # reads, measured directly. Proxmox's own pve-installer.squashfs alone is 614
 # MB, which is 13+ MINUTES of streaming for that one file, before the installer
-# even starts running against it. The default below is generous accordingly.
-# Do not shrink it casually, and do not interpret a long, quiet wait as this
-# role having hung -- see README.md's note on this and on idle sessions being
-# normal and unbounded (up to 130 consecutive seconds with zero requests,
-# measured directly, while the host sat at a bootloader menu).
+# even starts running against it. Do not shrink this casually, and do not
+# interpret a long, quiet wait as this role having hung -- see README.md's
+# note on this and on idle sessions being normal and unbounded (up to 130
+# consecutive seconds with zero requests, measured directly, while the host
+# sat at a bootloader menu).
+#
+# THIS VALUE WAS RAISED FOR A REASON, NOT A GUESS: a real, unattended Proxmox
+# install against the target hardware was killed by the previous default
+# (3600s / one hour) at 70% complete -- the install genuinely needed more
+# time, not less. The arithmetic behind the new value (see README.md's
+# "Expected duration" section for the full derivation, including how to size
+# your own value for a different ISO):
+#   1. Raw transfer floor: a 1,628 MiB ISO at ~790 KB/s is
+#      1628*1024/790 ~= 2,111s (~35.2 minutes) just to stream once.
+#   2. What the real failure implies: 70% done at the old 3,600s cutoff
+#      extrapolates linearly to a full run needing >= 3600/0.70 ~= 5,143s
+#      (~85.7 minutes) -- a FLOOR derived from an incomplete run, likely an
+#      underestimate of the true total.
+#   3. New default (7200s / two hours) sits ~40% above that 85.7-minute
+#      floor and >3x the raw transfer floor, to absorb idle stretches and
+#      postinstall configuration the transfer-time figure alone does not
+#      capture.
 #
 # Also decisive: the stock-ISO limitation above. If asmb8_baremetal_install_iso_path
 # points at an unprepared installer ISO, the host stops at a keypress-driven
@@ -217,7 +234,7 @@ asmb8_baremetal_install_observe_delay: 15
 asmb8_baremetal_install_wait_for_handoff: true
 asmb8_baremetal_install_handoff_host: null
 asmb8_baremetal_install_handoff_port: 22
-asmb8_baremetal_install_handoff_timeout: 3600
+asmb8_baremetal_install_handoff_timeout: 7200
 asmb8_baremetal_install_handoff_delay: 120
 
 # ---------------------------------------------------------------------------

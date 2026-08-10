@@ -34,3 +34,5 @@ action_groups:
     - asmb8_media
     - asmb8_redirection
     - asmb8_console
+    - asmb8_reset
+    - asmb8_http_origin

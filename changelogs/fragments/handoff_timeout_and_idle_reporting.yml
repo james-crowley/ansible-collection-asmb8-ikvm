@@ -1,0 +1,15 @@
+bugfixes:
+  - >-
+    asmb8_baremetal_install - raise the default ``asmb8_baremetal_install_handoff_timeout``
+    from ``3600`` to ``7200`` seconds. A real, unattended Proxmox install against the
+    target hardware was killed by the old one-hour default at 70% complete; see the
+    role's README ("Expected duration") for the sizing arithmetic and how to compute a
+    value for your own ISO.
+minor_changes:
+  - >-
+    asmb8_media - the background media session's state file now records idle-streak
+    bookkeeping (``idle_polls``, ``current_idle_streak``, ``last_idle_streak``,
+    ``idle_poll_interval_seconds``) so a post-mortem can separate a healthy, expected
+    idle period from a connection that actually broke, instead of relying on a single
+    point-in-time read of ``updated_at``. Surfaced under ``operation.observed`` on every
+    ``asmb8_media`` call.

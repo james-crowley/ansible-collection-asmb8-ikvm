@@ -147,6 +147,10 @@ class TestInitialStateRecord:
             "last_request_at",
             "started_at",
             "updated_at",
+            "idle_polls",
+            "idle_poll_interval_seconds",
+            "current_idle_streak",
+            "last_idle_streak",
         ):
             assert key in record, f"missing documented field {key!r}"
         assert record["state"] == media_session.STATE_STARTING
@@ -154,6 +158,10 @@ class TestInitialStateRecord:
         assert record["bytes_read"] == 0
         assert record["sectors_served"] == 0
         assert record["last_request_at"] is None
+        assert record["idle_polls"] == 0
+        assert record["idle_poll_interval_seconds"] == media_session._RECV_POLL_TIMEOUT
+        assert record["current_idle_streak"] is None
+        assert record["last_idle_streak"] is None
 
     def test_never_contains_a_password_or_token_shaped_field(self):
         record = media_session._initial_state(session_id="abc", endpoint=EXAMPLE_ENDPOINT, pid=4242, image="/srv/x.iso")
@@ -186,6 +194,41 @@ class TestInitialStateRecord:
         media_session._write_state_if_absent(tmp_path, "abc", media_session._initial_state(session_id="abc", endpoint=EXAMPLE_ENDPOINT, pid=1, image="x"))
         mode = stat.S_IMODE(media_session.state_file_path(tmp_path, "abc").stat().st_mode)
         assert mode == 0o600
+
+
+class TestCloseIdleStreak:
+    """Unit tests for the pure `_close_idle_streak` helper, isolated from the
+    real daemon loop (see `TestRunDaemonIdleHandling` below for that).
+    """
+
+    def test_no_open_streak_is_a_noop(self):
+        state = {"current_idle_streak": None, "last_idle_streak": None}
+        media_session._close_idle_streak(state, now="2026-01-01T00:00:10+00:00")
+        assert state["current_idle_streak"] is None
+        assert state["last_idle_streak"] is None
+
+    def test_an_open_streak_is_moved_to_last_idle_streak_with_an_ended_at(self):
+        state = {
+            "current_idle_streak": {"started_at": "2026-01-01T00:00:00+00:00", "polls": 3, "seconds": 6.0},
+            "last_idle_streak": None,
+        }
+        media_session._close_idle_streak(state, now="2026-01-01T00:00:06+00:00")
+        assert state["current_idle_streak"] is None
+        assert state["last_idle_streak"] == {
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "polls": 3,
+            "seconds": 6.0,
+            "ended_at": "2026-01-01T00:00:06+00:00",
+        }
+
+    def test_closing_a_streak_overwrites_whatever_last_idle_streak_previously_held(self):
+        state = {
+            "current_idle_streak": {"started_at": "t2", "polls": 1, "seconds": 2.0},
+            "last_idle_streak": {"started_at": "t0", "ended_at": "t1", "polls": 5, "seconds": 10.0},
+        }
+        media_session._close_idle_streak(state, now="t3")
+        assert state["last_idle_streak"]["started_at"] == "t2"
+        assert state["last_idle_streak"]["ended_at"] == "t3"
 
 
 # ===========================================================================
@@ -573,6 +616,70 @@ class TestRunDaemonIdleHandling:
         final = media_session.read_state(harness.runtime_dir, "idle-session")
         assert final["updated_at"] > final["started_at"]
         assert final["last_request_at"] is None  # never any real traffic in this script
+
+    def test_idle_streak_accumulates_polls_and_seconds_while_quiet(self, harness):
+        script = self._handshake() + ["idle"] * 5 + [_kill_frame()]
+        final = harness(script)
+        # The streak is still open at kill time (a kill frame is not a real
+        # SCSI request, so it never closes it via _on_request) -- see
+        # _close_idle_streak's own docstring: a normal serve_forever exit
+        # closes whatever was open, so this shows up as last_idle_streak, not
+        # current_idle_streak, in the FINAL persisted state.
+        assert final["current_idle_streak"] is None
+        assert final["last_idle_streak"]["polls"] == 5
+        assert final["last_idle_streak"]["seconds"] == 5 * media_session._RECV_POLL_TIMEOUT
+        assert final["last_idle_streak"]["started_at"] is not None
+        assert final["last_idle_streak"]["ended_at"] is not None
+        assert final["idle_polls"] == 5
+
+    def test_a_real_request_closes_the_streak_into_last_idle_streak(self, harness):
+        script = self._handshake() + ["idle"] * 3 + [_read_capacity_frame(sequence_number=9)] + [_kill_frame()]
+        final = harness(script)
+        # last_idle_streak reflects the pre-request quiet stretch (3 polls),
+        # not anything after the request resumed traffic.
+        assert final["last_idle_streak"]["polls"] == 3
+        assert final["idle_polls"] == 3
+        # current_idle_streak was cleared by the request and never reopened
+        # (the kill frame arrives immediately after, with no further idle).
+        assert final["current_idle_streak"] is None
+
+    def test_last_idle_streak_is_not_clobbered_by_a_second_shorter_quiet_stretch(self, harness):
+        # A second, SHORTER idle stretch after new traffic must not silently
+        # look identical to the first, longer one in a naive read of the
+        # final state -- last_idle_streak always reflects the MOST RECENT
+        # closed streak, which is exactly what a post-mortem needs, not
+        # necessarily the longest one ever seen.
+        script = self._handshake() + ["idle"] * 10 + [_read_capacity_frame(sequence_number=9)] + ["idle"] * 2 + [_kill_frame()]
+        final = harness(script)
+        assert final["last_idle_streak"]["polls"] == 2
+        assert final["idle_polls"] == 12  # lifetime total across both streaks
+
+    def test_idle_polls_is_a_lifetime_counter_not_reset_by_a_request(self, harness):
+        script = self._handshake() + ["idle"] * 4 + [_read_capacity_frame(sequence_number=9)] + ["idle"] * 6 + [_kill_frame()]
+        final = harness(script)
+        assert final["idle_polls"] == 10
+
+    def test_no_idle_at_all_leaves_both_streak_fields_null(self, harness):
+        script = [*self._handshake(), _read_capacity_frame(sequence_number=9), _kill_frame()]
+        final = harness(script)
+        assert final["current_idle_streak"] is None
+        assert final["last_idle_streak"] is None
+        assert final["idle_polls"] == 0
+
+    def test_a_wire_fault_leaves_the_idle_streak_open_not_force_closed(self, harness):
+        # The exception path (any IkvmError escaping serve_forever without a
+        # real request ever having succeeded first) deliberately does NOT
+        # call _close_idle_streak -- see that function's own docstring on why
+        # "idle right up until this failure" is itself useful forensic
+        # signal, not something to erase.
+        bad_header = bytearray(iusb.Header(data_packet_len=0).marshal())
+        bad_header[0:8] = b"XXXX    "
+        script = [*self._handshake(), "idle", "idle", bytes(bad_header)]
+        final = harness(script)
+        assert final["state"] == media_session.STATE_ERROR
+        assert final["current_idle_streak"] is not None
+        assert final["current_idle_streak"]["polls"] == 2
+        assert final["last_idle_streak"] is None
 
     def test_peer_closing_the_connection_is_recorded_as_detached_not_error(self, harness):
         script = [*self._handshake(), "idle", "eof"]

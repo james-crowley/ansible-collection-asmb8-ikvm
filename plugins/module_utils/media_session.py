@@ -15,11 +15,37 @@ about this module, are the two facts the task brief calls out explicitly:
    host sitting at a bootloader menu), then reads resumed normally. The serve
    loop this module drives (``iusb.Session.serve_forever``) never raises on
    an idle socket -- see that method's docstring -- and this module's own
-   idle callback only refreshes ``updated_at`` as a heartbeat; it never ends
-   the session. A caller debugging a slow install needs to be able to tell
-   "idle because the installer is waiting for input" from "dead": that is
-   exactly what ``last_request_at`` (set only on real traffic) versus
-   ``updated_at`` (refreshed on every poll, idle or not) is for.
+   idle callback refreshes ``updated_at`` as a heartbeat; it never ends the
+   session. A caller debugging a slow install needs to be able to tell "idle
+   because the installer is waiting for input" from "dead": that is exactly
+   what ``last_request_at`` (set only on real traffic) versus ``updated_at``
+   (refreshed on every poll, idle or not) is for.
+
+   A real incident sharpened this further: a trace showed stretches of zero
+   reads that were read, at the time, as "the installer is unpacking
+   packages" -- when at least one such stretch may actually have been a
+   network outage between the controller and the BMC (the guest logged SCSI
+   timeouts and I/O errors during the same window, and critically **zero**
+   ``REQUEST_SENSE`` commands, meaning it never received an error status at
+   all -- a timeout signature, not an error-reply one). ``updated_at`` alone,
+   read once after the fact, cannot answer "how long was that quiet stretch,
+   and when did it start/end" -- it is a single mutable timestamp, not a
+   history. ``current_idle_streak``/``last_idle_streak``/``idle_polls``
+   (below, all populated by :func:`_run_daemon`'s idle/request callbacks) are
+   this module's answer: not real-time network-failure detection (an idle
+   timeout at a frame boundary -- see ``iusb.IdleTimeout``'s own docstring --
+   carries no information about *why* nothing arrived, whether the peer is
+   genuinely quiet or the network briefly died between two requests), but
+   enough recorded start/end timestamps and durations for a post-mortem to
+   cross-reference a suspicious quiet stretch against independent evidence
+   (the guest's own kernel log timestamps, BMC logs, network monitoring) after
+   the fact. A connection that has actually broken -- a stalled read
+   mid-frame, not at a boundary, or a socket error -- is unaffected by any of
+   this and is reported the way it always was: ``state=error`` with a real
+   ``error_class`` (most often ``connection``) and a message naming the
+   fault; see ``iusb.SocketTransport.recv_exact``'s own idle-at-boundary
+   versus stalled-mid-frame split, which this module builds on top of but
+   does not modify.
 2. **The media slot is single-occupancy, board-wide, with no server-side
    reclaim.** Unlike IDE-R, this is not scoped to one ``session_id`` this
    collection's own runtime_dir happens to track -- it is one slot for the
@@ -204,6 +230,12 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
     anything) -- and, per the sibling collection's own hard-won lesson, they
     must never disagree on shape. Factored into one function so a new key
     added here reaches both writers by construction.
+
+    ``idle_polls``/``idle_poll_interval_seconds``/``current_idle_streak``/
+    ``last_idle_streak`` are the idle-versus-broken forensic fields described
+    in this module's own docstring point 1 -- populated by :func:`_run_daemon`'s
+    ``_on_idle``/``_on_request`` callbacks and :func:`_close_idle_streak`,
+    never by anything outside this file.
     """
     now = _now_iso()
     return {
@@ -219,7 +251,31 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
         "last_request_at": None,
         "started_at": now,
         "updated_at": now,
+        "idle_polls": 0,
+        "idle_poll_interval_seconds": _RECV_POLL_TIMEOUT,
+        "current_idle_streak": None,
+        "last_idle_streak": None,
     }
+
+
+def _close_idle_streak(state: dict[str, Any], *, now: str) -> None:
+    """Close the in-progress idle streak (if any) into ``last_idle_streak``.
+
+    Called when a real request arrives after a quiet spell, and again after
+    the serve loop exits normally (see :func:`_run_daemon`), so the state
+    file always shows how long the MOST RECENT stretch of silence lasted --
+    not merely whether one happens to be open right now -- even once new
+    traffic has resumed or the session has ended. Deliberately NOT called on
+    the exception path: if the daemon crashed mid-read, ``current_idle_streak``
+    left open (rather than force-closed here) accurately shows "idle right up
+    until this failure", which is itself useful forensic signal, not a bug to
+    paper over.
+    """
+    streak = state.get("current_idle_streak")
+    if streak is None:
+        return
+    state["last_idle_streak"] = {**streak, "ended_at": now}
+    state["current_idle_streak"] = None
 
 
 def _write_state_if_absent(runtime_dir: str | os.PathLike[str], session_id: str, data: dict[str, Any]) -> bool:
@@ -580,8 +636,12 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
     endpoint = f"{config.host}:{config.cd_port}"
     state: dict[str, Any] = _initial_state(session_id=config.session_id, endpoint=endpoint, pid=os.getpid(), image=config.image)
 
-    def _persist() -> None:
-        state["updated_at"] = _now_iso()
+    def _persist(now: str | None = None) -> None:
+        # Accepts an already-computed timestamp so a caller that needs "now"
+        # for more than just this heartbeat (the idle-streak bookkeeping
+        # below) spends exactly one _now_iso() call, not two slightly
+        # different ones.
+        state["updated_at"] = now if now is not None else _now_iso()
         _write_state_atomic(config.runtime_dir, config.session_id, state)
 
     # Claim the state file immediately, before opening the image or touching
@@ -663,19 +723,44 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
         _persist()
 
         def _on_idle() -> None:
-            # Heartbeat only -- see the module docstring point 1. updated_at moves;
-            # last_request_at does not, so a caller can tell "idle" from "dead" and
-            # "idle" from "still actively serving reads".
-            _persist()
+            # Heartbeat (updated_at moves; last_request_at does not, so a caller
+            # can tell "idle" from "dead") PLUS the idle-streak bookkeeping this
+            # module's docstring point 1 describes: how long has the CURRENT
+            # quiet stretch run so far, and how many lifetime idle polls has
+            # this session seen. One _now_iso() call, reused for both the
+            # streak timestamp and the heartbeat itself.
+            now = _now_iso()
+            streak = state.get("current_idle_streak")
+            if streak is None:
+                state["current_idle_streak"] = {"started_at": now, "polls": 1, "seconds": _RECV_POLL_TIMEOUT}
+            else:
+                streak["polls"] += 1
+                streak["seconds"] = streak["polls"] * _RECV_POLL_TIMEOUT
+            state["idle_polls"] += 1
+            _persist(now)
 
         def _on_request(_req: iusb.Packet) -> None:
+            # Real traffic ends whatever idle streak was in progress -- see
+            # _close_idle_streak's docstring: the closed streak stays visible
+            # in last_idle_streak even after this line moves on. One
+            # _now_iso() call, shared by the streak close, last_request_at,
+            # and the heartbeat.
+            now = _now_iso()
+            _close_idle_streak(state, now=now)
             state["bytes_read"] = device.bytes_served()
             state["sectors_served"] = device.blocks_served()
-            state["last_request_at"] = _now_iso()
-            _persist()
+            state["last_request_at"] = now
+            _persist(now)
 
         outcome = session.serve_forever(device, should_stop=lambda: _stop_flag, on_idle=_on_idle, on_request=_on_request)
 
+        # A normal exit (stopped/peer-closed/killed) may happen while a streak
+        # is still open -- e.g. the session ended during what looked, up to
+        # that point, like ordinary idle. Close it here so the final state
+        # still shows how long that last stretch ran. Deliberately NOT done on
+        # the exception path below -- see _close_idle_streak's own docstring.
+        now = _now_iso()
+        _close_idle_streak(state, now=now)
         state["bytes_read"] = device.bytes_served()
         state["sectors_served"] = device.blocks_served()
         if outcome == iusb.SERVE_STOPPED:
@@ -687,7 +772,7 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
         else:  # iusb.SERVE_KILLED
             state["state"] = STATE_DETACHED
             state["error"] = "BMC sent a redirection-terminate (opcode 0xF6)"
-        _persist()
+        _persist(now)
     except IkvmError as exc:
         _fail(str(exc), error_class=exc.error_class)
     except Exception as exc:  # last-resort: the daemon has no other way to report a crash.

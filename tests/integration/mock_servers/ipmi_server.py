@@ -148,6 +148,19 @@ it, never re-derived independently:
   ``pyghmi.exceptions.IpmiException`` with a caller-chosen message for
   anything that should classify as neither (this collection's
   ``error_class=remote_operation``/``connection`` catch-all).
+* ``Command.reset_bmc()`` (Cold Reset, netfn 0x06 cmd 0x02) calls
+  ``raw_command(netfn=6, command=2, retry=False)`` internally and raises only
+  if the response carries an ``'error'`` key; it returns nothing itself. Warm
+  Reset (netfn 0x06 cmd 0x03) has no pyghmi wrapper at all, so ``ipmi.py``'s
+  ``IpmiClient.reset_bmc(mode='warm')`` calls ``raw_command()`` directly with
+  that command byte. :meth:`FakeIpmiCommand.reset_bmc`/:meth:`raw_command`
+  model both: a normal call succeeds with an empty response (matching the
+  live capture against the target board, which observed completion code 0
+  and no ``'error'`` key for Cold Reset);
+  :attr:`IpmiFaultConfig.force_reset_rejected`, when set, makes either
+  command byte return ``{'error': ...}`` instead, standing in for the BMC
+  actively rejecting the reset rather than this fixture simply not modelling
+  it yet.
 """
 
 from __future__ import annotations
@@ -245,6 +258,14 @@ KNOWN_POWER_STATES = frozenset({"on", "off", "reset", "shutdown", "softoff", "bo
 #: regardless of `wait`.
 _CONFIRMABLE_STATES = frozenset({"on", "off", "shutdown", "softoff"})
 
+#: The two BMC self-reset (netfn, command) pairs this fixture models, mapped
+#: to the mode name `ipmi.py`'s `IpmiClient.reset_bmc()` uses -- Cold Reset
+#: (0x06/0x02, VERIFIED LIVE against the target board: completion code 0, no
+#: 'error' key) and Warm Reset (0x06/0x03, not independently verified live --
+#: see ipmi.py's docstring). Any other (netfn, command) pair reaching
+#: `FakeIpmiCommand.raw_command()` is not modelled by this fixture.
+RESET_COMMANDS = {(0x06, 0x02): "cold", (0x06, 0x03): "warm"}
+
 
 @dataclass
 class IpmiBmcState:
@@ -261,6 +282,11 @@ class IpmiBmcState:
     #: field's docstring on `FakeIpmiBmc`.
     boot_ever_set: bool = False
     mc_info: str | None = DEFAULT_MC_INFO
+    #: Lifetime count of successful self-resets this fixture has accepted,
+    #: split by mode -- purely for a test's own diagnostics; nothing in
+    #: `ipmi.py` reads this back.
+    reset_count: int = 0
+    last_reset_mode: str | None = None
 
 
 @dataclass
@@ -298,6 +324,13 @@ class IpmiFaultConfig:
     #: the underlying transition still applies before this is raised, exactly
     #: as ipmi.py's own docstring describes the real failure.
     force_power_wait_timeout: bool = False
+    #: `raw_command()` for either reset command byte (see
+    #: :data:`RESET_COMMANDS`) returns `{'error': ...}` with this text
+    #: instead of applying the reset, standing in for the BMC actively
+    #: rejecting the request. `None` (the default) means every modelled
+    #: reset command succeeds -- matching the live capture against the
+    #: target board for Cold Reset.
+    force_reset_rejected: str | None = None
 
 
 class FakeIpmiBmc:
@@ -498,6 +531,37 @@ class FakeIpmiCommand:
         self._fixture.load()
         return self._fixture.state.mc_info
 
+    # -- self-reset ------------------------------------------------------------
+
+    def reset_bmc(self) -> None:
+        """Cold Reset (netfn 0x06 cmd 0x02) -- mirrors pyghmi's own real
+        `Command.reset_bmc()`: calls `raw_command()` and raises only if the
+        response carries an 'error' key. Returns nothing itself, exactly like
+        the real method (see ipmi.py's docstring).
+        """
+        response = self.raw_command(netfn=0x06, command=0x02, retry=False)
+        if response and "error" in response:
+            raise ipmi_exceptions.IpmiException(response["error"])
+
+    def raw_command(self, *, netfn: int, command: int, retry: bool = True, **_ignored: Any) -> dict[str, Any]:
+        """Stand-in for `pyghmi.ipmi.command.Command.raw_command()`.
+
+        Only the two reset (netfn, command) pairs this fixture models (see
+        :data:`RESET_COMMANDS`) are recognised; anything else raises, since
+        this fixture has no basis to fabricate a response for a command it
+        was never asked to model.
+        """
+        self._fixture.load()
+        mode = RESET_COMMANDS.get((netfn, command))
+        if mode is None:
+            raise ipmi_exceptions.IpmiException(f"raw_command netfn=0x{netfn:02x} command=0x{command:02x} is not modelled by this fixture")
+        if self._fixture.faults.force_reset_rejected:
+            return {"error": self._fixture.faults.force_reset_rejected}
+        self._fixture.state.reset_count += 1
+        self._fixture.state.last_reset_mode = mode
+        self._fixture._save()
+        return {}
+
 
 __all__ = [
     "AUTH_FAILURE_MESSAGE",
@@ -507,6 +571,7 @@ __all__ = [
     "DEFAULT_USERNAME",
     "KNOWN_BOOT_DEVICES",
     "KNOWN_POWER_STATES",
+    "RESET_COMMANDS",
     "SET_POWER_WAIT_TIMEOUT_MESSAGE",
     "UNREACHABLE_MESSAGE",
     "FakeIpmiBmc",

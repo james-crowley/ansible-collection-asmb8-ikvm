@@ -456,6 +456,56 @@ not been taken yet: a timestamp immediately before and after the client's own
 and the next inbound request arriving (BMC-side turnaround). Whichever side
 that gap lands on is the next real lead — not another socket option.
 
+## Redirection rejection status `3` — an undocumented refusal code
+
+Observed 2026-08-09, after the events above. Every attempt to attach virtual
+media began failing with the client's own, correct diagnosis:
+
+```
+AckError: vmedia: redirection not accepted (status 3)
+```
+
+This matters for two reasons.
+
+**First, `3` is not a status this project had seen before.** `iusb.py` names
+exactly three connection-status values, all sourced from the decompiled vendor
+client: `CONN_OK = 1`, `CONN_ERR_IN_USE_5 = 5`, `CONN_ERR_IN_USE_8 = 8`. Since
+both known failures mean "already in use", and `3` is neither, **`3` is
+something other than occupancy** — most plausibly a refusal by configuration or
+policy rather than by contention. Its meaning is **not established**; do not
+guess at it in code or docs until it is sourced.
+
+**Second, the failure signature is easy to misread.** The symptoms were:
+
+- TCP to port 5120 **connected** and stayed `ESTABLISHED`
+- 62 bytes sat **unread** in the socket's receive queue
+- **zero** SCSI commands were ever serviced
+- the log line `vmedia: redirection accepted (instance 0, port 5120)` — present
+  in every successful run — was **absent**
+
+So *an established connection is not evidence that media is being served.* The
+presence or absence of that "redirection accepted" line is the discriminator,
+and it is the thing to check first when media appears attached but the host
+reads nothing. A 30-second attach-only probe distinguishes this from every
+other failure mode without spending a boot cycle, and is far cheaper than
+inferring from a read trace.
+
+What is **not** yet known: what actually caused it. Two observations bound the
+question. It first appeared after a session was orphaned by a network outage
+that cut the controller off mid-install — and `cd-media` allows one session
+with **no** server-side timeout, so an orphaned session is not self-clearing.
+But a BMC cold reset (netfn `0x06` cmd `0x02`, completion code 0) did **not**
+clear it, which argues against simple occupancy and is consistent with `3`
+meaning something configuration-shaped. A candidate worth checking before
+anything else: whether the reset reverted the media-redirection or
+media-encryption settings that had been set manually in the web UI, since the
+client cannot speak the encrypted variant.
+
+Also recorded from that cold reset, since it is directly useful: the host was
+**unaffected** and stayed powered on, and recovery was **staged** — ICMP and
+IPMI (UDP 623) answered several minutes before TCP 443 did. A readiness check
+keyed on ping therefore reports success while the web stack is still down.
+
 ## Still unproven — do not claim these
 
 - **Whether the guest OS can obtain its own media session.** Once Linux boots it
@@ -472,6 +522,14 @@ that gap lands on is the next real lead — not another socket option.
   only CD-ROM has been exercised.
 - **Any board other than this one.** One machine, one firmware version. This is
   repeatability at best, not a compatibility guarantee.
+- **The meaning of redirection status `3`.** Reproducibly refuses media attach
+  and is not one of the two known "in use" codes. Cause and meaning both
+  unestablished — see the section above.
+- **Whether this board boots a small iPXE image over iUSB.** A custom iPXE build
+  with an embedded chain script was produced at **0.89 MiB** — against a 1,628
+  MiB installer ISO, that is what the bootstrap approach rests on. It has **not**
+  been booted on hardware: both attempts were blocked by the status `3` refusal
+  above, so nothing is yet known about whether the board accepts it.
 - **The cause of the residual ~30 ms per read** (network RTT to the BMC is
   ~5 ms). `TCP_NODELAY` was tried and produced no measurable change in a
   controlled A/B test, which rules it out as the dominant cause but does not

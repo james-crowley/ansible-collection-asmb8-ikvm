@@ -69,6 +69,50 @@ making a single request against any real BMC. Specifically:
   ``self._oem.get_oem_identifier()`` or the result of a DCMI fetch helper,
   neither dict-shaped) and by the maintainer's live capture. Do not write a
   caller that treats this like ``get_power()``/``get_bootdev()``.
+* ``Command.reset_bmc()`` (``command.py:409-413``) issues Cold Reset (netfn
+  ``0x06`` cmd ``0x02``) via ``self.raw_command(netfn=6, command=2,
+  retry=False)`` and raises ``exc.IpmiException(response['error'])`` only if
+  the response carries an ``'error'`` key; it returns nothing itself. Warm
+  Reset (netfn ``0x06`` cmd ``0x03``) has no dedicated pyghmi wrapper at
+  all -- confirmed by reading ``command.py`` end to end, the same way every
+  other fact above was sourced -- so :meth:`IpmiClient.reset_bmc` issues it
+  the identical way ``reset_bmc()`` issues Cold Reset internally: a bare
+  ``raw_command(netfn=6, command=3, retry=False)`` plus the same
+  ``'error' in response`` check. This is reproduction of an existing,
+  already-standard pattern for the sibling command byte, not new protocol
+  invention.
+
+  **Live capture against the target board (ASUS ASMB8-iKVM), Cold Reset
+  only** -- the maintainer issued ``c.raw_command(netfn=0x06, command=0x02)``
+  directly and observed:
+
+  - The response was ``{'netfn': 7, 'command': 2, 'code': 0, 'data':
+    bytearray(b'')}`` -- completion code 0, i.e. no ``'error'`` key, exactly
+    the success shape :meth:`IpmiClient.reset_bmc` checks for.
+  - The host stayed powered on and completely unaffected throughout: a
+    ``get_power()`` immediately before the reset read ``{'powerstate':
+    'on'}``, and the host never rebooted. A BMC self-reset (either mode) is a
+    management-controller-only operation, confirmed live, not an inference
+    from the IPMI spec alone.
+  - Recovery of the BMC afterwards was staged, not instantaneous or uniform
+    across services: ICMP answered noticeably before the ``.asp`` web/HTTPS
+    stack (port 443) did. No exact duration was captured for either stage,
+    so this collection does not assert one; a caller that must know the BMC
+    is back should poll the specific service it actually depends on (IPMI
+    itself, via a fresh :class:`IpmiClient`/``asmb8_info``, or HTTPS) rather
+    than ICMP, which recovers first and is not evidence the management stack
+    is usable yet.
+  - The on-demand iUSB media listener (port 5120) was closed immediately
+    after the reset -- expected and normal, not a fault: that port is bound
+    only after a JNLP fetch allocates a session (see ``asp.py``'s
+    ``allocate_media_session``), and a reset drops every session, so nothing
+    has allocated it yet.
+
+  Warm Reset was not exercised live by that capture; nothing above should be
+  read as observed for that mode. It is expected to share the same
+  host-unaffected property (both modes are netfn ``0x06`` App-group
+  management-controller self-resets, not chassis-power operations), but that
+  expectation is not itself a live observation.
 """
 
 from __future__ import annotations
@@ -131,6 +175,15 @@ _AUTH_FAILURE_MARKERS = ("password", "rakp", "unauthorized", "wrong kg")
 #: observed worker-pool saturation; nothing analogous has been observed or
 #: sourced for this BMC's IPMI listener).
 _TIMEOUT_MARKER = "timeout"
+
+#: Standard IPMI App-group netfn (0x06) both self-reset commands live under.
+#: Cold Reset is command 0x02 (pyghmi's own `Command.reset_bmc()` wraps this
+#: exact byte pair -- `command.py:409-413`); Warm Reset is command 0x03, for
+#: which pyghmi ships no wrapper at all. See this module's docstring for the
+#: full citation, including the live capture confirming Cold Reset's
+#: acceptance shape on the target board.
+_RESET_NETFN = 0x06
+_WARM_RESET_COMMAND = 0x03
 
 
 def _classify_session_error(message: str) -> type[AuthenticationError | TimeoutError_ | ConnectionError_]:
@@ -305,3 +358,49 @@ class IpmiClient:
         if identifier is None:
             return None
         return str(identifier)
+
+    # --- self-reset -----------------------------------------------------------
+
+    def reset_bmc(self, mode: str) -> dict[str, Any]:
+        """Issue a BMC self-reset. ``mode`` is ``'cold'`` or ``'warm'``.
+
+        Drops every active BMC session -- IPMI, the ``.asp`` web session, and
+        any iUSB/KVM media session in flight -- see `asmb8_reset`'s own
+        DOCUMENTATION for what that means operationally. This method never
+        waits for the BMC to come back: there is nothing pyghmi (or the raw
+        IPMI command) gives us to poll for after a self-reset, the same
+        "fire and forget" reasoning `set_power_state` already documents for
+        chassis-level ``reset``/``boot``.
+
+        ``mode='cold'`` calls pyghmi's own ``Command.reset_bmc()`` directly --
+        the call this module's docstring cites as VERIFIED LIVE against the
+        target board. ``mode='warm'`` has no pyghmi wrapper, so it is issued
+        the identical way ``reset_bmc()`` issues Cold Reset internally: a bare
+        ``raw_command(netfn=0x06, command=0x03, retry=False)``, checked for
+        the same ``'error'`` key. Both of pyghmi's two failure shapes for this
+        call are handled the same way :meth:`set_boot_device` already handles
+        them for ``set_bootdev()`` -- a raised exception, or a returned dict
+        carrying an ``'error'`` key -- both become
+        :class:`errors.RemoteOperationError`.
+        """
+        try:
+            if mode == "cold":
+                self._command.reset_bmc()
+                response: dict[str, Any] = {}
+            else:
+                response = dict(self._command.raw_command(netfn=_RESET_NETFN, command=_WARM_RESET_COMMAND, retry=False) or {})
+        except ipmi_exceptions.PyghmiException as exc:
+            raise RemoteOperationError(
+                f"IPMI {mode} reset failed: {exc}",
+                endpoint=self._endpoint,
+                operation="reset_bmc",
+                secrets=self._known_secrets(),
+            ) from exc
+        if "error" in response:
+            raise RemoteOperationError(
+                f"IPMI {mode} reset was rejected: {response['error']}",
+                endpoint=self._endpoint,
+                operation="reset_bmc",
+                secrets=self._known_secrets(),
+            )
+        return {"mode": mode, **response}

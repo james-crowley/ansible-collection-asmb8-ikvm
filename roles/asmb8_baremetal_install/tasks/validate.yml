@@ -75,7 +75,8 @@
   # defaults/main.yml's comment on this variable. Refusing here, before probe,
   # before attach, before the reset, is strictly cheaper than discovering a wrong
   # guess after burning the full asmb8_baremetal_install_handoff_timeout (default
-  # 3600s) on a machine that may have installed perfectly.
+  # 7200s -- see defaults/main.yml's comment on this variable for the sizing
+  # arithmetic) on a machine that may have installed perfectly.
   ansible.builtin.assert:
     that:
       - asmb8_baremetal_install_handoff_host is truthy

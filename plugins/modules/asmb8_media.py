@@ -34,6 +34,21 @@ description:
     caller can tell "quiet because idle" from "quiet because the background process died" by
     comparing it against O(attach_timeout)-scale polling, not by assuming any fixed idle bound.
   - >-
+    B(An idle-looking stretch of silence is not automatically evidence of a healthy connection --
+    only of the absence, so far, of a reported failure.) A real incident produced exactly this
+    ambiguity: a stretch of zero reads was read, at the time, as "the installer is unpacking
+    packages", when it may in fact have coincided with a brief network outage between the
+    controller and the BMC (the guest logged SCSI timeouts with zero C(REQUEST_SENSE) commands,
+    meaning it was never answered at all, not answered with an error). Two fields exist to make a
+    stretch of silence reviewable after the fact against independent evidence: the still-open
+    stretch of silence, if any (RV(operation.observed.current_idle_streak)), and the most
+    recently closed one, which survives new traffic resuming (RV(operation.observed.last_idle_streak)) --
+    see the C(asmb8_baremetal_install) role's README.md, "Distinguishing idle from a broken
+    connection", for the full reasoning. A connection that has genuinely broken (as opposed to
+    merely gone quiet) is unaffected by any of this: it still reports
+    RV(ignore:session_state) V(error) with a real RV(ignore:error_class), most often V(connection),
+    naming the fault.
+  - >-
     B(The BMC's iUSB/KVM media service allows exactly one active session, board-wide, and never
     reclaims an abandoned one on its own.) There is no server-side timeout for this: a session
     left attached by a previous, uncleanly-terminated run holds the slot forever until something
@@ -344,6 +359,59 @@ operation:
         started_at:
           description: Controller-clock ISO-8601 timestamp of when the background process started.
           type: str
+        idle_polls:
+          description: >-
+            Lifetime count of idle heartbeats (poll timeouts with zero bytes at a fresh frame
+            boundary -- see C(plugins/module_utils/iusb.py)'s C(IdleTimeout)) this session has
+            observed. A coarse "how quiet has this session been overall" figure; see
+            C(current_idle_streak)/C(last_idle_streak) below for actual start/end timestamps of
+            individual quiet stretches.
+          type: int
+        idle_poll_interval_seconds:
+          description: >-
+            Seconds between idle heartbeats, so C(idle_polls) (or a streak's own C(polls)) can be
+            converted to an approximate duration without hardcoding this module's internal poll
+            cadence externally.
+          type: float
+        current_idle_streak:
+          description: >-
+            The still-open stretch of silence, if the session is idle right now, or V(null) if it
+            last saw real traffic (or has not gone idle since it last did). Cleared back to
+            V(null) the moment a real SCSI request arrives -- see the module description's note
+            on distinguishing idle from a broken connection.
+          type: dict
+          contains:
+            started_at:
+              description: Controller-clock ISO-8601 timestamp of when this streak of silence began.
+              type: str
+            polls:
+              description: Idle heartbeats observed so far in this streak.
+              type: int
+            seconds:
+              description: Approximately C(polls) times C(idle_poll_interval_seconds).
+              type: float
+        last_idle_streak:
+          description: >-
+            The most recently CLOSED stretch of silence -- unlike C(current_idle_streak), this is
+            not cleared by new traffic resuming, so it stays visible for a post-mortem even after
+            the session kept running. V(null) if the session has never yet closed an idle streak
+            (no idle period has ended in either a real request or the session itself ending).
+          type: dict
+          contains:
+            started_at:
+              description: Controller-clock ISO-8601 timestamp of when this streak of silence began.
+              type: str
+            ended_at:
+              description: >-
+                Controller-clock ISO-8601 timestamp of when this streak ended -- either a real
+                SCSI request arrived, or the session itself ended while this streak was still open.
+              type: str
+            polls:
+              description: Idle heartbeats observed during this streak.
+              type: int
+            seconds:
+              description: Approximately C(polls) times C(idle_poll_interval_seconds).
+              type: float
         error:
           description: Same value as RV(error).
           type: str
@@ -440,6 +508,14 @@ def _status_fields(state: dict | None) -> dict:
         "last_request_at": state.get("last_request_at"),
         "updated_at": state.get("updated_at"),
         "error": state.get("error"),
+        # Idle-versus-broken forensic fields -- see media_session.py's module
+        # docstring point 1. Not surfaced at the top level by _finalize() (see
+        # its own docstring on which fields are), but included here so a
+        # failure path's **fields spread carries them too, and so they are
+        # available for RETURN's operation.observed documentation below.
+        "idle_polls": state.get("idle_polls", 0),
+        "current_idle_streak": state.get("current_idle_streak"),
+        "last_idle_streak": state.get("last_idle_streak"),
     }
 
 

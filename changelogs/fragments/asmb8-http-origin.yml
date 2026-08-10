@@ -1,0 +1,11 @@
+minor_changes:
+  - >-
+    asmb8_http_origin - new module, an ephemeral local HTTP file server for handing installer
+    files to a target that only speaks HTTP rather than this collection's native iUSB path. Kept
+    to this collection's "no standing infrastructure" rule with a hard, unconditional
+    ``lifetime_seconds`` cap so a background instance self-terminates even if the play that
+    started it crashes or the controller loses power mid-run; per-request path confinement
+    against ``..``, symlink, and percent-encoding (including double-encoding) traversal; a
+    structured per-request access log for diagnosing a failed install; and correct ``Range``/``206
+    Partial Content`` handling for bootloaders and installers that issue ranged reads. Added to
+    ``meta/runtime.yml``'s ``asmb8_ikvm`` action group alongside the other six modules.

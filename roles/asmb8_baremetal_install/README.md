@@ -90,11 +90,29 @@ process, because nothing ran to stop it.
 
 **If software reclamation ever fails** -- this role's own `always` block, a
 manual `asmb8_media state=detached` call, all of it -- the operator's escape
-hatch is a **BMC cold reset** (`ipmitool mc reset cold`, or the
-`pyghmi`/`community.general.ipmi_power` equivalent against the BMC's own
-management controller). This resets the *BMC*, not the host: it does **not**
-power-cycle or otherwise affect the machine the BMC is managing. It is safe to
-use to break a wedged media session precisely because of that separation.
+hatch is a **BMC cold reset** (`ipmitool mc reset cold`, the
+`pyghmi`/`community.general.ipmi_power` equivalent, or this collection's own
+`james_crowley.asmb8_ikvm.asmb8_reset` module with `mode: cold`, which is
+exactly that manual step promoted to a first-class, testable module). This
+resets the *BMC*, not the host: verified live against the target hardware, the
+host stayed powered on and completely unaffected throughout a cold reset. It
+is safe to use to break a wedged media session precisely because of that
+separation -- but it drops every other active BMC session too (IPMI, `.asp`
+web logins, any other in-flight media session), and recovery of the BMC
+afterwards is staged (ICMP answers before the `.asp`/HTTPS stack does), so do
+not assume the BMC is fully usable again the instant it starts responding to
+ping. See `asmb8_reset`'s own `DOCUMENTATION` for the full detail.
+
+**A wedged session does not necessarily look wedged from the network layer.**
+Observed directly on the target hardware: a stuck media session's TCP
+connection to the iUSB port was fully `ESTABLISHED`, with bytes sitting unread
+in the socket's own receive queue, while zero SCSI commands were actually
+being serviced. An `ESTABLISHED` connection on port 5120 is therefore **not**
+evidence media is being served -- check `asmb8_media`'s own `session_state`/
+`bytes_read`/`sectors_served` (or the idle-streak fields described in
+["Distinguishing idle from a broken connection"](#distinguishing-idle-from-a-broken-connection)
+below) before concluding a session is healthy just because something answers
+on that port.
 
 `asmb8_media`'s attach also runs an always-on reclamation pass over every
 OTHER session this collection's own `runtime_dir` still has a record of
@@ -151,10 +169,10 @@ Point this role at exactly one host per play.
 ## Expected duration -- do not kill a working install
 
 Measured directly against the target hardware: this board streams the
-attached ISO over iUSB at roughly **800 KB/s**, using 16-block (32 KB) reads.
-Proxmox's own `pve-installer.squashfs` alone is **614 MB** -- that is **13+
-minutes of streaming for one file**, before the installer even starts running
-against it. A full unattended install is longer still.
+attached ISO over iUSB at roughly **790-800 KB/s**, using 16-block (32 KB)
+reads. Proxmox's own `pve-installer.squashfs` alone is **614 MB** -- that is
+**13+ minutes of streaming for one file**, before the installer even starts
+running against it. A full unattended install is longer still.
 
 **Idle is normal and has no meaningful upper bound.** Verified directly: an
 attached, healthy session went completely silent for **130 consecutive
@@ -163,8 +181,90 @@ normally with no intervention at all. A long, quiet wait during
 `tasks/wait_for_handoff.yml`, or a long gap between debug output during the
 install, is not evidence of a hang.
 
-`asmb8_baremetal_install_handoff_timeout` defaults to `3600` (one hour)
-accordingly. Do not shrink it casually.
+**A real install was killed by too-short a default.** `handoff_timeout` used
+to default to `3600` (one hour), and a real, unattended Proxmox install
+against the target hardware was killed by that timeout at **70% complete** --
+the install needed longer, not less. That default was too tight and has been
+raised; the arithmetic behind the new default follows, so you can size your
+own value for your own ISO rather than guessing:
+
+1. **Raw transfer time.** A 1,628 MiB installer ISO at the measured ~790 KB/s
+   takes `1,628 * 1024 / 790 ≈ 2,111 s ≈ 35.2 minutes` just to stream once,
+   before the installer does anything else with it. This is a floor, not an
+   estimate of total install time -- an installer typically re-reads parts of
+   the ISO non-sequentially and spends real time unpacking/configuring
+   packages on top of the streaming itself.
+2. **What the real failure implies about total duration.** The run that was
+   killed had completed 70% of its work at the old 60-minute (3,600 s) cutoff.
+   Extrapolating linearly, a full run needed at least
+   `3,600 / 0.70 ≈ 5,143 s ≈ 85.7 minutes` -- and that is a *floor* derived
+   from an incomplete run, not a measured total; the real figure could be
+   higher.
+3. **New default.** `asmb8_baremetal_install_handoff_timeout` is now `7200`
+   (two hours) -- comfortably above both the 85.7-minute floor from step 2
+   (about 40% headroom) and more than 3x the raw 35-minute transfer time from
+   step 1, to absorb idle stretches (confirmed normal, up to 130+ seconds at a
+   time) and postinstall configuration that the transfer-time figure alone
+   does not capture.
+4. **Sizing your own value.** Do not just trust the default for a
+   dissimilar ISO or workload -- compute your own floor the same way:
+   `handoff_timeout ≈ (your_iso_size_MiB * 1024 / 790) * safety_factor`,
+   where a `safety_factor` of at least 2-3x the raw transfer time is a
+   reasonable starting point given how far short the raw transfer estimate
+   alone fell for Proxmox above. For a larger ISO, or an installer known to
+   do a lot of post-unpack configuration, prefer the higher end of that
+   range -- or size directly off a real run's own progress the way step 2
+   above did, if you have one.
+
+Do not shrink `asmb8_baremetal_install_handoff_timeout` casually, and do not
+mistake a long, quiet `wait_for_handoff` for a hang -- see the idle-versus-
+broken guidance immediately below for how to tell the difference from the
+media session's own state file while a run is still in progress.
+
+## Distinguishing idle from a broken connection
+
+The same real incident above also produced a genuinely ambiguous trace:
+stretches of zero reads that were read, at the time, as "the installer is
+unpacking packages" -- when at least one such stretch may actually have been
+a network outage between the controller and the BMC. On the guest side, the
+symptom was SCSI timeouts and I/O errors; tellingly, the guest logged **zero
+`REQUEST_SENSE` commands**, meaning it never received an error status at
+all -- it simply never got answered. That is a timeout signature, not an
+error-reply signature, on both sides of the connection.
+
+`asmb8_media`'s background session's state file now records enough to make
+this separable after the fact, without needing to have been watching live at
+the time:
+
+- `operation.observed.current_idle_streak` -- while the session is quiet,
+  this is a dict (`started_at`, `polls`, `seconds`) tracking the *current*,
+  still-open stretch of silence. It is cleared back to `null` the moment a
+  real SCSI request arrives.
+- `operation.observed.last_idle_streak` -- the most recently *closed* stretch
+  of silence (`started_at`, `ended_at`, `polls`, `seconds`), including the one
+  that was open when the session ended, if it ended while idle. Unlike
+  `current_idle_streak`, this is not cleared by later traffic, so it stays
+  visible for a post-mortem even after the session resumed and kept running.
+- `operation.observed.idle_polls` -- a lifetime count of idle heartbeats,
+  for a coarse "how quiet has this session been overall" figure.
+
+None of this is real-time network-failure detection -- a network partition
+that happens to occur exactly between two SCSI requests still looks, from
+this session's own vantage point, identical to a healthy, willingly-idle
+host (see `plugins/module_utils/iusb.py`'s `IdleTimeout`/`recv_exact` split
+for exactly why: an idle timeout at a frame boundary carries no information
+about *why* nothing arrived). What these fields *do* give you is enough
+recorded detail -- exact start/end timestamps and durations for every
+quiet stretch -- to cross-reference against independent evidence after the
+fact: the guest's own kernel/SCSI timeout log timestamps, BMC-side logs, or
+network monitoring for the same window. A connection that has genuinely
+broken (a stalled read mid-frame, not at a boundary; a socket error) is
+reported quite differently and always was, before this change --
+`session_state=error` with `error_class=connection` and a message naming the
+stall -- so the combination to look for in a post-mortem is: no
+`session_state=error` recorded, but a `last_idle_streak`/`current_idle_streak`
+duration that lines up suspiciously well with an independently-observed
+outage window.
 
 ## Resumability
 
@@ -312,7 +412,7 @@ other.
     asmb8_baremetal_install_wait_for_handoff: true
     asmb8_baremetal_install_handoff_host: "{{ provisioned_host_address }}"
     asmb8_baremetal_install_handoff_port: 22
-    asmb8_baremetal_install_handoff_timeout: 3600     # a real install can run a long time unattended
+    asmb8_baremetal_install_handoff_timeout: 7200     # a real install can run a long time unattended -- see "Expected duration" above
     asmb8_baremetal_install_handoff_delay: 120
 
   roles:
@@ -366,7 +466,7 @@ connection variable below is this role's own, with no fallback.
 | `asmb8_baremetal_install_wait_for_handoff` | `true` | Set `false` to skip the final wait |
 | `asmb8_baremetal_install_handoff_host` | `null` (**required** when `asmb8_baremetal_install_wait_for_handoff` is `true`) | The address the freshly installed **OS** answers on -- not the BMC address |
 | `asmb8_baremetal_install_handoff_port` | `22` | |
-| `asmb8_baremetal_install_handoff_timeout` / `asmb8_baremetal_install_handoff_delay` | `3600` / `120` | See ["Expected duration"](#expected-duration----do-not-kill-a-working-install) |
+| `asmb8_baremetal_install_handoff_timeout` / `asmb8_baremetal_install_handoff_delay` | `7200` / `120` | See ["Expected duration"](#expected-duration----do-not-kill-a-working-install) for the sizing arithmetic |
 | `asmb8_baremetal_install_media_release_after_handoff` | `false` | **Untested extension point** -- see ["Unresolved: Linux's own USB re-enumeration"](#unresolved-linuxs-own-usb-re-enumeration) |
 | `asmb8_baremetal_install_target_disk` | `null` | **Unused today.** Forward guard for a disk-pinning requirement on a not-yet-existing answer-file feature -- see `defaults/main.yml`'s comment and `tasks/validate.yml` |
 | `asmb8_baremetal_install_state_dir` | `~/.ansible/asmb8_ikvm/baremetal-install` | Resumability state; needs durable, per-controller-shared storage |
