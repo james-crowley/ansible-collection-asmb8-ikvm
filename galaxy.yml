@@ -1,7 +1,7 @@
 ---
 namespace: james_crowley
 name: asmb8_ikvm
-version: 0.4.0
+version: 0.5.0
 readme: README.md
 
 authors:

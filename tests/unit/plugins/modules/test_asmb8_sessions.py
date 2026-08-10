@@ -9,13 +9,15 @@ real `AspClient` to canned HTTP responses built from the real, redacted fixtures
 `tests/unit/fixtures/asp/`, mocking only `requests.Session.request`. Nothing here opens a socket or
 talks to any BMC.
 
-`getsessioninfo.asp` (captured via POST) is deliberately not wired up anywhere in this file --
-see the module's own DOCUMENTATION and `TestNeverCallsGetSessionInfo` below, which pins that gap
-structurally rather than only in prose.
+`getsessioninfo.asp` is read through `AspClient.post_webvar()` (POST, SERVICEBIT) only when
+O(active_session_services) is given -- see `TestActiveSessionServices` below, and
+`TestActiveSessionsNeverViaGetWebvar` for the structural pin that it is never reached through the
+GET-only `get_webvar()`, no matter what is requested.
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 from pathlib import Path
@@ -332,25 +334,176 @@ class TestNoCredentialLeakage:
         assert PASSWORD not in json.dumps(result)
 
 
-class TestNeverCallsGetSessionInfo:
-    """Structural pin for this module's documented, deliberate gap: getsessioninfo.asp is not
-    readable via AspClient.get_webvar (it was captured via POST; get_webvar is GET-only by
-    design), and this module must never grow a call to it -- see the module description."""
+#: The real getsessioninfo_post_servicebit4.txt capture's one session record, decoded -- see
+#: tests/unit/fixtures/asp/README.md's "POST-parameterized reads" section for provenance.
+_EXPECTED_CD_MEDIA_SESSION = {
+    "service": "cd-media",
+    "session_id_raw": 24,
+    "session_type_raw": 7,
+    "user_id_raw": 2,
+    "username": "admin",
+    "ip_address": "192.0.2.10",
+    "privilege_raw": 4,
+}
 
-    def test_source_never_names_getsessioninfo(self):
-        # Only the executable code, not the DOCUMENTATION block (which legitimately discusses the
-        # gap in prose) -- inspect each function that could plausibly call get_webvar.
-        for func in (asmb8_sessions.gather_report, asmb8_sessions.fetch_remote_session_config, asmb8_sessions.main):
-            assert "getsessioninfo" not in inspect.getsource(func)
 
-    def test_active_sessions_is_always_none_even_on_a_successful_run(self, monkeypatch):
+def _client_with_active_sessions(**fixture_overrides) -> AspClient:
+    fixture_map = {name: loader() for name, loader in DEFAULT_FIXTURES.items()}
+    fixture_map["getsessioninfo"] = _read_fixture("getsessioninfo_post_servicebit4.txt")
+    fixture_map.update(fixture_overrides)
+    return build_client_with_fixtures(fixture_map)
+
+
+class TestKnownServiceIds:
+    def test_builds_the_mapping_straight_from_getallservicescfg_records(self):
+        response = parse_webvar(_read_fixture("getallservicescfg.txt"))
+        ids = asmb8_sessions.known_service_ids(response.records)
+        assert ids["cd-media"] == 4  # the one SERVICEBIT this collection has independently confirmed
+        assert ids["web"] == 1
+        assert set(ids) == {"web", "kvm", "cd-media", "fd-media", "hd-media", "ssh", "telnet"}
+
+
+class TestResolveRequestedSessionServices:
+    KNOWN = {"web": 1, "kvm": 2, "cd-media": 4}
+
+    def test_none_or_empty_returns_no_services(self):
+        assert asmb8_sessions.resolve_requested_session_services(None, self.KNOWN) == []
+        assert asmb8_sessions.resolve_requested_session_services([], self.KNOWN) == []
+
+    def test_specific_names_are_returned_deduplicated_preserving_order(self):
+        resolved = asmb8_sessions.resolve_requested_session_services(["cd-media", "web", "cd-media"], self.KNOWN)
+        assert resolved == ["cd-media", "web"]
+
+    def test_all_resolves_to_every_known_name(self):
+        resolved = asmb8_sessions.resolve_requested_session_services(["all"], self.KNOWN)
+        assert set(resolved) == set(self.KNOWN)
+
+    def test_all_short_circuits_even_when_combined_with_other_names(self):
+        resolved = asmb8_sessions.resolve_requested_session_services(["web", "all"], self.KNOWN)
+        assert set(resolved) == set(self.KNOWN)
+
+    def test_unknown_name_raises_value_error_naming_it(self):
+        with pytest.raises(ValueError, match="typo-service"):
+            asmb8_sessions.resolve_requested_session_services(["typo-service"], self.KNOWN)
+
+
+class TestDecodeSessionRecord:
+    """IPADDRESS/UNAME are returned deliberately here -- see the module description for why that
+    is the opposite of asmb8_users' EmailID/SSHKeyInfo choice and is not an inconsistency."""
+
+    def test_matches_the_real_capture_field_for_field(self):
+        record = {"SID": 24, "STYPE": 7, "IPADDRESS": "192.0.2.10", "UID": 2, "UNAME": "admin", "UPRIV": 4}
+        assert asmb8_sessions.decode_session_record(record, service_name="cd-media") == _EXPECTED_CD_MEDIA_SESSION
+
+    def test_empty_ip_address_or_username_decodes_to_none(self):
+        decoded = asmb8_sessions.decode_session_record({"IPADDRESS": "", "UNAME": ""}, service_name="web")
+        assert decoded["ip_address"] is None
+        assert decoded["username"] is None
+
+    def test_upriv_is_returned_raw_undecoded(self):
+        decoded = asmb8_sessions.decode_session_record({"UPRIV": 4}, service_name="web")
+        assert decoded["privilege_raw"] == 4
+
+
+class TestFetchActiveSessions:
+    def test_posts_servicebit_derived_from_the_live_service_id_mapping(self):
+        client = Mock()
+        client.post_webvar.return_value = parse_webvar(_read_fixture("getsessioninfo_post_servicebit4.txt"))
+
+        sessions = asmb8_sessions.fetch_active_sessions(client, ["cd-media"], {"cd-media": 4})
+
+        client.post_webvar.assert_called_once_with("getsessioninfo", data={"SERVICEBIT": "4"})
+        assert sessions == [_EXPECTED_CD_MEDIA_SESSION]
+
+    def test_source_uses_post_webvar_and_never_get_webvar(self):
+        # AST-based (Attribute nodes only), not a raw substring search over the function's text:
+        # its own docstring names get_webvar() in prose to explain why it is *not* used, which a
+        # plain `"get_webvar" not in source` check would wrongly trip on.
+        tree = ast.parse(inspect.getsource(asmb8_sessions.fetch_active_sessions))
+        called_attrs = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        assert "post_webvar" in called_attrs
+        assert "get_webvar" not in called_attrs
+
+
+class TestActiveSessionServices:
+    """End-to-end O(active_session_services), against the real, redacted
+    getsessioninfo_post_servicebit4.txt capture."""
+
+    def test_omitted_leaves_active_sessions_null_unchanged_from_before(self, monkeypatch):
         client = _default_client()
         monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
         result = _run_ok(dict(BASE_ARGS))
+
         assert result["active_sessions"] is None
+        assert result["active_sessions_queried"] == []
+
+    def test_a_specific_service_reads_via_post_webvar(self, monkeypatch):
+        client = _client_with_active_sessions()
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
+        result = _run_ok(dict(BASE_ARGS, active_session_services=["cd-media"]))
+
+        assert result["active_sessions_queried"] == ["cd-media"]
+        assert result["active_sessions"] == [_EXPECTED_CD_MEDIA_SESSION]
+
+    def test_all_queries_every_service_getallservicescfg_reported(self, monkeypatch):
+        client = _client_with_active_sessions()
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
+        result = _run_ok(dict(BASE_ARGS, active_session_services=["all"]))
+
+        assert set(result["active_sessions_queried"]) == {"web", "kvm", "cd-media", "fd-media", "hd-media", "ssh", "telnet"}
+        # Every service's getsessioninfo.asp read is answered by the same canned fixture here, so
+        # every queried service contributes exactly one session record, tagged with its own name.
+        assert len(result["active_sessions"]) == len(result["active_sessions_queried"])
+        assert {entry["service"] for entry in result["active_sessions"]} == set(result["active_sessions_queried"])
+
+    def test_unknown_service_name_fails_the_module_after_login_not_before(self, monkeypatch):
+        client = _default_client()
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
+        result = _run_fail(dict(BASE_ARGS, active_session_services=["not-a-real-service"]))
+
+        assert "not-a-real-service" in result["msg"]
+        assert "error_class" not in result  # a plain ValueError, not an IkvmError -- see main()
+
+    def test_unknown_service_name_still_performs_a_real_login_first(self, monkeypatch):
+        # Companion to the test above: uses the real, fixture-backed client (not a bare Mock) to
+        # prove the failure genuinely happens after login + getallservicescfg.asp, not before.
+        client = _default_client()
+        login_spy = Mock(wraps=client.login)
+        client.login = login_spy
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
+        _run_fail(dict(BASE_ARGS, active_session_services=["not-a-real-service"]))
+
+        login_spy.assert_called_once()
+
+    def test_check_mode_never_reads_active_sessions_either(self, monkeypatch):
+        build_asp = Mock(side_effect=AssertionError("check mode must never build a client"))
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", build_asp)
+
+        result = _run_ok(dict(BASE_ARGS, active_session_services=["all"], _ansible_check_mode=True))
+
+        assert result["active_sessions"] is None
+        assert result["active_sessions_queried"] is None
+        build_asp.assert_not_called()
+
+    def test_no_credential_leakage_with_active_sessions_populated(self, monkeypatch):
+        client = _client_with_active_sessions()
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+        result = _run_ok(dict(BASE_ARGS, active_session_services=["cd-media"]))
+        assert PASSWORD not in json.dumps(result)
+
+
+class TestActiveSessionsNeverViaGetWebvar:
+    """Structural pin: no matter what O(active_session_services) requests, getsessioninfo.asp must
+    only ever be reached through post_webvar(), never through the GET-only get_webvar() -- see
+    AspClient.get_webvar()'s own docstring on why that method must never be widened."""
 
     def test_get_webvar_is_never_called_with_getsessioninfo(self, monkeypatch):
-        client = _default_client()
+        client = _client_with_active_sessions()
         real_get_webvar = client.get_webvar
 
         def _spy(endpoint, **kwargs):
@@ -359,4 +512,28 @@ class TestNeverCallsGetSessionInfo:
 
         client.get_webvar = _spy
         monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+        _run_ok(dict(BASE_ARGS, active_session_services=["all"]))
+
+    def test_post_webvar_is_called_with_getsessioninfo_when_requested(self, monkeypatch):
+        client = _client_with_active_sessions()
+        real_post_webvar = client.post_webvar
+        seen_endpoints = []
+
+        def _spy(endpoint, **kwargs):
+            seen_endpoints.append(endpoint)
+            return real_post_webvar(endpoint, **kwargs)
+
+        client.post_webvar = _spy
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+        _run_ok(dict(BASE_ARGS, active_session_services=["cd-media"]))
+
+        assert seen_endpoints == ["getsessioninfo"]
+
+    def test_post_webvar_is_never_called_at_all_when_active_session_services_is_omitted(self, monkeypatch):
+        client = _default_client()
+        client.post_webvar = Mock(side_effect=AssertionError("post_webvar must not be called when active_session_services is omitted"))
+        monkeypatch.setattr(asmb8_sessions, "build_asp_client", lambda params: client)
+
         _run_ok(dict(BASE_ARGS))
+
+        client.post_webvar.assert_not_called()

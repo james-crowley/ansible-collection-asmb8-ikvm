@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_SETDATETIME =
+ {
+ WEBVAR_STRUCTNAME_SETDATETIME :
+ [
+ {} ],
+ HAPI_STATUS:0 };
+//Dynamic data end
+

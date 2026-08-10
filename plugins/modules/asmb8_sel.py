@@ -46,18 +46,38 @@ description:
     read-only, on purpose, and does not offer a flag that would tempt a caller into destructive use
     of an endpoint nobody has actually captured or tested.
   - >-
-    B(Pagination.) C(getselentries.asp) is this board's paged sibling of C(getallselentries.asp) --
-    it is a C(POST) endpoint, not a C(GET), and this corpus's own C(getselentries.txt) fixture (a
-    C(GET) capture made without the POST parameters that endpoint actually needs) returns only the
-    empty sentinel, which is evidence that endpoint needs its documented POST form to return
-    anything, not evidence of an empty log. C(module_utils/asp.py)'s C(AspClient.get_webvar()) is
-    C(GET)-only by deliberate design specifically so it can never be turned into a general request
-    escape hatch; this module honours that boundary rather than subverting it, and reads
-    C(getallselentries.asp) instead, which returned the BMC's entire 24-entry log in one C(GET) in
-    this corpus with no evidence of internal truncation. If this board's log ever grows large enough
-    that C(getallselentries.asp) itself stops returning everything in one response, paging through
-    C(getselentries.asp) would need a dedicated, properly-named C(POST) method on
-    C(AspClient) -- not present today, and out of scope for this read-only module.
+    B(Pagination via O(after_event_id).) C(getselentries.asp) is this board's paged sibling of
+    C(getallselentries.asp), and it is a C(POST) endpoint, not a C(GET): a real save-action capture
+    (2026-08-10) sourced its request shape as C(POST /rpc/getselentries.asp) with a
+    C(WEBVAR_LASTEVENTID) form field, returning entries B(after) that SEL record ID.
+    C(module_utils/asp.py)'s C(AspClient.get_webvar()) remains C(GET)-only by deliberate design, so
+    this module reads this endpoint through the separate, explicitly-named
+    C(AspClient.post_webvar()) instead -- see that method's own docstring for why it is not a
+    widening of C(get_webvar()). O(after_event_id) is optional; the default, unset behaviour is
+    unchanged from before this capability existed -- read C(getallselentries.asp) in full, which
+    returned the BMC's entire 24-entry log in one C(GET) in this corpus with no evidence of
+    internal truncation. O(limit) applies identically to either path, after whichever read ran.
+  - >-
+    B(An empty O(after_event_id) result can legitimately mean "nothing newer", not a failure.) This
+    module's own C(getselentries_post_lasteventid24.txt) fixture -- the real capture backing
+    O(after_event_id) -- issued C(WEBVAR_LASTEVENTID=24) against a log holding exactly 24 entries,
+    and got back zero records. That is the B(correct) answer (nothing follows the newest record
+    that already existed), not evidence the request failed or that this endpoint is broken --
+    contrast this with C(getselentries.txt), a different, older fixture in the same corpus captured
+    as a bare C(GET) with none of this endpoint's actual parameters, which is evidence only that a
+    parameterless request returns nothing useful, not that the log itself was empty. Do not treat
+    RV(entries) being empty after O(after_event_id) as a signal to retry or escalate; check
+    RV(entries_available) against the value you passed instead.
+  - >-
+    B(The paged endpoint's own field-level record shape is unverified beyond its outer envelope.)
+    The one real capture of C(getselentries.asp) returned zero records, so there is no captured
+    evidence for what fields a non-empty page of this specific endpoint actually carries -- only
+    that its outer C(WEBVAR_JSONVAR_HL_GETSELENTRIES)/C(HAPI_STATUS) envelope matches every other
+    C(.asp) read this collection parses (see C(module_utils/webvar.py)). This module reuses
+    C(getallselentries.asp)'s own field mapping (RV(entries)'s C(record_id)/C(record_type)/etc.)
+    for any record O(after_event_id) does return, on the reasoning that both endpoints read the
+    same underlying SEL table -- but that specific reuse is an inference, not something this
+    corpus has directly confirmed, and is flagged here rather than silently assumed.
   - >-
     RV(sel_policy) is reported exactly as C(getselcfg.asp)'s C(SEL_POLICY) field returns it, with no
     interpretation attached -- this corpus's one sample is always V(0), and nothing sourced here
@@ -84,7 +104,18 @@ options:
       - >-
         Entries are kept in exactly the order C(getallselentries.asp) returned them -- this corpus's
         own fixture returns them highest-C(RecordID)-first (newest first) -- and O(limit) simply
-        takes the first O(limit) of that order without resorting it.
+        takes the first O(limit) of that order without resorting it. Applies identically whether
+        O(after_event_id) is set or not.
+    type: int
+  after_event_id:
+    description:
+      - >-
+        If given, read C(getselentries.asp) (C(POST), C(WEBVAR_LASTEVENTID)) for entries B(after)
+        this SEL record ID instead of C(getallselentries.asp)'s full read. See this module's
+        description for exactly what was and was not sourced about this endpoint, including why an
+        empty RV(entries) result here is often the B(correct) answer, not a failure. Must not be
+        negative.
+      - Omit (the default) to keep reading C(getallselentries.asp) in full, unchanged from before this option existed.
     type: int
 seealso:
   - module: james_crowley.asmb8_ikvm.asmb8_info
@@ -124,6 +155,22 @@ EXAMPLES = r"""
   delegate_to: localhost
   no_log: true
   register: recent_sel
+
+- name: Only entries newer than the last one this run already saw
+  james_crowley.asmb8_ikvm.asmb8_sel:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    after_event_id: "{{ last_seen_record_id }}"
+  delegate_to: localhost
+  no_log: true
+  register: new_sel
+
+- name: An empty result after after_event_id is not necessarily a problem -- see the module description
+  ansible.builtin.debug:
+    msg: "no SEL entries newer than {{ last_seen_record_id }}"
+  when: new_sel.entries_returned == 0
 
 - name: Warn if the log is approaching its reported capacity
   ansible.builtin.debug:
@@ -207,10 +254,12 @@ entries:
       type: dict
 entries_available:
   description: >-
-    Number of entries C(getallselentries.asp) actually returned in this call, before O(limit) was
-    applied. This module has no evidence that endpoint itself paginates -- its own fixture returned
-    every entry (24) in one response -- so, today, this is simply "how many entries the BMC
-    currently has", not "how many were on this page".
+    Number of entries this call's own read actually returned, before O(limit) was applied. Without
+    O(after_event_id), that read is C(getallselentries.asp), which has no evidence of pagination --
+    its own fixture returned every entry (24) in one response -- so this is simply "how many
+    entries the BMC currently has". With O(after_event_id), it is however many entries
+    C(getselentries.asp) reported after that record ID -- V(0) is a legitimate value here, not an
+    error; see the module description.
   type: int
   returned: always
   sample: 24
@@ -267,11 +316,13 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp impor
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import IkvmError, ProtocolError
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.models import OperationReceipt
 
-#: Endpoints this module reads. All three are sourced from real captures under
-#: ``tests/unit/fixtures/asp/`` -- see that directory's README and this module's DOCUMENTATION for
-#: why ``getselentries`` (the paged POST sibling of ``getallselentries``) is deliberately not among
-#: them.
+#: Endpoints this module reads. All four are sourced from real captures under
+#: ``tests/unit/fixtures/asp/`` -- see that directory's README and this module's DOCUMENTATION.
+#: ``getselentries`` (the paged POST sibling of ``getallselentries``) is read through
+#: ``AspClient.post_webvar()``, never through the GET-only ``get_webvar()`` -- see
+#: read_paged_entries() below.
 _ENTRIES_ENDPOINT = "getallselentries"
+_PAGED_ENTRIES_ENDPOINT = "getselentries"
 _MAX_ENTRIES_ENDPOINT = "getmaxselentries"
 _CONFIG_ENDPOINT = "getselcfg"
 
@@ -315,6 +366,7 @@ def _connection_argument_spec() -> dict[str, dict]:
 def argument_spec() -> dict[str, dict]:
     spec = _connection_argument_spec()
     spec["limit"] = {"type": "int"}
+    spec["after_event_id"] = {"type": "int"}
     return spec
 
 
@@ -387,6 +439,28 @@ def read_entries(client: AspClient, *, limit: int | None) -> tuple[list[dict], i
     return entries, entries_available
 
 
+def read_paged_entries(client: AspClient, *, after_event_id: int, limit: int | None) -> tuple[list[dict], int]:
+    """Read C(getselentries.asp) (C(POST), C(WEBVAR_LASTEVENTID)) for entries after a given SEL record ID.
+
+    Returns ``(entries, entries_available)`` in the same shape as :func:`read_entries`, so
+    O(limit) can be applied identically by the caller regardless of which path ran. An empty
+    result is a legitimate outcome, not degraded or retried here -- see this module's
+    DOCUMENTATION and C(tests/unit/fixtures/asp/README.md) for the sourced capture (a log holding
+    exactly 24 entries, queried for anything after record 24) that this behaviour is drawn from.
+
+    Reuses :func:`parse_entry`'s C(getallselentries.asp) field mapping for whatever records this
+    call does return -- see the DOCUMENTATION's caveat that this specific reuse is an inference
+    (both endpoints read the same underlying table), not something the one real, empty capture of
+    this endpoint could itself confirm field-for-field.
+    """
+    response = client.post_webvar(_PAGED_ENTRIES_ENDPOINT, data={"WEBVAR_LASTEVENTID": str(after_event_id)})
+    entries = [parse_entry(record) for record in response.records]
+    entries_available = len(entries)
+    if limit is not None:
+        entries = entries[:limit]
+    return entries, entries_available
+
+
 def read_max_entries(client: AspClient) -> int:
     """Read C(getmaxselentries.asp)'s C(COUNT) field."""
     response = client.get_webvar(_MAX_ENTRIES_ENDPOINT)
@@ -424,11 +498,19 @@ def main() -> None:
         module.fail_json(msg=f"limit must not be negative; got {limit}")
         return
 
+    after_event_id = params["after_event_id"]
+    if after_event_id is not None and after_event_id < 0:
+        module.fail_json(msg=f"after_event_id must not be negative; got {after_event_id}")
+        return
+
     client = build_asp_client(params)
 
     try:
         client.login()
-        entries, entries_available = read_entries(client, limit=limit)
+        if after_event_id is not None:
+            entries, entries_available = read_paged_entries(client, after_event_id=after_event_id, limit=limit)
+        else:
+            entries, entries_available = read_entries(client, limit=limit)
         max_entries = read_max_entries(client)
         sel_policy = read_sel_policy(client)
     except IkvmError as err:

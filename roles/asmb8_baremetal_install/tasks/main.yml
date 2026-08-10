@@ -29,6 +29,18 @@
 - name: Load and reconcile prior run state for this target
   ansible.builtin.include_tasks: state.yml
 
+- name: Select which local image this run attaches as virtual media, based on delivery mode
+  # full_iso: the whole ISO, exactly as this role has always attached it.
+  # ipxe_http: the tiny bootstrap image tasks/prepare_ipxe_delivery.yml is
+  # about to build -- computed here, before that file has even run, because
+  # this is only a path string; tasks/attach_media.yml runs strictly after
+  # tasks/prepare_ipxe_delivery.yml has actually written it.
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_media_image_path: >-
+      {{ asmb8_baremetal_install_ipxe_bootstrap_output
+         if asmb8_baremetal_install_delivery == 'ipxe_http'
+         else asmb8_baremetal_install_iso_path }}
+
 - name: Run the install lifecycle
   module_defaults:
     group/james_crowley.asmb8_ikvm.asmb8_ikvm:
@@ -48,7 +60,11 @@
     - name: Probe BMC-observed capabilities and state before any mutation
       ansible.builtin.include_tasks: probe.yml
 
-    - name: Attach the installer ISO as virtual media over iUSB
+    - name: Start the ephemeral HTTP origin and build the iPXE bootstrap image
+      ansible.builtin.include_tasks: prepare_ipxe_delivery.yml
+      when: asmb8_baremetal_install_delivery == 'ipxe_http'
+
+    - name: Attach the installer image as virtual media over iUSB
       ansible.builtin.include_tasks: attach_media.yml
 
     - name: Arm the one-time optical boot selection
@@ -91,3 +107,11 @@
     - name: Always detach media, even on failure, so no daemon is left holding the BMC's single media slot open
       ansible.builtin.include_tasks: detach_media.yml
       when: asmb8_baremetal_install_run_state is defined
+
+    - name: >-
+        Always stop the ephemeral iPXE HTTP origin, even on failure, so it cannot outlive this play
+        (ipxe_http delivery mode only)
+      ansible.builtin.include_tasks: stop_ipxe_origin.yml
+      when:
+        - asmb8_baremetal_install_run_state is defined
+        - asmb8_baremetal_install_run_state.ipxe_origin_session_id is truthy

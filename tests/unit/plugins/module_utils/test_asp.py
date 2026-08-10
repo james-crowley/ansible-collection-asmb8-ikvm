@@ -15,8 +15,11 @@ through a real connection attempt.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import re
 import ssl
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -39,12 +42,29 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     BmcBusyError,
     ConnectionError_,
     ProtocolError,
+    RemoteOperationError,
     TlsValidationError,
 )
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.webvar import WebVarResponse
 
 PASSWORD = "Sup3rSecret!"
 SESSION_COOKIE = "abcd1234efgh5678ijkl9012mnop3456xyz"
 KVM_TOKEN = "0123456789abcdef"
+CSRF_TOKEN = "csrf-token-not-real-0123456789"
+
+#: tests/unit/fixtures/asp -- same depth from this file as every sibling test file's own
+#: FIXTURES_DIR (see e.g. test_asmb8_sel.py).
+FIXTURES_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "asp"
+
+#: The repository's plugins/ tree, for the structural "no write endpoint is reachable" checks
+#: below -- these must scan real source files on disk, not just this process's already-imported
+#: modules, so a write capability hiding behind a lazy import cannot slip past them.
+PLUGINS_DIR = Path(__file__).resolve().parents[4] / "plugins"
+
+
+def _read_fixture(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
 
 # Two obviously-fake JNLP fragments, one for each live port-wiring mode this
 # board has been observed in (see JnlpSession's docstring in models.py). Not
@@ -112,6 +132,26 @@ def mock_response(text: str) -> Mock:
     response = Mock(spec=requests.Response)
     response.text = text
     return response
+
+
+def _synthetic_webvar_failure_body(name: str, hapi_status: int) -> str:
+    """A WEBVAR/JSONVAR body reporting a non-zero ``HAPI_STATUS``, built inline rather than as a
+    fixture file. No real capture -- write or read, across every fixture this collection has ever
+    added -- has ever shown a non-zero ``HAPI_STATUS``; see
+    ``tests/unit/fixtures/asp/README.md``'s note on why a fabricated "failure" reply belongs here,
+    not in that directory, matching ``test_asmb8_network.py``'s ``SYNTHETIC_DNSCFG_WITH_SECRET``
+    precedent for the same reason."""
+    upper = name.upper()
+    return (
+        f"\n//Dynamic Data Begin\n"
+        f" WEBVAR_JSONVAR_{upper} = \n"
+        f" {{ \n"
+        f" WEBVAR_STRUCTNAME_{upper} : \n"
+        f" [ \n"
+        f" {{}} ],  \n"
+        f" HAPI_STATUS:{hapi_status} }}; \n"
+        f"//Dynamic data end\n"
+    )
 
 
 class TestTransportPolicy:
@@ -549,3 +589,407 @@ class TestNoCredentialLeakage:
         assert client._known_secrets() == [PASSWORD]
         client._session_cookie = SESSION_COOKIE
         assert set(client._known_secrets()) == {PASSWORD, SESSION_COOKIE}
+
+    def test_known_secrets_includes_the_csrf_token_once_captured(self):
+        client = make_client()
+        client._csrf_token = CSRF_TOKEN
+        assert CSRF_TOKEN in client._known_secrets()
+
+
+class TestGetWebvarIsReadOnly:
+    """The structural half of this collection's read-only guarantee: every informational module
+    can claim "get_webvar only ever issues GET" as a fact about the code, not a promise about
+    intent. Pinned two ways -- by observed behaviour (what actually goes out on the wire) and by
+    the method's own signature (it does not even accept a `data` argument, so nothing a caller
+    passes could turn it into a POST)."""
+
+    def test_get_webvar_issues_a_bare_get_with_no_body(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getdatetime.txt")))
+
+        client.get_webvar("getdatetime")
+
+        args, kwargs = client._http_session.request.call_args
+        assert args[0] == "GET"
+        assert kwargs["data"] is None
+
+    def test_get_webvar_has_no_data_parameter_to_be_misused(self):
+        signature = inspect.signature(AspClient.get_webvar)
+        assert "data" not in signature.parameters
+
+    def test_get_webvar_source_never_mentions_post(self):
+        # Belt-and-suspenders on top of the behavioural test above: the method body itself must
+        # not contain the string "POST" in any form that could issue one.
+        source = inspect.getsource(AspClient.get_webvar)
+        assert '"POST"' not in source
+        assert "'POST'" not in source
+
+
+class TestPostWebvar:
+    """`AspClient.post_webvar()` -- the separately-named sibling of `get_webvar()` for the two
+    endpoints sourced from a real save-action capture that require their selector submitted as a
+    POST body: `getselentries.asp` (SEL paging, WEBVAR_LASTEVENTID) and `getsessioninfo.asp` (the
+    per-service session directory, SERVICEBIT). See tests/unit/fixtures/asp/README.md's
+    "POST-parameterized reads" section for exactly what was captured."""
+
+    def test_issues_a_post_with_the_given_data_to_the_rpc_path(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getselentries_post_lasteventid24.txt")))
+
+        client.post_webvar("getselentries", data={"WEBVAR_LASTEVENTID": "24"})
+
+        args, kwargs = client._http_session.request.call_args
+        assert args[0] == "POST"
+        assert args[1] == f"{client.base_url}/rpc/getselentries.asp"
+        assert kwargs["data"] == {"WEBVAR_LASTEVENTID": "24"}
+
+    def test_parses_the_real_getselentries_post_capture_as_a_legitimately_empty_result(self):
+        """Sourced fact, not a parsing failure: the SEL held exactly 24 entries at capture time, so
+        "entries after record 24" is genuinely empty -- see the module docstring on asmb8_sel and
+        the fixtures README."""
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getselentries_post_lasteventid24.txt")))
+
+        response = client.post_webvar("getselentries", data={"WEBVAR_LASTEVENTID": "24"})
+
+        assert isinstance(response, WebVarResponse)
+        assert response.records == []
+        assert response.hapi_status == 0
+
+    def test_parses_the_real_getsessioninfo_post_capture(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getsessioninfo_post_servicebit4.txt")))
+
+        response = client.post_webvar("getsessioninfo", data={"SERVICEBIT": "4"})
+
+        assert response.records == [{"SID": 24, "STYPE": 7, "IPADDRESS": "192.0.2.10", "UID": 2, "UNAME": "admin", "UPRIV": 4}]
+        assert response.hapi_status == 0
+
+    def test_endpoint_name_is_wrapped_in_the_rpc_path_the_same_way_as_get_webvar(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getsessioninfo_post_servicebit4.txt")))
+
+        client.post_webvar("getsessioninfo", data={"SERVICEBIT": "4"})
+
+        assert client._http_session.request.call_args[0][1] == f"{client.base_url}/rpc/getsessioninfo.asp"
+
+    def test_malformed_response_raises_protocol_error_same_as_get_webvar(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response("<html>not a webvar body</html>"))
+
+        with pytest.raises(ProtocolError):
+            client.post_webvar("getselentries", data={"WEBVAR_LASTEVENTID": "24"})
+
+
+class TestSetWebvar:
+    """`AspClient.set_webvar()` -- this collection's first, and so far only, way to mutate BMC
+    configuration. Sourced from a real save-action capture (2026-08-10) backing `asmb8_ntp`; see
+    `docs/protocol-notes.md`'s NTP write-convention section for the request-body field names and
+    `tests/unit/fixtures/asp/README.md` for exactly what is and is not sourced about the two reply
+    fixtures used below."""
+
+    def test_issues_a_post_with_the_given_data_to_the_rpc_path(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("setntpcfg_write.txt")))
+
+        client.set_webvar(
+            "setntpcfg",
+            {
+                "NEW_NTPSERVER_NAME1": "pool.ntp.org",
+                "OLD_NTPSERVER_NAME1": "pool.ntp.org",
+                "NEW_NTPSERVER_NAME2": " 192.0.2.10",
+                "ISNTPENABLE": "0",
+            },
+        )
+
+        args, kwargs = client._http_session.request.call_args
+        assert args[0] == "POST"
+        assert args[1] == f"{client.base_url}/rpc/setntpcfg.asp"
+        assert kwargs["data"]["ISNTPENABLE"] == "0"
+        assert kwargs["data"]["NEW_NTPSERVER_NAME2"] == " 192.0.2.10"  # leading space sent verbatim
+
+    def test_returns_the_parsed_empty_record_reply(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("setntpcfg_write.txt")))
+
+        response = client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+        assert isinstance(response, WebVarResponse)
+        assert response.records == []
+        assert response.hapi_status == 0
+
+    def test_works_against_setdatetime_too(self):
+        # set_webvar() is sourced against two endpoints from the same capture, not just the one
+        # asmb8_ntp itself calls -- see the method's own docstring.
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("setdatetime_write.txt")))
+
+        response = client.set_webvar("setdatetime", {"SECONDS": "1786347240", "UTCMINUTES": "480", "TIMEZONE": "GMT+8", "ISNTPENABLE": "0"})
+
+        assert response.hapi_status == 0
+        args, _kwargs = client._http_session.request.call_args
+        assert args[1] == f"{client.base_url}/rpc/setdatetime.asp"
+
+    def test_nonzero_hapi_status_raises_remote_operation_error(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_synthetic_webvar_failure_body("setntpcfg", 1)))
+
+        with pytest.raises(RemoteOperationError):
+            client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+    def test_nonzero_hapi_status_error_carries_the_status_as_return_value(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_synthetic_webvar_failure_body("setntpcfg", 1)))
+
+        with pytest.raises(RemoteOperationError) as excinfo:
+            client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+        assert excinfo.value.return_value == 1
+
+    def test_malformed_response_raises_protocol_error_same_as_get_and_post_webvar(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response("<html>not a webvar body</html>"))
+
+        with pytest.raises(ProtocolError):
+            client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+    def test_set_webvar_is_a_distinct_method_from_get_and_post_webvar(self):
+        # Different name, different method object from both read paths -- see set_webvar's own
+        # docstring for why that is the entire point: nobody reaches a write by accident.
+        assert AspClient.set_webvar is not AspClient.get_webvar
+        assert AspClient.set_webvar is not AspClient.post_webvar
+
+
+class TestCsrfToken:
+    """The anti-CSRF token this BMC's login response carries, and this collection's
+    match-the-vendor decision to replay it on POST reads -- see AspClient._headers()'s docstring
+    for the full reasoning, including the explicit caveat that enforcement is unverified."""
+
+    def test_login_harvests_the_csrftoken_from_the_response_body(self):
+        client = make_client()
+        client._http_session.request = Mock(return_value=mock_response(f"{{'SESSION_COOKIE':'{SESSION_COOKIE}','CSRFTOKEN':'{CSRF_TOKEN}'}}"))
+
+        client.login()
+
+        assert client._csrf_token == CSRF_TOKEN
+
+    def test_a_login_response_with_no_csrftoken_field_leaves_it_none_without_raising(self):
+        client = make_client()
+        client._http_session.request = Mock(return_value=mock_response(f"{{'SESSION_COOKIE':'{SESSION_COOKIE}'}}"))
+
+        client.login()  # must not raise
+
+        assert client._csrf_token is None
+
+    def test_an_empty_csrftoken_value_is_none_not_an_empty_string(self):
+        client = make_client()
+        client._http_session.request = Mock(return_value=mock_response(f"{{'SESSION_COOKIE':'{SESSION_COOKIE}','CSRFTOKEN':''}}"))
+
+        client.login()
+
+        assert client._csrf_token is None
+
+    def test_the_login_request_itself_never_carries_a_csrftoken_header_even_when_one_is_already_known(self):
+        # Mirrors the vendor JS's own rule verbatim (lib/xmit.js): CSRFTOKEN is never attached to
+        # a WEBSES request. A client re-authenticating (e.g. after a session expired) may already
+        # hold a token from its previous login; that must not leak onto the next login POST.
+        client = make_client()
+        client._csrf_token = CSRF_TOKEN
+        client._http_session.request = Mock(return_value=mock_response(f"{{'SESSION_COOKIE':'{SESSION_COOKIE}'}}"))
+
+        client.login()
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert "CSRFTOKEN" not in kwargs["headers"]
+        assert kwargs["headers"].get("Cookie") is None  # no session cookie was set before this login, either
+
+    def test_post_webvar_sends_the_csrftoken_header_when_one_was_captured(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._csrf_token = CSRF_TOKEN
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getsessioninfo_post_servicebit4.txt")))
+
+        client.post_webvar("getsessioninfo", data={"SERVICEBIT": "4"})
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert kwargs["headers"]["CSRFTOKEN"] == CSRF_TOKEN
+
+    def test_post_webvar_omits_the_header_when_no_token_was_ever_captured(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        assert client._csrf_token is None
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getsessioninfo_post_servicebit4.txt")))
+
+        client.post_webvar("getsessioninfo", data={"SERVICEBIT": "4"})
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert "CSRFTOKEN" not in kwargs["headers"]
+
+    def test_get_webvar_never_sends_a_csrftoken_header_even_when_one_is_known(self):
+        # Scope check for the deliberately-narrower-than-the-vendor rule: see _headers()'s
+        # docstring on why this collection attaches CSRFTOKEN to POST only, leaving the
+        # independently-working GET reads unchanged.
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._csrf_token = CSRF_TOKEN
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getdatetime.txt")))
+
+        client.get_webvar("getdatetime")
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert "CSRFTOKEN" not in kwargs["headers"]
+
+    def test_no_csrftoken_header_is_ever_sent_before_a_token_exists_regardless_of_method(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("getselentries_post_lasteventid24.txt")))
+
+        client.post_webvar("getselentries", data={"WEBVAR_LASTEVENTID": "24"})
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert "CSRFTOKEN" not in kwargs["headers"]
+
+    def test_set_webvar_sends_the_csrftoken_header_when_one_was_captured(self):
+        # set_webvar() shares _headers() with post_webvar() -- same attachment rule, same
+        # best-effort/never-blocking behaviour -- see set_webvar's own docstring.
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._csrf_token = CSRF_TOKEN
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("setntpcfg_write.txt")))
+
+        client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert kwargs["headers"]["CSRFTOKEN"] == CSRF_TOKEN
+
+    def test_set_webvar_omits_the_header_when_no_token_was_ever_captured(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        assert client._csrf_token is None
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("setntpcfg_write.txt")))
+
+        client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+        kwargs = client._http_session.request.call_args.kwargs
+        assert "CSRFTOKEN" not in kwargs["headers"]
+
+
+def _string_call_arguments(source: str) -> set[str]:
+    """Every string literal passed as a `Call` argument (positional or keyword) anywhere in `source`.
+
+    AST-based, deliberately not a raw substring search over the text: a prose mention inside a
+    comment or a docstring is neither of those things (a docstring is an `Expr` statement holding
+    a bare string constant, never itself an argument to a `Call`), so this cannot be tripped by
+    legitimate documentation the way a plain ``"needle" in source`` check would be. Only text that
+    some function call could actually be reached with counts.
+    """
+    tree = ast.parse(source)
+    values: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for arg in (*node.args, *(kw.value for kw in node.keywords)):
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    values.add(arg.value)
+    return values
+
+
+def _names_endpoint_as_a_call_argument(source: str, endpoint: str) -> bool:
+    return any(endpoint in value.lower() for value in _string_call_arguments(source))
+
+
+#: Endpoints with a sourced `set*.asp` write convention (see docs/protocol-notes.md) that this
+#: collection deliberately does NOT implement -- no client method, no module option, no call
+#: argument anywhere under plugins/. `set_webvar()`'s own docstring names the two endpoints that
+#: ARE implemented (`setntpcfg`, `setdatetime`); this tuple is everything else that is merely
+#: *recorded* as protocol knowledge. Extend this tuple, not the individual tests below, the next
+#: time a write convention is sourced but deliberately left unbuilt -- that is the whole point of
+#: `TestNoWriteEndpointIsReachable` staying a loop over data rather than one test per endpoint.
+_UNIMPLEMENTED_SET_ENDPOINTS = ("setvmediacfg",)
+
+#: The only two write endpoints this collection actually reaches, via `set_webvar()` from
+#: `asmb8_ntp`. Kept alongside `_UNIMPLEMENTED_SET_ENDPOINTS` so a future addition to either tuple
+#: makes the "is this endpoint accounted for" bookkeeping impossible to forget.
+_IMPLEMENTED_SET_ENDPOINTS = ("setntpcfg", "setdatetime")
+
+
+class TestNoWriteEndpointIsReachable:
+    """The sourced `setvmediacfg.asp` write convention (see docs/protocol-notes.md's "A sourced,
+    unimplemented write convention" section) is recorded as protocol knowledge only, deliberately
+    NOT implemented anywhere in this collection -- no client method, no module option. These scan
+    real source files on disk (not just this process's imports) so a write capability cannot slip
+    in behind a lazy import or a dynamically-built string this static a check would otherwise miss
+    trivially -- see each test's own docstring for exactly what it does and does not catch.
+
+    Generalised (not just `setvmediacfg`-specific) so the same guarantee automatically covers any
+    future endpoint added to `_UNIMPLEMENTED_SET_ENDPOINTS` above, per `set_webvar()`'s own
+    docstring note that adding a write method must never loosen this guarantee for the endpoints
+    it does not implement."""
+
+    def test_no_write_method_exists_on_the_client_for_unimplemented_endpoints(self):
+        assert not hasattr(AspClient, "set_vmediacfg")
+
+    def test_asp_py_source_never_calls_out_to_an_unimplemented_write_endpoint(self):
+        # Documenting the endpoint in a docstring (as post_webvar()'s and set_webvar()'s own
+        # docstrings do, by name, to explain why it must never be used that way) is fine and
+        # expected; passing it as a call argument anywhere would mean it is actually reachable,
+        # which is what this checks.
+        source = inspect.getsource(asp)
+        for endpoint in _UNIMPLEMENTED_SET_ENDPOINTS:
+            assert not _names_endpoint_as_a_call_argument(source, endpoint)
+
+    def test_no_plugin_source_file_calls_out_to_an_unimplemented_write_endpoint(self):
+        """`docs/protocol-notes.md` and this file's own docstrings are allowed to name an
+        unimplemented endpoint in prose as sourced-but-unimplemented protocol knowledge (that is
+        the whole point of recording it) -- but no file under `plugins/` (the code that actually
+        runs) may pass that name as an actual call argument, ever."""
+        offenders = []
+        for path in PLUGINS_DIR.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for endpoint in _UNIMPLEMENTED_SET_ENDPOINTS:
+                if _names_endpoint_as_a_call_argument(text, endpoint):
+                    offenders.append((str(path), endpoint))
+        assert offenders == []
+
+    def test_set_webvar_only_names_the_two_endpoints_it_actually_implements(self):
+        """`set_webvar()` itself is generic -- it will POST to whatever endpoint a caller gives it
+        -- so the real guarantee lives in who calls it, not in the method. This confirms
+        `asp.py`'s own source never passes any of the deliberately-unimplemented endpoints as a
+        call argument to `set_webvar` (or anything else -- see the test above) while still being
+        free to mention `_IMPLEMENTED_SET_ENDPOINTS` in its docstring."""
+        source = inspect.getsource(asp)
+        arguments = _string_call_arguments(source)
+        for endpoint in _UNIMPLEMENTED_SET_ENDPOINTS:
+            assert endpoint not in arguments
+
+    def test_asmb8_ntp_only_reaches_the_two_sourced_write_endpoints(self):
+        """The one caller of `set_webvar()` in this collection today. Confirms it reaches exactly
+        the endpoints its own write capture sourced, and none of the endpoints recorded as
+        unimplemented."""
+        from ansible_collections.james_crowley.asmb8_ikvm.plugins.modules import asmb8_ntp
+
+        source = inspect.getsource(asmb8_ntp)
+        arguments = _string_call_arguments(source)
+        for endpoint in _UNIMPLEMENTED_SET_ENDPOINTS:
+            assert endpoint not in arguments
+        assert "setntpcfg" in arguments  # the one write endpoint this module actually uses
+
+    def test_asmb8_sel_and_asmb8_sessions_modules_expose_no_state_option(self):
+        """The write convention's own brief is explicit: no `state` option anywhere for this
+        capability. `asmb8_redirection` legitimately has an unrelated, already-documented `state`
+        option of its own (a different, also-unimplemented gap) -- this checks only the two
+        modules this task actually touched."""
+        from ansible_collections.james_crowley.asmb8_ikvm.plugins.modules import asmb8_sel, asmb8_sessions
+
+        assert "state" not in asmb8_sel.argument_spec()
+        assert "state" not in asmb8_sessions.argument_spec()

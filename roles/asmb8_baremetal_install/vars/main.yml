@@ -31,3 +31,10 @@ asmb8_baremetal_install_default_state:
   reset_confirmed: false
   detached: true
   last_failure: null
+  # ipxe_http delivery mode only -- the session id of the ephemeral
+  # asmb8_http_origin session this run started, claimed and persisted before
+  # asmb8_bootstrap_image or asmb8_media can be attached against it, for the
+  # same "always able to find it and stop it" reason session_id (above) is
+  # claimed before asmb8_media's attach -- see tasks/prepare_ipxe_delivery.yml
+  # and tasks/main.yml's `always` block. null for a full_iso run, always.
+  ipxe_origin_session_id: null

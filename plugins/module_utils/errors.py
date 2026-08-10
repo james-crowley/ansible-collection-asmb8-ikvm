@@ -105,6 +105,12 @@ _REDACTED = "[REDACTED]"
 #:   A generic ``\bpassword\b`` pattern will NOT match this: underscore is a
 #:   word character, so there is no word boundary between ``WEBVAR_`` and
 #:   ``PASSWORD`` and the substring is never isolated as its own word.
+#: * ``CSRFTOKEN`` -- the anti-CSRF token ``asp.py``'s ``login()`` harvests
+#:   from ``/rpc/WEBSES/create.asp``'s own response body (see that file's
+#:   ``_CSRFTOKEN_RE``) and later replays as a request header on ``POST``
+#:   reads (``post_webvar()``). Not credential material in the sense of
+#:   granting access on its own, but it is BMC-issued session-bound material
+#:   with no business appearing in a message, same as ``STOKEN``/``kvmtoken``.
 _AMI_SECRET_NAMES = (
     "SESSION_COOKIE",
     "SessionCookie",
@@ -112,6 +118,7 @@ _AMI_SECRET_NAMES = (
     "kvmtoken",
     "webcookie",
     "WEBVAR_PASSWORD",
+    "CSRFTOKEN",
 )
 _AMI_SECRET_NAME_ALTERNATION = "|".join(re.escape(name) for name in _AMI_SECRET_NAMES)
 

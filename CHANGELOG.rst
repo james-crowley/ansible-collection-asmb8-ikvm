@@ -4,6 +4,77 @@ james\_crowley.asmb8\_ikvm Release Notes
 
 .. contents:: Topics
 
+v0.5.0
+======
+
+Release Summary
+---------------
+
+Twenty modules, and the first one that writes BMC configuration.
+
+The headline is the fast install path. Streaming a 1,628 MiB installer over the
+BMC's virtual media is measured at ~790 KB/s, takes roughly 35 minutes, and a
+real attempt failed partway with virtual-CD read timeouts. A 0.89 MiB iPXE
+bootstrap, by contrast, boots over the same channel in about two minutes,
+nearly all of it POST rather than transfer — confirmed twice on real hardware.
+Until now that image was built by hand outside the repository. This release adds
+``asmb8_bootstrap_image`` to build it, and an ``ipxe_http`` delivery mode in the
+``asmb8_baremetal_install`` role that serves it, hands off, and tears the
+ephemeral origin down afterwards. ``full_iso`` remains the default, so nothing
+already published changes behaviour.
+
+Two things in that path exist because of specific failures. The origin's
+lifetime is now computed from the role's own handoff timeout rather than
+guessed, after a hand-set 30-minute cap expired mid-run and a boot attempt hit
+a dead server. And the role now samples the BIOS POST code across the handoff,
+because IPMI Serial-over-LAN does not work on this board and the console's video
+cannot be decoded — without it, a failed install reports nothing more useful
+than "timed out".
+
+``asmb8_ntp`` is the collection's first configuration write. Its endpoints are
+sourced from a capture of the BMC's own web UI performing a save, and it is
+genuinely idempotent: it reads current state, compares, and writes only on a
+real difference. One detail worth knowing if you extend this — the BMC returns
+its second NTP server with a leading space and expects it back unchanged, so
+comparison is byte-for-byte with no trimming. A module that stripped whitespace
+would report a change on every single run.
+
+``asmb8_info`` gains optional media preconditions, reading the encryption,
+licensing and attach state that determine whether a virtual-media attach can
+succeed. That turns "attach failed" into "attach failed because media
+encryption is enabled, which this client cannot speak" — a distinction that
+previously cost hours of misdiagnosis.
+
+Still **not hardware-qualified**. A completed unattended operating-system
+install remains unproven; the target used for testing currently has no Ethernet
+link on any interface, which is what blocks the HTTP hand-off rather than
+anything in this collection. The ``ipxe_http`` path is unit-tested but has never
+produced a booting machine, and the bootstrap image's real size and GRUB syntax
+have not been verified against a genuine build. ``docs/capability-matrix.md``
+tiers every claim and ``docs/netboot-design.md`` section 10 states precisely
+which parts of that design are implemented versus verified.
+
+Minor Changes
+-------------
+
+- ``asmb8_ntp`` - new module, this collection's first that actually writes BMC configuration: manages NTP server configuration (``server1``/``server2``/``enabled``) via ``getntpcfg.asp``/``setntpcfg.asp``. Genuinely idempotent -- it reads current state first and only writes when something actually differs, comparing ``server2`` byte-for-byte (including a leading space observed in the real capture) rather than after a friendlier but wrong trimmed comparison. Returns the prior state alongside the new one so a play can restore it. ``check_mode`` reads (login is a real, unavoidable prerequisite for predicting a write here) but never writes. Follows the sourced write convention exactly: ``OLD_NTPSERVER_NAME1`` is always sent, no ``OLD_NTPSERVER_NAME2`` is ever invented, and every write resubmits all three fields, not just the one that changed. Deliberately does not implement timezone/UTC-offset options or ever call ``setdatetime.asp`` -- see its DOCUMENTATION and ``docs/asmb8_ntp.md`` for why, including the explicitly-flagged, unsourced inference this module makes to map ``getntpcfg.asp``'s ``NTP_STATUS`` (read) onto ``setntpcfg.asp``'s ``ISNTPENABLE`` (write).
+- ``asmb8_sel`` - add ``after_event_id``, reading the SEL's paged, ``POST``-only ``getselentries.asp`` sibling (``WEBVAR_LASTEVENTID``) via the new ``post_webvar()``. Documents that an empty result after ``after_event_id`` can legitimately mean "nothing newer", not a failure -- the one real capture of this endpoint (``WEBVAR_LASTEVENTID=24`` against a 24-entry log) returned zero records for exactly that reason. The default, unset behaviour (``getallselentries.asp`` in full) is unchanged.
+- ``asmb8_sessions`` - add ``active_session_services``, reading ``getsessioninfo.asp``'s per-service active-session directory (``POST``, ``SERVICEBIT``) via the new ``post_webvar()``. ``SERVICEBIT`` is resolved live against this run's own ``getallservicescfg.asp`` read (``SERVICEID``) rather than a second, hardcoded copy of that mapping; only ``cd-media``'s ``SERVICEBIT`` is independently confirmed by a real capture, and the module documents that generalising it to other services is an inference. ``IPADDRESS``/``UNAME`` are returned (deliberately, unlike ``asmb8_users``' opposite choice for unrelated personal-data fields -- see the module's own DOCUMENTATION for why); ``UPRIV`` is returned raw, since its encoding is unsourced. ``active_sessions`` stays ``null`` unless ``active_session_services`` is given.
+- ``docs/protocol-notes.md`` - record the sourced-and-now-implemented ``setntpcfg.asp``/ ``setdatetime.asp`` write convention backing ``asmb8_ntp``, naming all three ``set*.asp`` endpoints sourced so far in one place. The key finding: setter field-name convention is per-endpoint, not collection-wide -- ``setdatetime.asp`` reuses its getter's field names verbatim, while ``setntpcfg.asp`` does not reuse ``getntpcfg.asp``'s at all. The previously recorded, still-unimplemented ``setvmediacfg.asp`` convention is retained unchanged, now cross-referenced against this contradicting evidence.
+- ``docs/protocol-notes.md`` - record the sourced-but-unimplemented ``setvmediacfg.asp`` write convention (``set<X>.asp`` takes the field names ``get<X>.asp`` returns) as protocol knowledge only. Nothing in this collection implements it -- no write method, no ``state`` option, no reference to it anywhere under ``plugins/``.
+- ``plugins/module_utils/asp.py`` - add ``AspClient.post_webvar()``, a separately-named sibling of ``get_webvar()`` for the handful of ``.asp`` endpoints that require their parameters submitted as a ``POST`` body to return anything (sourced from a real save-action capture, 2026-08-10). ``get_webvar()`` itself is untouched and remains strictly ``GET``-only, so every module's existing "this only issues GET" claim still holds; ``post_webvar()`` exists precisely so a genuine write can never be reached by reusing the read path. Also captures the anti-CSRF ``CSRFTOKEN`` this BMC's login response returns and attaches it to non-login ``POST`` requests, matching the vendor JS's own rule -- best-effort only, since whether this firmware enforces the header is unverified.
+- ``plugins/module_utils/asp.py`` - add ``AspClient.set_webvar()``, this collection's first, and so far only, way to mutate BMC configuration. Named distinctly from ``get_webvar()`` (strictly ``GET``-only, unchanged) and ``post_webvar()`` (a ``POST`` that is still only ever a read) precisely so a genuine write can never be reached by a caller reusing an existing read method for "just one more POST". Attaches the ``CSRFTOKEN`` header the same best-effort way ``post_webvar()`` already does, and raises ``errors.RemoteOperationError`` on a non-zero ``HAPI_STATUS`` -- a write that gets HTTP 200 back and is treated as successful without anyone checking the BMC's own result code is exactly the failure mode this method exists to prevent. Sourced from a real save-action capture (2026-08-10) against ``setntpcfg.asp`` and ``setdatetime.asp``; the structural tests guaranteeing ``setvmediacfg.asp`` (a third, still unimplemented, sourced write endpoint) remains unreachable from any plugin source file are generalised to cover any future unimplemented ``set*.asp`` endpoint, not just that one.
+- asmb8_baremetal_install - add O(asmb8_baremetal_install_delivery=ipxe_http) as an alternative to the existing O(asmb8_baremetal_install_delivery=full_iso) (the unchanged default) install path. C(ipxe_http) attaches only a tiny M(james_crowley.asmb8_ikvm.asmb8_bootstrap_image) image over iUSB and fetches everything Proxmox-sized over plain HTTP from an ephemeral M(james_crowley.asmb8_ikvm.asmb8_http_origin) session this role starts and always stops itself (even on failure or interruption), sized from O(asmb8_baremetal_install_handoff_timeout) so the origin cannot expire mid-install. See C(docs/netboot-design.md) for the research behind this path.
+- asmb8_baremetal_install - sample M(james_crowley.asmb8_ikvm.asmb8_postcode) throughout O(asmb8_baremetal_install_wait_for_handoff)'s wait (O(asmb8_baremetal_install_sample_post_code_during_handoff), on by default for C(ipxe_http), off by default for C(full_iso)) so a failed hand-off reports the last BIOS POST code actually observed instead of only "timed out".
+- asmb8_bootstrap_image - new module that builds a size-budgeted (default 16 MiB), bootable iPXE image -- a prebuilt C(ipxe.lkrn) wrapped by C(grub-mkrescue), with an embedded script that brings up the target's NIC (O(network_mode=static) by default, O(network_mode=dhcp) as an explicit opt-out) and C(chain)s to O(origin_url). Never fetches C(ipxe.lkrn) itself and never falls back to a container runtime or a source build -- see its own C(DOCUMENTATION) for the trade-off. Supports C(check_mode).
+- asmb8_info - Add ``include_media_preconditions`` (requires ``include_web_session=true``), which reads ``getremotesession.asp`` and ``getvmediacfg.asp`` and reports the settings that gate whether a virtual-media attach can succeed -- media/KVM encryption, licensing, current attach state, configured device counts, and CD-ROM session capacity -- without attempting an attach. This turns a bare protocol rejection (the literal ``redirection not accepted (status 3)``, or this collection's own ``error_class=bmc_busy``) into an explained one -- see ``docs/hardware-evidence-2026-08-08.md``'s "Redirection rejection status 3 means bad token" section for the incident (two wrong theories chased for hours, two wasted boot cycles, and an unnecessary BMC cold reset) this option exists to shortcut. Session counts are decoded with the same ``+128`` offset ``asmb8_sessions`` already documents and confirms; the raw value is never reported. ``getremotesession.asp``'s documented, unverified session-expired failure mode against a programmatic client is degraded gracefully (reported via ``remote_session_read``, not fatal); ``getvmediacfg.asp`` has shown no equivalent failure mode, so a failure reading it still fails the module. ``V_MEDIA_STATUS`` is reported raw with an explicit meaning-unsourced caveat and is never used to infer live attach state.
+
+New Modules
+-----------
+
+- james_crowley.asmb8_ikvm.asmb8_bootstrap_image - Build a size\-budgeted, bootable iPXE bootstrap image that chains to an HTTP origin
+- james_crowley.asmb8_ikvm.asmb8_ntp - Manage ASMB8\-iKVM NTP server configuration
+
 v0.4.0
 ======
 

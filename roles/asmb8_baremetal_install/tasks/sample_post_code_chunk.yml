@@ -1,0 +1,46 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# One iteration of tasks/wait_for_handoff.yml's chunked hand-off wait /
+# POST-code sample. Split into its own file because `loop:` is not a valid
+# attribute of a `block:` task in Ansible -- looping this sequence of steps
+# therefore has to loop an `include_tasks` (which does support `loop`)
+# rather than the block itself. `item` below is supplied by the caller's own
+# `loop:`.
+
+- name: Try the hand-off endpoint for one bounded chunk
+  ansible.builtin.wait_for:
+    host: "{{ asmb8_baremetal_install_handoff_host }}"
+    port: "{{ asmb8_baremetal_install_handoff_port }}"
+    timeout: "{{ asmb8_baremetal_install_post_code_poll_interval_seconds }}"
+    delay: "{{ asmb8_baremetal_install_handoff_delay if item == 0 else 0 }}"
+  delegate_to: localhost
+  register: asmb8_baremetal_install_handoff_chunk
+  failed_when: false
+
+- name: Record whether this chunk actually confirmed hand-off
+  # See tasks/wait_for_handoff.yml's own header comment: ansible.builtin.
+  # wait_for's return carries no `msg` key on success, and always carries
+  # one on a timeout or refused connection -- that is the signal used here.
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_handoff_confirmed: "{{ asmb8_baremetal_install_handoff_chunk.msg is not defined }}"
+
+- name: Read the current POST code for diagnosis, only while hand-off remains unconfirmed
+  james_crowley.asmb8_ikvm.asmb8_postcode: {}
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_postcode_chunk
+  failed_when: false
+  when: not asmb8_baremetal_install_handoff_confirmed
+
+- name: Record the observed POST code and extend the history
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_last_post_code: "{{ asmb8_baremetal_install_postcode_chunk.post_code | default(asmb8_baremetal_install_last_post_code) }}"
+    asmb8_baremetal_install_post_code_history: >-
+      {{ asmb8_baremetal_install_post_code_history +
+         [{'chunk': item, 'post_code': asmb8_baremetal_install_postcode_chunk.post_code}] }}
+  when:
+    - not asmb8_baremetal_install_handoff_confirmed
+    - asmb8_baremetal_install_postcode_chunk.post_code is defined

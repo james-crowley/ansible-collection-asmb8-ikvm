@@ -101,8 +101,11 @@ ansible-galaxy collection install git+https://github.com/james-crowley/ansible-c
 | [`asmb8_media`](docs/asmb8_media.md) | Stream a local ISO to the BMC's virtual CD-ROM over iUSB | Yes |
 | [`asmb8_redirection`](docs/asmb8_redirection.md) | Report whether this BMC's own services (web, KVM, media, SSH, telnet) are enabled and reachable | No (`state` is accepted but always fails honestly — see [Known limitations](#known-limitations)) |
 | [`asmb8_console`](docs/asmb8_console.md) | Open the iKVM console (IVTP) session headlessly: confirm the channel is live, or save one raw (undecoded) video frame | No |
-| [`asmb8_reset`](plugins/modules/asmb8_reset.py) | Cold/warm-reset the BMC's management controller over IPMI — the recovery escape hatch for a wedged media session | Yes (BMC only; host power is unaffected) |
-| [`asmb8_http_origin`](plugins/modules/asmb8_http_origin.py) | Run (or stop) an ephemeral, path-confined, lifetime-capped local HTTP file server, for installers that fetch bulk files over LAN-speed HTTP instead of the slower iUSB path | No (local process only; does not touch the BMC) |
+| [`asmb8_reset`](docs/asmb8_reset.md) | Cold/warm-reset the BMC's management controller over IPMI — the recovery escape hatch for a wedged media session | Yes (BMC only; host power is unaffected) |
+| [`asmb8_identify`](docs/asmb8_identify.md) | Turn the chassis identify LED on (for a bounded interval or indefinitely) or off, over standard IPMI | Yes (LED only) |
+| [`asmb8_http_origin`](docs/asmb8_http_origin.md) | Run (or stop) an ephemeral, path-confined, lifetime-capped local HTTP file server, for installers that fetch bulk files over LAN-speed HTTP instead of the slower iUSB path | No (local process only; does not touch the BMC) |
+| [`asmb8_bootstrap_image`](docs/asmb8_bootstrap_image.md) | Build a small bootable iPXE image carrying an embedded chain script, so iUSB only has to carry megabytes while the installer itself travels over HTTP | No (produces a local file; does not touch the BMC) |
+| [`asmb8_ntp`](docs/asmb8_ntp.md) | Read and set the BMC's NTP servers and enable flag — the collection's only module that writes BMC configuration | **Yes** (writes `.asp` configuration) |
 
 ### Informational modules
 
@@ -135,7 +138,7 @@ entries are the one exception and are returned verbatim: sanitising free-text
 log entries would corrupt the record and give false assurance, so they may
 contain usernames or addresses and are documented as such.
 
-All eighteen are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
+All twenty are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
 their shared connection options centrally with `module_defaults`:
 
 ```yaml
@@ -353,7 +356,7 @@ body never lands in a task result verbatim.
 
 ## Project status
 
-**0.4.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
+**0.5.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
 hedge; it is an accurate description of where this collection is today.
 
 On one ASUS Z10PE-D16 WS / ASMB8-iKVM board (firmware 1.14, aux 1.14.2), this
@@ -508,11 +511,10 @@ this collection warrants unusual care with credentials.
   [`docs/asmb8_boot.md`](docs/asmb8_boot.md),
   [`docs/asmb8_media.md`](docs/asmb8_media.md),
   [`docs/asmb8_redirection.md`](docs/asmb8_redirection.md),
-  [`docs/asmb8_console.md`](docs/asmb8_console.md) — per-module reference:
-  options, return values, error classes, and examples. `asmb8_reset` and
-  `asmb8_http_origin` are documented in full in their own `DOCUMENTATION`
-  block (`ansible-doc james_crowley.asmb8_ikvm.asmb8_reset`, and likewise for
-  `asmb8_http_origin`) pending a standalone reference page.
+  [`docs/asmb8_console.md`](docs/asmb8_console.md),
+  [`docs/asmb8_reset.md`](docs/asmb8_reset.md),
+  [`docs/asmb8_http_origin.md`](docs/asmb8_http_origin.md) — per-module
+  reference: options, return values, error classes, and examples.
 - [`docs/capability-matrix.md`](docs/capability-matrix.md) — exactly what is
   verified against real firmware evidence, what is only unit/mock-tested, and
   what remains unproven, claim by claim.

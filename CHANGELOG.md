@@ -2,29 +2,104 @@
 
 **Topics**
 
-- <a href="#v0-4-0">v0\.4\.0</a>
+- <a href="#v0-5-0">v0\.5\.0</a>
     - <a href="#release-summary">Release Summary</a>
     - <a href="#minor-changes">Minor Changes</a>
-    - <a href="#bugfixes">Bugfixes</a>
     - <a href="#new-modules">New Modules</a>
-- <a href="#v0-3-0">v0\.3\.0</a>
+- <a href="#v0-4-0">v0\.4\.0</a>
     - <a href="#release-summary-1">Release Summary</a>
     - <a href="#minor-changes-1">Minor Changes</a>
-    - <a href="#bugfixes-1">Bugfixes</a>
+    - <a href="#bugfixes">Bugfixes</a>
     - <a href="#new-modules-1">New Modules</a>
-- <a href="#v0-2-0">v0\.2\.0</a>
+- <a href="#v0-3-0">v0\.3\.0</a>
     - <a href="#release-summary-2">Release Summary</a>
-    - <a href="#major-changes">Major Changes</a>
     - <a href="#minor-changes-2">Minor Changes</a>
+    - <a href="#bugfixes-1">Bugfixes</a>
+    - <a href="#new-modules-2">New Modules</a>
+- <a href="#v0-2-0">v0\.2\.0</a>
+    - <a href="#release-summary-3">Release Summary</a>
+    - <a href="#major-changes">Major Changes</a>
+    - <a href="#minor-changes-3">Minor Changes</a>
     - <a href="#bugfixes-2">Bugfixes</a>
 - <a href="#v0-1-0">v0\.1\.0</a>
-    - <a href="#release-summary-3">Release Summary</a>
-    - <a href="#new-modules-2">New Modules</a>
+    - <a href="#release-summary-4">Release Summary</a>
+    - <a href="#new-modules-3">New Modules</a>
+
+<a id="v0-5-0"></a>
+## v0\.5\.0
+
+<a id="release-summary"></a>
+### Release Summary
+
+Twenty modules\, and the first one that writes BMC configuration\.
+
+The headline is the fast install path\. Streaming a 1\,628 MiB installer over the
+BMC\'s virtual media is measured at \~790 KB/s\, takes roughly 35 minutes\, and a
+real attempt failed partway with virtual\-CD read timeouts\. A 0\.89 MiB iPXE
+bootstrap\, by contrast\, boots over the same channel in about two minutes\,
+nearly all of it POST rather than transfer — confirmed twice on real hardware\.
+Until now that image was built by hand outside the repository\. This release adds
+<code>asmb8\_bootstrap\_image</code> to build it\, and an <code>ipxe\_http</code> delivery mode in the
+<code>asmb8\_baremetal\_install</code> role that serves it\, hands off\, and tears the
+ephemeral origin down afterwards\. <code>full\_iso</code> remains the default\, so nothing
+already published changes behaviour\.
+
+Two things in that path exist because of specific failures\. The origin\'s
+lifetime is now computed from the role\'s own handoff timeout rather than
+guessed\, after a hand\-set 30\-minute cap expired mid\-run and a boot attempt hit
+a dead server\. And the role now samples the BIOS POST code across the handoff\,
+because IPMI Serial\-over\-LAN does not work on this board and the console\'s video
+cannot be decoded — without it\, a failed install reports nothing more useful
+than \"timed out\"\.
+
+<code>asmb8\_ntp</code> is the collection\'s first configuration write\. Its endpoints are
+sourced from a capture of the BMC\'s own web UI performing a save\, and it is
+genuinely idempotent\: it reads current state\, compares\, and writes only on a
+real difference\. One detail worth knowing if you extend this — the BMC returns
+its second NTP server with a leading space and expects it back unchanged\, so
+comparison is byte\-for\-byte with no trimming\. A module that stripped whitespace
+would report a change on every single run\.
+
+<code>asmb8\_info</code> gains optional media preconditions\, reading the encryption\,
+licensing and attach state that determine whether a virtual\-media attach can
+succeed\. That turns \"attach failed\" into \"attach failed because media
+encryption is enabled\, which this client cannot speak\" — a distinction that
+previously cost hours of misdiagnosis\.
+
+Still <strong>not hardware\-qualified</strong>\. A completed unattended operating\-system
+install remains unproven\; the target used for testing currently has no Ethernet
+link on any interface\, which is what blocks the HTTP hand\-off rather than
+anything in this collection\. The <code>ipxe\_http</code> path is unit\-tested but has never
+produced a booting machine\, and the bootstrap image\'s real size and GRUB syntax
+have not been verified against a genuine build\. <code>docs/capability\-matrix\.md</code>
+tiers every claim and <code>docs/netboot\-design\.md</code> section 10 states precisely
+which parts of that design are implemented versus verified\.
+
+<a id="minor-changes"></a>
+### Minor Changes
+
+* <code>asmb8\_ntp</code> \- new module\, this collection\'s first that actually writes BMC configuration\: manages NTP server configuration \(<code>server1</code>/<code>server2</code>/<code>enabled</code>\) via <code>getntpcfg\.asp</code>/<code>setntpcfg\.asp</code>\. Genuinely idempotent \-\- it reads current state first and only writes when something actually differs\, comparing <code>server2</code> byte\-for\-byte \(including a leading space observed in the real capture\) rather than after a friendlier but wrong trimmed comparison\. Returns the prior state alongside the new one so a play can restore it\. <code>check\_mode</code> reads \(login is a real\, unavoidable prerequisite for predicting a write here\) but never writes\. Follows the sourced write convention exactly\: <code>OLD\_NTPSERVER\_NAME1</code> is always sent\, no <code>OLD\_NTPSERVER\_NAME2</code> is ever invented\, and every write resubmits all three fields\, not just the one that changed\. Deliberately does not implement timezone/UTC\-offset options or ever call <code>setdatetime\.asp</code> \-\- see its DOCUMENTATION and <code>docs/asmb8\_ntp\.md</code> for why\, including the explicitly\-flagged\, unsourced inference this module makes to map <code>getntpcfg\.asp</code>\'s <code>NTP\_STATUS</code> \(read\) onto <code>setntpcfg\.asp</code>\'s <code>ISNTPENABLE</code> \(write\)\.
+* <code>asmb8\_sel</code> \- add <code>after\_event\_id</code>\, reading the SEL\'s paged\, <code>POST</code>\-only <code>getselentries\.asp</code> sibling \(<code>WEBVAR\_LASTEVENTID</code>\) via the new <code>post\_webvar\(\)</code>\. Documents that an empty result after <code>after\_event\_id</code> can legitimately mean \"nothing newer\"\, not a failure \-\- the one real capture of this endpoint \(<code>WEBVAR\_LASTEVENTID\=24</code> against a 24\-entry log\) returned zero records for exactly that reason\. The default\, unset behaviour \(<code>getallselentries\.asp</code> in full\) is unchanged\.
+* <code>asmb8\_sessions</code> \- add <code>active\_session\_services</code>\, reading <code>getsessioninfo\.asp</code>\'s per\-service active\-session directory \(<code>POST</code>\, <code>SERVICEBIT</code>\) via the new <code>post\_webvar\(\)</code>\. <code>SERVICEBIT</code> is resolved live against this run\'s own <code>getallservicescfg\.asp</code> read \(<code>SERVICEID</code>\) rather than a second\, hardcoded copy of that mapping\; only <code>cd\-media</code>\'s <code>SERVICEBIT</code> is independently confirmed by a real capture\, and the module documents that generalising it to other services is an inference\. <code>IPADDRESS</code>/<code>UNAME</code> are returned \(deliberately\, unlike <code>asmb8\_users</code>\' opposite choice for unrelated personal\-data fields \-\- see the module\'s own DOCUMENTATION for why\)\; <code>UPRIV</code> is returned raw\, since its encoding is unsourced\. <code>active\_sessions</code> stays <code>null</code> unless <code>active\_session\_services</code> is given\.
+* <code>docs/protocol\-notes\.md</code> \- record the sourced\-and\-now\-implemented <code>setntpcfg\.asp</code>/ <code>setdatetime\.asp</code> write convention backing <code>asmb8\_ntp</code>\, naming all three <code>set\*\.asp</code> endpoints sourced so far in one place\. The key finding\: setter field\-name convention is per\-endpoint\, not collection\-wide \-\- <code>setdatetime\.asp</code> reuses its getter\'s field names verbatim\, while <code>setntpcfg\.asp</code> does not reuse <code>getntpcfg\.asp</code>\'s at all\. The previously recorded\, still\-unimplemented <code>setvmediacfg\.asp</code> convention is retained unchanged\, now cross\-referenced against this contradicting evidence\.
+* <code>docs/protocol\-notes\.md</code> \- record the sourced\-but\-unimplemented <code>setvmediacfg\.asp</code> write convention \(<code>set\<X\>\.asp</code> takes the field names <code>get\<X\>\.asp</code> returns\) as protocol knowledge only\. Nothing in this collection implements it \-\- no write method\, no <code>state</code> option\, no reference to it anywhere under <code>plugins/</code>\.
+* <code>plugins/module\_utils/asp\.py</code> \- add <code>AspClient\.post\_webvar\(\)</code>\, a separately\-named sibling of <code>get\_webvar\(\)</code> for the handful of <code>\.asp</code> endpoints that require their parameters submitted as a <code>POST</code> body to return anything \(sourced from a real save\-action capture\, 2026\-08\-10\)\. <code>get\_webvar\(\)</code> itself is untouched and remains strictly <code>GET</code>\-only\, so every module\'s existing \"this only issues GET\" claim still holds\; <code>post\_webvar\(\)</code> exists precisely so a genuine write can never be reached by reusing the read path\. Also captures the anti\-CSRF <code>CSRFTOKEN</code> this BMC\'s login response returns and attaches it to non\-login <code>POST</code> requests\, matching the vendor JS\'s own rule \-\- best\-effort only\, since whether this firmware enforces the header is unverified\.
+* <code>plugins/module\_utils/asp\.py</code> \- add <code>AspClient\.set\_webvar\(\)</code>\, this collection\'s first\, and so far only\, way to mutate BMC configuration\. Named distinctly from <code>get\_webvar\(\)</code> \(strictly <code>GET</code>\-only\, unchanged\) and <code>post\_webvar\(\)</code> \(a <code>POST</code> that is still only ever a read\) precisely so a genuine write can never be reached by a caller reusing an existing read method for \"just one more POST\"\. Attaches the <code>CSRFTOKEN</code> header the same best\-effort way <code>post\_webvar\(\)</code> already does\, and raises <code>errors\.RemoteOperationError</code> on a non\-zero <code>HAPI\_STATUS</code> \-\- a write that gets HTTP 200 back and is treated as successful without anyone checking the BMC\'s own result code is exactly the failure mode this method exists to prevent\. Sourced from a real save\-action capture \(2026\-08\-10\) against <code>setntpcfg\.asp</code> and <code>setdatetime\.asp</code>\; the structural tests guaranteeing <code>setvmediacfg\.asp</code> \(a third\, still unimplemented\, sourced write endpoint\) remains unreachable from any plugin source file are generalised to cover any future unimplemented <code>set\*\.asp</code> endpoint\, not just that one\.
+* asmb8\_baremetal\_install \- add O\(asmb8\_baremetal\_install\_delivery\=ipxe\_http\) as an alternative to the existing O\(asmb8\_baremetal\_install\_delivery\=full\_iso\) \(the unchanged default\) install path\. C\(ipxe\_http\) attaches only a tiny M\(james\_crowley\.asmb8\_ikvm\.asmb8\_bootstrap\_image\) image over iUSB and fetches everything Proxmox\-sized over plain HTTP from an ephemeral M\(james\_crowley\.asmb8\_ikvm\.asmb8\_http\_origin\) session this role starts and always stops itself \(even on failure or interruption\)\, sized from O\(asmb8\_baremetal\_install\_handoff\_timeout\) so the origin cannot expire mid\-install\. See C\(docs/netboot\-design\.md\) for the research behind this path\.
+* asmb8\_baremetal\_install \- sample M\(james\_crowley\.asmb8\_ikvm\.asmb8\_postcode\) throughout O\(asmb8\_baremetal\_install\_wait\_for\_handoff\)\'s wait \(O\(asmb8\_baremetal\_install\_sample\_post\_code\_during\_handoff\)\, on by default for C\(ipxe\_http\)\, off by default for C\(full\_iso\)\) so a failed hand\-off reports the last BIOS POST code actually observed instead of only \"timed out\"\.
+* asmb8\_bootstrap\_image \- new module that builds a size\-budgeted \(default 16 MiB\)\, bootable iPXE image \-\- a prebuilt C\(ipxe\.lkrn\) wrapped by C\(grub\-mkrescue\)\, with an embedded script that brings up the target\'s NIC \(O\(network\_mode\=static\) by default\, O\(network\_mode\=dhcp\) as an explicit opt\-out\) and C\(chain\)s to O\(origin\_url\)\. Never fetches C\(ipxe\.lkrn\) itself and never falls back to a container runtime or a source build \-\- see its own C\(DOCUMENTATION\) for the trade\-off\. Supports C\(check\_mode\)\.
+* asmb8\_info \- Add <code>include\_media\_preconditions</code> \(requires <code>include\_web\_session\=true</code>\)\, which reads <code>getremotesession\.asp</code> and <code>getvmediacfg\.asp</code> and reports the settings that gate whether a virtual\-media attach can succeed \-\- media/KVM encryption\, licensing\, current attach state\, configured device counts\, and CD\-ROM session capacity \-\- without attempting an attach\. This turns a bare protocol rejection \(the literal <code>redirection not accepted \(status 3\)</code>\, or this collection\'s own <code>error\_class\=bmc\_busy</code>\) into an explained one \-\- see <code>docs/hardware\-evidence\-2026\-08\-08\.md</code>\'s \"Redirection rejection status 3 means bad token\" section for the incident \(two wrong theories chased for hours\, two wasted boot cycles\, and an unnecessary BMC cold reset\) this option exists to shortcut\. Session counts are decoded with the same <code>\+128</code> offset <code>asmb8\_sessions</code> already documents and confirms\; the raw value is never reported\. <code>getremotesession\.asp</code>\'s documented\, unverified session\-expired failure mode against a programmatic client is degraded gracefully \(reported via <code>remote\_session\_read</code>\, not fatal\)\; <code>getvmediacfg\.asp</code> has shown no equivalent failure mode\, so a failure reading it still fails the module\. <code>V\_MEDIA\_STATUS</code> is reported raw with an explicit meaning\-unsourced caveat and is never used to infer live attach state\.
+
+<a id="new-modules"></a>
+### New Modules
+
+* james\_crowley\.asmb8\_ikvm\.asmb8\_bootstrap\_image \- Build a size\-budgeted\, bootable iPXE bootstrap image that chains to an HTTP origin
+* james\_crowley\.asmb8\_ikvm\.asmb8\_ntp \- Manage ASMB8\-iKVM NTP server configuration
 
 <a id="v0-4-0"></a>
 ## v0\.4\.0
 
-<a id="release-summary"></a>
+<a id="release-summary-1"></a>
 ### Release Summary
 
 Takes the collection from 8 modules to 18\. The new surface is read\-only\: ten
@@ -65,7 +140,7 @@ mocked transport\, which is not the same thing\. <code>docs/capability\-matrix\.
 tiers every claim\, and <code>docs/hardware\-evidence\-2026\-08\-08\.md</code> records the
 dated observations behind them\, including the negative results\.
 
-<a id="minor-changes"></a>
+<a id="minor-changes-1"></a>
 ### Minor Changes
 
 * Add <code>asmb8\_identify</code>\, a module that controls the ASMB8\-iKVM chassis identify LED over standard IPMI \(netfn <code>0x00</code>\, cmd <code>0x04</code>\)\, via <code>pyghmi</code>\'s <code>Command\.set\_identify\(\)</code>\. Verified directly against <code>pyghmi</code> 1\.6\.19\'s installed source that this always resolves to the standard command on this board \(American Megatrends has no entry in <code>pyghmi</code>\'s OEM <code>oemmap</code>\, so the lookup falls through to its generic handler\, which is caught internally and never reaches this collection\'s caller\)\. Supports turning the LED on for a bounded duration\, on indefinitely\, or off\; refuses the two combinations that would silently contradict the requested state \(<code>duration</code> set alongside <code>state\=off</code>\, and <code>duration\=0</code> alongside <code>state\=on</code>\) before opening any IPMI session\. Standard IPMI Chassis Identify has no read\-back command\, so this module does not claim idempotence it cannot back up \-\- <code>changed</code> is always <code>true</code> on a real run\, matching <code>asmb8\_reset</code>\'s own honesty about the same kind of gap\, and check mode never opens a connection at all\. Carries no lockout risk \-\- it can only ever change whether a light is lit\.
@@ -89,7 +164,7 @@ dated observations behind them\, including the negative results\.
 * asmb8\_media \- fix a defect where an uncleanly\-terminated background media\-session daemon \(a <code>SIGTERM</code>\, e\.g\. from an interrupted play or a stray <code>pkill</code>\, previously arriving with no guaranteed effect\) could leave the BMC\'s single\, board\-wide C\(cd\-media\) slot held forever \-\- C\(getallservicescfg\.asp\) confirms this BMC applies no server\-side timeout at all \(C\(SERVICE\_TIMEOUT\: 4294967295\)\) to reclaim it\. The background daemon\'s existing <code>SIGTERM</code> handler is now proven\, by a test that forks a real daemon process and sends it a real <code>SIGTERM</code>\, to route through the exact same normal\-exit teardown a local O\(state\=detached\) call already used \-\- closing the iUSB session \(which sends the TCP C\(FIN\) the BMC needs to free the slot\) before the process exits \-\- rather than merely having a handler registered\. Deliberately not <code>SIGINT</code>\: a backgrounded process inherits C\(SIG\_IGN\) for that signal from its launching shell\'s own job control\, so C\(kill \-INT\) on one is silently swallowed\. The signal handler itself only ever sets a flag \(never touches the network\, a lock\, or any other non\-signal\-safe state\)\, which also makes it naturally idempotent \-\- a second <code>SIGTERM</code> arriving mid\-shutdown is a no\-op\, not a hang or an exception\.
 * asmb8\_media \- the background daemon\'s state file\, and RV\(operation\.observed\.stop\_reason\)\, now record WHY a O\(state\=detached\) session actually stopped \(V\(signal\)\, V\(peer\_closed\)\, or V\(bmc\_terminate\)\)\, mirroring O\(james\_crowley\.asmb8\_ikvm\.asmb8\_http\_origin\)\'s identically\-named field\, so a post\-mortem can tell a signalled stop apart from a BMC\-initiated one\.
 
-<a id="new-modules"></a>
+<a id="new-modules-1"></a>
 ### New Modules
 
 * james\_crowley\.asmb8\_ikvm\.asmb8\_alerts \- Read the ASMB8\-iKVM BMC\'s alerting configuration \(SMTP\, PEF\, policies\, LAN destinations\)
@@ -101,7 +176,7 @@ dated observations behind them\, including the negative results\.
 <a id="v0-3-0"></a>
 ## v0\.3\.0
 
-<a id="release-summary-1"></a>
+<a id="release-summary-2"></a>
 ### Release Summary
 
 Adds the two modules that 0\.2\.0 documented but did not ship\, plus a
@@ -134,7 +209,7 @@ mock coverage of its handshake state machine\. <code>README\.md</code> and
 <code>docs/hardware\-evidence\-2026\-08\-08\.md</code> records the dated observations behind
 every claim\, including the negative results\.
 
-<a id="minor-changes-1"></a>
+<a id="minor-changes-2"></a>
 ### Minor Changes
 
 * <code>asmb8\_media</code> \- add a regression test pinning that the KVM/media token is resolved from the JNLP by flag name rather than by argument position\. The shipped parser was already correct\; the test exists because a diagnostic harness read the token positionally as the fourth <code>\<argument\></code>\, which on this firmware is <code>\-hostname</code>\'s value \-\- the BMC\'s own IP address\. Authenticating with that made the BMC refuse redirection with an otherwise\-undocumented status <code>3</code>\, a failure whose only visible symptom was an established\-but\-idle socket\. Status <code>3</code> means \"bad token\"\. The test uses this firmware\'s real argument order so a future refactor back to index arithmetic fails in CI rather than on hardware\.
@@ -147,7 +222,7 @@ every claim\, including the negative results\.
 
 * asmb8\_baremetal\_install \- raise the default <code>asmb8\_baremetal\_install\_handoff\_timeout</code> from <code>3600</code> to <code>7200</code> seconds\. A real\, unattended Proxmox install against the target hardware was killed by the old one\-hour default at 70\% complete\; see the role\'s README \(\"Expected duration\"\) for the sizing arithmetic and how to compute a value for your own ISO\.
 
-<a id="new-modules-1"></a>
+<a id="new-modules-2"></a>
 ### New Modules
 
 * james\_crowley\.asmb8\_ikvm\.asmb8\_http\_origin \- Run \(or stop\) an ephemeral\, lifetime\-capped local HTTP file server
@@ -156,7 +231,7 @@ every claim\, including the negative results\.
 <a id="v0-2-0"></a>
 ## v0\.2\.0
 
-<a id="release-summary-2"></a>
+<a id="release-summary-3"></a>
 ### Release Summary
 
 First release intended for Ansible Galaxy\. <code>0\.1\.0</code> was tagged but never
@@ -191,7 +266,7 @@ deliberately so they are not re\-investigated without new evidence\.
 
 * asmb8\_redirection \- rewritten before the first Galaxy release to actually match its name\. It previously opened an IVTP console/KVM session \(closer to what amt\_media does in the sibling james\_crowley\.intel\_amt collection than to what amt\_redirection does\)\; that implementation has moved\, essentially unchanged\, to the new asmb8\_console module\. The name asmb8\_redirection now does what the sibling collection\'s amt\_redirection does\: report\, and \(once a real RPC is confirmed\) toggle\, whether this BMC\'s own listed services \(web\, kvm\, cd\-media\, fd\-media\, hd\-media\, ssh\, telnet\) are enabled\, separately from whether each one\'s TCP port is actually reachable right now\. Without a <code>state</code> option it is read\-only\, exactly like the sibling module\; any <code>state</code> request currently fails with <code>error\_class\=unsupported\_capability</code>\, since no sourced RPC exists yet for toggling a service\'s enablement on this BMC \(see the module\'s own DOCUMENTATION and docs/asmb8\_redirection\.md\)\.
 
-<a id="minor-changes-2"></a>
+<a id="minor-changes-3"></a>
 ### Minor Changes
 
 * asmb8\_console \- new module\, carrying asmb8\_redirection\'s former IVTP console/KVM\-session implementation \(handshake\, <code>capture\=handshake\_only\|raw\_frame\|decoded\_frame</code>\) unchanged in behaviour\. Added to <code>meta/runtime\.yml</code>\'s <code>asmb8\_ikvm</code> action group alongside the other five modules\.
@@ -205,7 +280,7 @@ deliberately so they are not re\-investigated without new evidence\.
 <a id="v0-1-0"></a>
 ## v0\.1\.0
 
-<a id="release-summary-3"></a>
+<a id="release-summary-4"></a>
 ### Release Summary
 
 Initial pre\-release\. Out\-of\-band management of ASUS ASMB8\-iKVM baseboard
@@ -219,7 +294,7 @@ verified against real firmware and <code>docs/hardware\-evidence\-2026\-08\-08\.
 the underlying observations\, including an explicit list of capabilities that
 remain unproven\.
 
-<a id="new-modules-2"></a>
+<a id="new-modules-3"></a>
 ### New Modules
 
 * james\_crowley\.asmb8\_ikvm\.asmb8\_boot \- Select a one\-time IPMI boot device on an ASMB8\-iKVM endpoint

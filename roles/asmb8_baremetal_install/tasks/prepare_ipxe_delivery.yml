@@ -1,0 +1,77 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# ipxe_http delivery mode only -- see README.md#ipxe_http and
+# docs/netboot-design.md for the full design this implements. Included from
+# tasks/main.yml's lifecycle block, before tasks/attach_media.yml, only when
+# asmb8_baremetal_install_delivery == ipxe_http.
+#
+# ORDER MATTERS: the origin must already be serving before the bootstrap
+# image is built, because the bootstrap's own embedded script chains to this
+# origin's URL -- there is no way to bake a URL into the image before the
+# origin has reported the address/port it actually bound.
+#
+# The origin's session id is claimed and persisted into run state
+# immediately once known -- mirrors tasks/attach_media.yml's own reasoning
+# for its media session id exactly: from this point on, tasks/main.yml's
+# `always` block can find and stop this origin on every path (success,
+# ordinary failure, or an indeterminate timeout), not only the happy path.
+# See README.md#ipxe_http for why this origin outliving the play at all
+# would be a real, not theoretical, problem.
+
+- name: Start the ephemeral HTTP origin for this install
+  james_crowley.asmb8_ikvm.asmb8_http_origin:
+    state: started
+    path: "{{ asmb8_baremetal_install_ipxe_origin_path }}"
+    bind_address: "{{ asmb8_baremetal_install_ipxe_origin_bind_address }}"
+    port: "{{ asmb8_baremetal_install_ipxe_origin_port }}"
+    runtime_dir: "{{ asmb8_baremetal_install_ipxe_origin_runtime_dir }}"
+    lifetime_seconds: "{{ asmb8_baremetal_install_ipxe_origin_lifetime_seconds | int }}"
+    start_timeout: "{{ asmb8_baremetal_install_ipxe_origin_start_timeout }}"
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_ipxe_origin_result
+
+- name: Persist the origin's session id before building or attaching anything against it
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_run_state: >-
+      {{ asmb8_baremetal_install_run_state
+         | combine({'ipxe_origin_session_id': asmb8_baremetal_install_ipxe_origin_result.session_id}) }}
+
+- name: Persist run state after starting the ipxe_http origin
+  ansible.builtin.include_tasks: save_state.yml
+
+- name: Build the iPXE bootstrap image chaining to this origin's boot script
+  james_crowley.asmb8_ikvm.asmb8_bootstrap_image:
+    origin_url: >-
+      {{ asmb8_baremetal_install_ipxe_origin_result.url | regex_replace('/+$', '') }}/{{
+      asmb8_baremetal_install_ipxe_script_name }}
+    ipxe_lkrn_path: "{{ asmb8_baremetal_install_ipxe_lkrn_path }}"
+    output_path: "{{ asmb8_baremetal_install_ipxe_bootstrap_output }}"
+    network_mode: "{{ asmb8_baremetal_install_ipxe_network_mode }}"
+    # default(omit, true) -- the boolean second argument, not the more usual
+    # single-argument form -- because these variables are DEFINED as an
+    # explicit `null` in defaults/main.yml (network_mode=dhcp leaves them
+    # unset), not Jinja-undefined; plain default() only substitutes on
+    # Undefined, and would otherwise template a bare None into the literal
+    # string "None" here.
+    address: "{{ asmb8_baremetal_install_ipxe_address | default(omit, true) }}"
+    netmask: "{{ asmb8_baremetal_install_ipxe_netmask | default(omit, true) }}"
+    gateway: "{{ asmb8_baremetal_install_ipxe_gateway | default(omit, true) }}"
+    dns: "{{ asmb8_baremetal_install_ipxe_dns | default(omit, true) }}"
+    size_budget_bytes: "{{ asmb8_baremetal_install_ipxe_size_budget_bytes }}"
+  delegate_to: localhost
+  register: asmb8_baremetal_install_bootstrap_result
+
+- name: Report the built bootstrap image's size against its budget
+  ansible.builtin.debug:
+    msg: >-
+      Built bootstrap image at {{ asmb8_baremetal_install_bootstrap_result.output_path }}
+      ({{ asmb8_baremetal_install_bootstrap_result.size_bytes }} bytes, budget
+      {{ asmb8_baremetal_install_ipxe_size_budget_bytes }} bytes). Serving
+      {{ asmb8_baremetal_install_ipxe_origin_path }} at
+      {{ asmb8_baremetal_install_ipxe_origin_result.url }} until this origin
+      is stopped or its {{ asmb8_baremetal_install_ipxe_origin_lifetime_seconds }}s
+      lifetime cap elapses, whichever comes first.

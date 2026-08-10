@@ -150,6 +150,125 @@ asmb8_baremetal_install_media_attach_timeout: 30
 asmb8_baremetal_install_media_detach_timeout: 30
 
 # ---------------------------------------------------------------------------
+# Delivery mode. full_iso (the default) streams the whole ISO named by
+# asmb8_baremetal_install_iso_path directly over iUSB, exactly as this role
+# has always worked -- see "Expected duration" above for why that is 35+
+# minutes for a real Proxmox ISO. ipxe_http instead attaches only a tiny
+# iPXE bootstrap image (asmb8_bootstrap_image, budget-capped -- see that
+# module's own DOCUMENTATION) over iUSB, and has the target fetch everything
+# Proxmox-sized over plain HTTP from an ephemeral origin this role starts and
+# stops itself (asmb8_http_origin). See docs/netboot-design.md for the
+# research behind this path, and README.md#ipxe_http for how the two roles
+# fit together.
+#
+# full_iso remains the default, and nothing about this variable's existence
+# changes full_iso's own behaviour -- every ipxe_http-only variable below is
+# ignored entirely unless this is set to ipxe_http.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_delivery: full_iso
+
+# ---------------------------------------------------------------------------
+# ipxe_http delivery mode only. See README.md#ipxe_http before setting any of
+# these -- in particular, this role does NOT run
+# `proxmox-auto-install-assistant --pxe` for you, and does NOT edit a
+# generated boot.ipxe's leading `dhcp` line for you; both are manual
+# prerequisites this role's tasks/validate.yml cannot verify were done
+# correctly, only that the variables naming them are set.
+# ---------------------------------------------------------------------------
+
+# Directory, on the controller, this role serves over HTTP for the duration
+# of the install -- typically proxmox-auto-install-assistant --pxe's own
+# output directory (vmlinuz, initrd.img, the stripped installer ISO, and a
+# generated boot.ipxe -- see docs/netboot-design.md section 3), with that
+# boot.ipxe's leading `dhcp` line already replaced by static `set net0/ip
+# ...`/`ifopen net0` lines per that document's section 5 -- this role's own
+# bootstrap image brings up the NIC once, before it ever chains to this
+# directory's boot.ipxe, so a second, redundant DHCP attempt inside that
+# file would defeat the whole point. Required when
+# asmb8_baremetal_install_delivery == ipxe_http.
+asmb8_baremetal_install_ipxe_origin_path: null
+
+# Filename, relative to asmb8_baremetal_install_ipxe_origin_path, this role's
+# bootstrap image chains to once its NIC is up. docs/netboot-design.md
+# section 3 documents this as the name proxmox-auto-install-assistant
+# --pxe-loader ipxe itself generates.
+asmb8_baremetal_install_ipxe_script_name: boot.ipxe
+
+# Local address the ephemeral HTTP origin listens on -- must be an address
+# the target's real NIC can actually reach, almost never the controller's
+# own loopback interface. Mirrors asmb8_http_origin's own bind_address,
+# which defaults to loopback specifically so a forgotten value fails safely
+# closed rather than answering on a network nobody decided it should; this
+# role does not inherit that default for the same reason
+# asmb8_baremetal_install_handoff_host has none either (see that variable's
+# own comment below) -- a wrong guess here is only discovered after the
+# reset. Required when asmb8_baremetal_install_delivery == ipxe_http.
+asmb8_baremetal_install_ipxe_origin_bind_address: null
+asmb8_baremetal_install_ipxe_origin_port: 0
+asmb8_baremetal_install_ipxe_origin_runtime_dir: ~/.ansible/asmb8_ikvm/http-origins
+asmb8_baremetal_install_ipxe_origin_start_timeout: 10
+asmb8_baremetal_install_ipxe_origin_stop_timeout: 15
+
+# THE ORIGIN'S LIFETIME CAP -- SIZED FROM THE HAND-OFF TIMEOUT, NOT A SECOND
+# INDEPENDENT GUESS. During this design's own investigation, an origin was
+# capped at 30 minutes and expired mid-run, so a later boot attempt hit a
+# dead HTTP server -- see docs/netboot-design.md and README.md#ipxe_http for
+# the reasoning this sizing exists to satisfy. This MUST always exceed
+# asmb8_baremetal_install_handoff_timeout with real headroom: the origin has
+# to still be alive for every byte fetched throughout the whole install, not
+# only through hand-off confirmation. Computed here from
+# asmb8_baremetal_install_handoff_timeout plus the postcondition-probe
+# window plus a fixed safety margin, rather than a second independent number
+# that could silently drift out of sync if someone raises one and forgets
+# the other -- override this directly only if that derivation genuinely
+# undersizes your own install.
+asmb8_baremetal_install_ipxe_origin_lifetime_seconds: >-
+  {{ (asmb8_baremetal_install_handoff_timeout | int)
+     + ((asmb8_baremetal_install_observe_retries | int) * (asmb8_baremetal_install_observe_delay | int))
+     + 900 }}
+
+# Prebuilt ipxe.lkrn path on the controller. asmb8_bootstrap_image never
+# fetches this itself -- see that module's own DOCUMENTATION for why -- so
+# caching this one small, static file is this role's caller's job. Required
+# when asmb8_baremetal_install_delivery == ipxe_http.
+asmb8_baremetal_install_ipxe_lkrn_path: null
+
+# Where this role writes the built bootstrap image before attaching it.
+asmb8_baremetal_install_ipxe_bootstrap_output: "{{ asmb8_baremetal_install_state_dir }}/bootstrap.iso"
+
+# Hard size-cap enforced by asmb8_bootstrap_image -- see its own
+# DOCUMENTATION for why this exists and defaults to 16 MiB.
+asmb8_baremetal_install_ipxe_size_budget_bytes: 16777216
+
+# static (the default) or dhcp -- see asmb8_bootstrap_image's own
+# DOCUMENTATION for why static is the default here and dhcp is offered only
+# as an explicit opt-out.
+asmb8_baremetal_install_ipxe_network_mode: static
+asmb8_baremetal_install_ipxe_address: null
+asmb8_baremetal_install_ipxe_netmask: null
+asmb8_baremetal_install_ipxe_gateway: null
+asmb8_baremetal_install_ipxe_dns: null
+
+# ---------------------------------------------------------------------------
+# POST-code sampling across the hand-off wait (tasks/wait_for_handoff.yml).
+# asmb8_postcode exists because IPMI Serial-over-LAN does not work on this
+# board and asmb8_console's video channel cannot be decoded -- see that
+# module's own DOCUMENTATION, which calls it "the highest-value module in
+# this batch" for exactly this reason. Wiring it into this wait means a
+# failed install reports the last BIOS POST code actually observed, instead
+# of only "timed out" -- the single biggest diagnostic improvement available
+# here for close to no cost.
+#
+# Defaults to enabled automatically for ipxe_http (where an origin that
+# expired, or a target that never got a NIC up, is a genuinely new failure
+# mode this role did not have before), and disabled by default for full_iso
+# so that mode's own behaviour is completely unchanged from before this
+# option existed -- override either explicitly if you want the opposite.
+# ---------------------------------------------------------------------------
+asmb8_baremetal_install_sample_post_code_during_handoff: "{{ asmb8_baremetal_install_delivery == 'ipxe_http' }}"
+asmb8_baremetal_install_post_code_poll_interval_seconds: 60
+
+# ---------------------------------------------------------------------------
 # One-time IPMI boot device this role arms before the destructive reset.
 # `optical` is the only value this role has ever driven -- the CD-ROM slot
 # asmb8_media attaches to above -- and is deliberately not left for a caller to

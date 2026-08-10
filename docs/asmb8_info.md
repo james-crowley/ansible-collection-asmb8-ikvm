@@ -50,6 +50,7 @@ determining it for real requires `asmb8_media`.
 | `connect_timeout` | `int` | `10` | no | — |
 | `ipmi_port` | `int` | `623` | no | — |
 | `include_web_session` | `bool` | `false` | no | — |
+| `include_media_preconditions` | `bool` | `false` | no | — (requires `include_web_session=true`) |
 
 `port`, `use_tls`, `allow_insecure_transport`, `validate_certs`, `ca_path`,
 `tls_fingerprint`, `timeout`, and `connect_timeout` are only consulted when
@@ -64,6 +65,34 @@ module **fails** — it does not silently degrade `asmb8.web_management` to
 `null` — because a caller that explicitly opted in almost certainly wants to
 know that credentials or connectivity are broken, not have that hidden behind
 a successful-looking IPMI-only result.
+
+### `include_media_preconditions`
+
+Defaults to `false`. **Requires `include_web_session=true`** — this module
+fails immediately, before reading anything, if this is `true` while
+`include_web_session` is not. Reads `getremotesession.asp` and
+`getvmediacfg.asp` over the same authenticated `.asp` session
+`include_web_session` creates (no second login), and reports the settings that
+actually gate whether a virtual-media attach can succeed, as
+`asmb8.media.preconditions` — without attempting an attach.
+
+**Why this exists.** Per
+[`docs/hardware-evidence-2026-08-08.md`](hardware-evidence-2026-08-08.md)'s
+"Redirection rejection status `3` means bad token" section, a bare protocol
+rejection (`vmedia: redirection not accepted (status 3)`, or this collection's
+own `error_class=bmc_busy`) does not by itself say *why*. Two wrong theories
+were chased for hours in that incident — a media session stranded by a network
+outage, then a BMC cold reset having reverted media settings — costing two
+wasted boot cycles and an unnecessary reset. Reading `getremotesession.asp`/
+`getvmediacfg.asp` first would have ruled out both suspected settings in one
+call each. **This option is the recommended first diagnostic step** before
+re-attempting an attach or reaching for a BMC reset.
+
+Costs two additional `GET` requests beyond `include_web_session` alone. This
+BMC's web server has a small per-listener worker pool and no keep-alive (see
+`plugins/module_utils/asp.py`); every request this module's `.asp` client
+issues is already serialized, and this option adds no concurrency of its own —
+avoid combining it with a concurrent play against the same BMC regardless.
 
 ## Return values
 
@@ -80,6 +109,15 @@ a successful-looking IPMI-only result.
 | `asmb8.capabilities.virtual_media` / `.remote_console` | `dict` | always | `{supported: null, proven: false, ...}` — not yet proven against this hardware. `null` (not `false`) means unknown, not unsupported. |
 | `asmb8.capabilities.redfish` | `dict` | always | Always `{supported: false, proven: true, ...}` — a confirmed hardware-generation fact (AST2400 predates Redfish), never a live probe. |
 | `asmb8.media.port_mode` | `str` | always | Always `"unknown"` — see Synopsis. |
+| `asmb8.media.preconditions` | `dict` | always | `null` unless `include_media_preconditions=true`. See "Diagnosing a failed virtual-media attach" below. |
+| `asmb8.media.preconditions.encryption.media_encryption_enabled` | `bool` | when `include_media_preconditions=true` | Whether `MEDIAENCRYPTION` is set, via `getremotesession.asp`. `null` if that endpoint could not be read this run. |
+| `asmb8.media.preconditions.encryption.secure_channel_enabled` | `bool` | when `include_media_preconditions=true` | Whether `V_STR_SECURE_CHANNEL` is set, via `getvmediacfg.asp`. |
+| `asmb8.media.preconditions.licensing.license_status_raw` | `int` | when `include_media_preconditions=true` | Raw `V_MEDIA_LICENSE_STATUS`. |
+| `asmb8.media.preconditions.attach.attach_raw` | `int` | when `include_media_preconditions=true` | Raw `VMEDIAATTACH`, via `getremotesession.asp`. `null` if that endpoint could not be read this run. |
+| `asmb8.media.preconditions.device_counts.{cd,fd,hd}` | `int` | when `include_media_preconditions=true` | Raw `V_NUM_CD`/`V_NUM_FD`/`V_NUM_HD`. |
+| `asmb8.media.preconditions.sessions.cd.{max,current}` | `int` | when `include_media_preconditions=true` | Decoded `V_MAX_CD_SESSIONS`/`V_ACTIVE_CD_SESSIONS` (raw value minus `128`). The raw value (`129`/`128` in this corpus) is never reported. |
+| `asmb8.media.preconditions.status_raw` | `int` | when `include_media_preconditions=true` | Raw `V_MEDIA_STATUS`. **Meaning unsourced** — see below. Never used to decide whether an attach can succeed. |
+| `asmb8.media.preconditions.remote_session_read.{outcome,error_class}` | `str` | when `include_media_preconditions=true` | Outcome of reading `getremotesession.asp` for this precondition group — `read` or `failed`. See below. |
 | `operation.schema` | `str` | always | Always `"asmb8-ikvm-operation/v1"`. |
 | `operation.action` | `str` | always | Always `"get_facts"`. |
 | `operation.endpoint` | `str` | always | `host:ipmi_port` this read was performed against. |
@@ -113,6 +151,66 @@ From `plugins/module_utils/errors.py`, via `IkvmError` subclasses:
   pre-connect timeout, or this board's saturated-worker-pool hang — see
   [`docs/asmb8_media.md`](asmb8_media.md)'s `error_class` section for what
   each of these means).
+- `protocol` — `getvmediacfg.asp` could not be parsed, when
+  `include_media_preconditions=true`. **Not** degraded to `null`: see
+  "Diagnosing a failed virtual-media attach" below for why this one endpoint
+  is treated differently from `getremotesession.asp`.
+
+## Diagnosing a failed virtual-media attach
+
+`include_media_preconditions=true` reads `getremotesession.asp` and
+`getvmediacfg.asp` and reports the settings that actually gate whether a
+virtual-media attach can succeed — as `asmb8.media.preconditions` — without
+attempting an attach itself.
+
+**Read this before re-attempting an attach or reaching for a BMC reset.** Per
+[`docs/hardware-evidence-2026-08-08.md`](hardware-evidence-2026-08-08.md)'s
+"Redirection rejection status `3` means bad token" section, a bare protocol
+rejection (`vmedia: redirection not accepted (status 3)`, or this collection's
+own `error_class=bmc_busy`) does not by itself say *why*. That incident chased
+two wrong theories for hours — a media session stranded by a network outage,
+then a BMC cold reset having reverted media settings — costing two wasted boot
+cycles and an unnecessary reset, before the real cause (a bad token, unrelated
+to either theory) was found. Reading `getremotesession.asp`/`getvmediacfg.asp`
+first would have ruled out both suspected settings in one call each.
+
+**The single most actionable field: encryption.**
+`asmb8.media.preconditions.encryption.media_encryption_enabled`
+(`MEDIAENCRYPTION`) and `.secure_channel_enabled` (`V_STR_SECURE_CHANNEL`) —
+this collection's iUSB client only speaks the plaintext variant of the
+protocol, so either one reading non-`false` means an attach cannot succeed
+against this client, independent of every other precondition reported
+alongside it.
+
+**`getremotesession.asp` is unverified against a programmatic client, and this
+module degrades accordingly.** This project's own testing found that endpoint
+answers a fresh, otherwise-successful login with a session-expired-looking
+HTML page — the identical request sequence works from a browser, and what a
+programmatic client additionally needs has not been identified (see
+[`asmb8_sessions`](asmb8_sessions.md) for the same, independently observed
+gap). `asmb8.media.preconditions.encryption.media_encryption_enabled` and
+`.attach.attach_raw` are sourced from that endpoint, so on a parse failure
+both degrade to `null` and `asmb8.media.preconditions.remote_session_read`
+reports `{outcome: "failed", ...}` — this module does **not** fail outright
+over it. `getvmediacfg.asp` has shown no equivalent failure mode in this
+project's testing, so a failure reading it **is not** degraded the same way:
+it fails this module, consistent with `include_web_session`'s own diagnostic
+read.
+
+**`asmb8.media.preconditions.status_raw` (`V_MEDIA_STATUS`) is reported raw,
+with an explicit meaning-unsourced caveat.** An earlier note in this project's
+own history wrongly guessed this field tracked live media-attach state; a
+later capture showed the BMC's own web UI writing it, which a live
+attach-state field would have no reason for a UI to do. Do not read a change
+in this value as evidence that an attach succeeded or failed.
+
+**Session counts are decoded, never raw.**
+`asmb8.media.preconditions.sessions.cd.{max,current}` applies the same `+128`
+offset [`asmb8_sessions`](asmb8_sessions.md) documents and independently
+confirms twice, because `getvmediacfg.asp`'s raw `V_MAX_CD_SESSIONS`/
+`V_ACTIVE_CD_SESSIONS` (`129`/`128` in this corpus) are the exact same raw
+values `getallservicescfg.asp`'s own `cd-media` `MAXSESS`/`CURSESS` report.
+The raw `129`/`128` is never returned by this field — only the decoded `1`/`0`.
 
 Note the asymmetry on the IPMI side specifically: IPMI session establishment
 failure fails the whole module; individual post-connection IPMI *read*
@@ -167,4 +265,24 @@ prior/after state to diff for a read.
   delegate_to: localhost
   no_log: true
   register: asmb8_with_web
+
+- name: Diagnose a failed virtual-media attach before re-attempting it or resetting the BMC
+  james_crowley.asmb8_ikvm.asmb8_info:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    include_web_session: true
+    include_media_preconditions: true
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_media_preconditions
+
+- name: Rule out media encryption before suspecting a stranded session or a reverted BMC setting
+  ansible.builtin.assert:
+    that:
+      # media_encryption_enabled is null (not false) when getremotesession.asp could not be
+      # read this run -- see remote_session_read -- so this checks it is false, not merely falsy.
+      - asmb8_media_preconditions.asmb8.media.preconditions.encryption.media_encryption_enabled == false
+      - asmb8_media_preconditions.asmb8.media.preconditions.encryption.secure_channel_enabled == false
 ```

@@ -1,0 +1,32 @@
+---
+# Copyright (c) 2026 Jim Crowley
+# GNU General Public License v3.0 or later (see LICENSE or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Included from tasks/main.yml's `always` block, exactly like
+# tasks/detach_media.yml, and for the identical reason: whatever fails --
+# probe, ipxe_http preparation itself, attach, arm, reset, observe, or
+# wait-for-hand-off -- this must still run, so an ephemeral HTTP origin can
+# never outlive this play, even on failure or interruption. Read
+# tasks/prepare_ipxe_delivery.yml's own comment for why the session id is
+# guaranteed to already be recorded by the time this can possibly be needed.
+#
+# Guarded by the caller (tasks/main.yml) on
+# asmb8_baremetal_install_run_state.ipxe_origin_session_id being truthy, the
+# same way tasks/detach_media.yml's own inner task guards on session_id --
+# it is always safe to call this even when no origin was ever started this
+# run, since asmb8_http_origin's own state=stopped contract already reports
+# changed=false with nothing to do when no state file exists for the given
+# session_id (see its DOCUMENTATION), but the outer guard avoids even that
+# no-op call for the common full_iso case where this file is never relevant
+# at all.
+
+- name: Stop the ephemeral iPXE HTTP origin, if one was started this run
+  james_crowley.asmb8_ikvm.asmb8_http_origin:
+    state: stopped
+    session_id: "{{ asmb8_baremetal_install_run_state.ipxe_origin_session_id }}"
+    runtime_dir: "{{ asmb8_baremetal_install_ipxe_origin_runtime_dir }}"
+    stop_timeout: "{{ asmb8_baremetal_install_ipxe_origin_stop_timeout }}"
+  delegate_to: localhost
+  no_log: true
+  register: asmb8_baremetal_install_ipxe_origin_stop_result

@@ -50,9 +50,16 @@
 - name: Persist the claimed session id before the attach, so the always-detach can find it
   ansible.builtin.include_tasks: save_state.yml
 
-- name: Attach the installer ISO as virtual media over iUSB
+- name: Attach the installer image as virtual media over iUSB
+  # asmb8_baremetal_install_media_image_path is computed once in
+  # tasks/main.yml, before this file is ever included: the whole ISO
+  # (asmb8_baremetal_install_iso_path) for delivery=full_iso, or the tiny
+  # image tasks/prepare_ipxe_delivery.yml just built
+  # (asmb8_baremetal_install_ipxe_bootstrap_output) for delivery=ipxe_http.
+  # This file itself is otherwise identical either way -- asmb8_media has no
+  # opinion about what its image actually is.
   james_crowley.asmb8_ikvm.asmb8_media:
-    image: "{{ asmb8_baremetal_install_iso_path }}"
+    image: "{{ asmb8_baremetal_install_media_image_path }}"
     session_id: "{{ asmb8_baremetal_install_run_state.session_id }}"
     runtime_dir: "{{ asmb8_baremetal_install_media_runtime_dir }}"
     cd_port: "{{ asmb8_baremetal_install_media_cd_port }}"

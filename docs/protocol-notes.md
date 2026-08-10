@@ -47,6 +47,19 @@ the underlying dated hardware record.
   directory's own `README.md` for redaction details — and parsed by
   `plugins/module_utils/webvar.py`, whose own docstring cites the same
   corpus for the parser-level facts §9 below does not repeat.
+- **[save-action capture 2026-08-10]** — a distinct, later capture from the
+  same board and firmware, made while the web UI performed an actual save
+  action rather than a plain page load — the only way to observe this
+  board's `POST`-only endpoints and their request bodies, which the
+  **[asp-corpus 2026-08-10]** page-load capture never exercised. Backs §10
+  below, including its NTP-specific write-convention subsection (a later
+  save action against `setntpcfg.asp`/`setdatetime.asp`, same day). Four of
+  its response bodies were added to `tests/unit/fixtures/asp/`:
+  `getselentries_post_lasteventid24.txt` and
+  `getsessioninfo_post_servicebit4.txt` (POST-parameterized reads), plus
+  `setntpcfg_write.txt` and `setdatetime_write.txt` (write replies, backing
+  `asmb8_ntp`) — see that directory's own `README.md` for why none of the
+  four are folded into the 54-file count above.
 
 ## 1. The 32-byte iUSB packet header
 
@@ -440,6 +453,204 @@ generic and does not special-case this field: presenting the "1.14" a human
 expects is a job for whatever future module reads `FirmwareRevision2`, not
 for the shared parser. Do not "simplify" a future consumer of this field by
 printing `20` as if it already were the minor version — it is not.
+
+## 10. POST-based reads, CSRFTOKEN, and this collection's `.asp` write convention(s)
+
+**[save-action capture 2026-08-10]** for everything in this section. Every
+fact here concerns endpoints or headers that §9's page-load-only corpus never
+exercised, because nothing in it ever submitted a form.
+
+### Some `.asp` reads require `POST`, not `GET`
+
+Two endpoints in this corpus return nothing useful over a bare `GET` and
+require their selector submitted as a `POST` body instead:
+
+| Endpoint | Selector field | Meaning |
+|---|---|---|
+| `getselentries.asp` | `WEBVAR_LASTEVENTID` | Return SEL entries **after** this record ID (the paged sibling of `getallselentries.asp`) |
+| `getsessioninfo.asp` | `SERVICEBIT` | Return the active session(s) for the service this bit selects |
+
+Both are read**s**, plain and simple, despite the method: the BMC's own
+choice of `POST` for a query it could in principle have taken as `GET`
+parameters is not evidence of a side effect, and neither endpoint's response
+shape differs in any way from an ordinary `.asp` read's — see "The envelope
+is unchanged" below. `plugins/module_utils/asp.py`'s `AspClient.post_webvar()`
+is this collection's client method for this shape: a `POST` that is a read,
+kept structurally separate from `AspClient.get_webvar()` (which remains
+`GET`-only, permanently, by design) specifically so a genuine mutation can
+never be reached by a caller reusing the read path "for just one more
+`POST`" — see that method's own docstring for the full reasoning.
+
+`getselentries.asp`'s one real capture (`WEBVAR_LASTEVENTID=24` against a log
+holding exactly 24 entries) returned zero records — the **correct** answer
+("nothing follows the newest entry that already existed"), not evidence of
+failure; see `plugins/modules/asmb8_sel.py`'s `after_event_id` option and
+DOCUMENTATION for how this collection surfaces that distinction to a caller.
+
+`getsessioninfo.asp`'s `SERVICEBIT` reuses `getallservicescfg.asp`'s own
+`SERVICEID` values: the captured `SERVICEBIT=4` is `cd-media`'s `SERVICEID`
+in the §9 corpus's own `getallservicescfg.txt`. Two independently-captured
+values agreeing is what makes that identity **sourced**, not assumed — but
+it is sourced for exactly that one service. Applying the same identity to
+any other service (`web`=1, `kvm`=2, `fd-media`=8, `hd-media`=16, `ssh`=32,
+`telnet`=64, per `getallservicescfg.asp`'s own `SERVICEID` values) is an
+inference from a pattern confirmed once, not a second capture per service —
+see `plugins/modules/asmb8_sessions.py`'s `active_session_services` option
+for how this collection both takes advantage of the pattern (deriving the
+mapping live, rather than hardcoding a second copy of it) and flags the
+inference honestly.
+
+### The envelope is unchanged
+
+Both endpoints' response bodies parse under the exact same
+`WEBVAR_JSONVAR_<NAME>`/`HAPI_STATUS` envelope §9 describes, with no
+different framing for having arrived via `POST` — `HAPI_STATUS` carries the
+result the same way it does for every `GET` read, and
+`plugins/module_utils/webvar.py`'s parser handles both new fixtures with no
+changes of its own, which is itself the evidence: nothing about "this was a
+POST" needed a different parser.
+
+### CSRFTOKEN
+
+Every `POST` this capture observed carries a `CSRFTOKEN` request header
+**except** the login itself (`POST /rpc/WEBSES/create.asp`) — which matches
+the vendor JS's own rule, verbatim, from `lib/xmit.js`:
+
+```js
+if (this.url.indexOf("WEBSES") == -1) {
+    this.xmldoc.setRequestHeader("CSRFTOKEN", top.user.CSRFtoken);
+}
+```
+
+The token itself comes back in the login response's own body, alongside
+`SESSION_COOKIE` (see `tests/unit/fixtures/asp/create.txt`'s `CSRFTOKEN`
+field) — that is what the vendor UI stores and replays, and what
+`AspClient.login()` now harvests (falling back to leaving it unset if the
+field is absent, never treating that as a login failure). A separate
+`/rpc/getcsrftoken.asp` endpoint also exists but is not used, since it would
+cost this serialized client an extra round trip against a web server already
+known to wedge under concurrent load, for a value the login response already
+carries.
+
+**Whether this firmware actually *enforces* CSRFTOKEN on any request is
+unverified.** This collection's existing `GET` reads send no such header and
+have always worked without it; whether a `POST` is rejected without one has
+not been tested, because every `POST` this collection issues has one
+available to send. `AspClient` therefore attaches the header on a
+best-effort, match-the-vendor basis — sent whenever a token has been
+captured, never treated as a precondition for the request — and does exactly
+that only for `POST` requests other than the login itself; see
+`AspClient._headers()`'s own docstring for why this is deliberately narrower
+than the vendor's own URL-based (not method-based) rule for `GET`.
+
+### Three `set*.asp` endpoints are sourced so far. Two are now implemented; one is not
+
+**[save-action capture 2026-08-10]** sourced this board's write shape on exactly three
+endpoints. Naming all three here, in one place, is the point of this subsection: every future
+`set*.asp` capture should be added to this list, not folded silently into prose elsewhere.
+
+| Endpoint | Status | Backed by |
+|---|---|---|
+| `setvmediacfg.asp` | Sourced, **not implemented** — see below | This section's own capture |
+| `setntpcfg.asp` | Sourced, **implemented** | `AspClient.set_webvar()`, `asmb8_ntp` |
+| `setdatetime.asp` | Sourced, **implemented in `AspClient.set_webvar()` only** — no module calls it; see `asmb8_ntp`'s DOCUMENTATION for why | `AspClient.set_webvar()` |
+
+#### `setntpcfg.asp` and `setdatetime.asp` — a sourced write convention, now implemented
+
+A later save-action capture, same day, exercised NTP's own save action and observed both of these
+endpoints POSTed together in the one save (reads first, for context):
+
+```
+GET  getdatetime.asp -> { 'SECONDS': 1786375523, 'UTCMINUTES': 480, 'TIMEZONE': 'GMT+8' }
+GET  getntpcfg.asp   -> { 'SERVER_NAME1': 'pool.ntp.org', 'SERVER_NAME2': ' 192.0.2.10', 'NTP_STATUS': 1 }
+
+POST setdatetime.asp   SECONDS=1786347240&UTCMINUTES=480&TIMEZONE=GMT%2B8&ISNTPENABLE=0
+POST setntpcfg.asp     NEW_NTPSERVER_NAME1=pool.ntp.org&OLD_NTPSERVER_NAME1=pool.ntp.org
+                       &NEW_NTPSERVER_NAME2= 192.0.2.10&ISNTPENABLE=0
+```
+
+Both replied in the same WEBVAR envelope, an empty record array, and `HAPI_STATUS:0` — see
+`tests/unit/fixtures/asp/README.md`'s "Write replies" section for exactly what is and is not
+sourced about the two reply fixtures this collection built from that description (the envelope
+shape is sourced; the specific `WEBVAR_JSONVAR_<NAME>` text inside it is this repository's own
+reconstruction of the established naming pattern, not verbatim captured bytes).
+
+**The critical finding: setter field-name convention is per-endpoint, not collection-wide.**
+`setvmediacfg.asp`'s capture above suggested `set<X>.asp` reuses `get<X>.asp`'s own field names.
+This second capture both confirms and contradicts that in the same save action:
+
+* `setdatetime.asp` *does* reuse `getdatetime.asp`'s own field names verbatim (`SECONDS`,
+  `UTCMINUTES`, `TIMEZONE` all unchanged), plus a fourth field, `ISNTPENABLE`, that
+  `getdatetime.asp` never returns at all.
+* `setntpcfg.asp` does **not** reuse `getntpcfg.asp`'s field names at all: `SERVER_NAME1` becomes
+  both `NEW_NTPSERVER_NAME1` *and* `OLD_NTPSERVER_NAME1`; `SERVER_NAME2` becomes
+  `NEW_NTPSERVER_NAME2` only (**no** `OLD_NTPSERVER_NAME2` — see below); `NTP_STATUS` becomes
+  `ISNTPENABLE`.
+
+One inference from `setvmediacfg.asp` alone would have generalised the wrong way for
+`setntpcfg.asp`. **The lesson generalises, the field names do not**: every future `set*.asp`
+capture needs its own read of the actual field names on the wire — do not assume a new endpoint
+follows either of these two conventions without checking.
+
+**`OLD_NTPSERVER_NAME1` is sent; `OLD_NTPSERVER_NAME2` is not, even though `SERVER_NAME2` was the
+field actually changing in this save.** This capture's own save action was toggling NTP off
+(`ISNTPENABLE` moving to `0`); server 1 was not changing (`NEW` equals `OLD`, both
+`pool.ntp.org`), yet an `OLD_NTPSERVER_NAME1` field was still sent. Server 2 carries its own
+leading space through unchanged (`NEW_NTPSERVER_NAME2= 192.0.2.10`, matching
+`getntpcfg.asp`'s `SERVER_NAME2` byte for byte) but has no `OLD` counterpart at all. This is
+vendor-side inconsistency, not a transcription error, and `asmb8_ntp` follows it exactly: it
+always sends `OLD_NTPSERVER_NAME1` and never invents an `OLD_NTPSERVER_NAME2`.
+
+**`NTP_STATUS` (read) and `ISNTPENABLE` (write) are not confirmed to share an encoding.** The read
+shows `NTP_STATUS: 1`; the write, from the same session, shows `ISNTPENABLE=0`. Nothing here
+proves the two fields describe the same quantity, let alone the same encoding — one is a
+read-only status field on `getntpcfg.asp`, the other a write-only field on two different setter
+endpoints. `asmb8_ntp` maps `NTP_STATUS` to a boolean ("nonzero means enabled") and writes
+`enabled=true` as `ISNTPENABLE=1` purely as a best-effort, explicitly-flagged inference — see its
+DOCUMENTATION and `docs/asmb8_ntp.md` for the full caveat, and its `ntp_status_raw` return field
+for the untranslated escape hatch.
+
+**`setdatetime.asp` and `setntpcfg.asp` were POSTed together in the one save action, coupling
+date/time and NTP-enable across two endpoints — `asmb8_ntp` deliberately manages only one side of
+that coupling.** It writes `ISNTPENABLE` through `setntpcfg.asp` only, and never calls
+`setdatetime.asp` at all, specifically to avoid resubmitting a live-read `SECONDS` value (which
+would nudge the BMC's clock forward by whatever gap elapsed since the read) for a capability that
+has nothing to do with the clock. Whether `setdatetime.asp`'s own copy of `ISNTPENABLE` tracks
+`setntpcfg.asp`'s automatically on real firmware is unverified either way.
+
+Transport is otherwise identical to the CSRFTOKEN section above: `Content-Type:
+application/x-www-form-urlencoded`, a `CSRFTOKEN` header present on both POSTs. `AspClient`'s
+generic write method for all of this is `set_webvar(endpoint, data, *, operation=None)` — named,
+per its own docstring, so a write can never be reached by a caller reusing a read method for "just
+one more POST"; it raises `errors.RemoteOperationError` on a non-zero `HAPI_STATUS`.
+
+#### `setvmediacfg.asp` — a sourced, unimplemented write convention — record only, do not build
+
+The original capture sourced this board's write shape on the virtual-media configuration endpoint:
+
+```
+POST /rpc/setvmediacfg.asp
+Content-Type: application/x-www-form-urlencoded
+CSRFTOKEN: <token>
+
+V_NUM_FD=1&V_NUM_CD=2&V_NUM_HD=1&V_MEDIA_STATUS=1
+```
+
+replying in the same WEBVAR envelope, an empty record array, and
+`HAPI_STATUS:0`. This was the first evidence for the "`set<X>.asp` takes the
+field names `get<X>.asp` returns" pattern — now known, per the NTP capture
+above, to be true for `setdatetime.asp` but false for `setntpcfg.asp`, i.e.
+**not a convention that generalises across endpoints without its own
+capture.** It remains recorded here purely as protocol knowledge for whoever
+eventually sources it.
+
+**Nothing in this collection implements this.** There is no `set_vmediacfg`
+(or any other write) method on `AspClient`, no `state` option on
+`asmb8_sel`/`asmb8_sessions`, and no code path anywhere under `plugins/`
+that names `setvmediacfg.asp`. This section exists purely so the next
+contributor sourcing a real write does not have to start from nothing — not
+as a plan, a TODO, or an invitation to build one from this documentation
+alone.
 
 ## Practical note for contributors
 

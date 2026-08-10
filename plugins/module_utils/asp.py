@@ -67,6 +67,7 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     BmcBusyError,
     ConnectionError_,
     ProtocolError,
+    RemoteOperationError,
     TimeoutError_,
     TlsValidationError,
 )
@@ -283,6 +284,16 @@ _FAILURE_LOGIN_PREFIX = "Failure_Login"
 _SESSION_COOKIE_RE = re.compile(r"'SESSION_COOKIE'\s*:\s*'([^']*)'")
 _STOKEN_RE = re.compile(r"'STOKEN'\s*:\s*'([^']*)'")
 
+#: Matches the anti-CSRF token this BMC's login response carries alongside
+#: SESSION_COOKIE, e.g. ``'CSRFTOKEN' : '<value>'`` -- confirmed directly in
+#: ``tests/unit/fixtures/asp/create.txt`` (redacted to ``<REDACTED>`` in that
+#: file, but the field's own quoting survived the redaction pass intact,
+#: unlike SESSION_COOKIE's -- see that fixture and webvar.py's module
+#: docstring for why). See :meth:`AspClient.login`'s docstring and
+#: :meth:`AspClient.post_webvar`'s docstring for what this token is used for
+#: and why a missing one must never block anything.
+_CSRFTOKEN_RE = re.compile(r"'CSRFTOKEN'\s*:\s*'([^']*)'")
+
 #: JNLP `<argument>value</argument>` elements alternate name/value: a `-flag`
 #: form (e.g. `-kvmport`) is immediately followed by a sibling `<argument>`
 #: holding that flag's value. This regex-based scan (rather than a full JNLP/
@@ -404,6 +415,11 @@ class AspClient:
         self._policy = TlsTrustPolicy.create(validate_certs=validate_certs, ca_path=ca_path, tls_fingerprint=tls_fingerprint)
         self._lock = threading.Lock()
         self._session_cookie: str | None = None
+        #: The anti-CSRF token harvested from the login response, if this
+        #: firmware returned one -- see :meth:`login` and :meth:`post_webvar`.
+        #: ``None`` until a successful :meth:`login`, and possibly still
+        #: ``None`` after one, if the response carried no CSRFTOKEN field.
+        self._csrf_token: str | None = None
 
         self._http_session = requests.Session()
         if use_tls:
@@ -435,14 +451,44 @@ class AspClient:
         secrets = [self._password]
         if self._session_cookie:
             secrets.append(self._session_cookie)
+        if self._csrf_token:
+            secrets.append(self._csrf_token)
         return [s for s in secrets if s]
 
     # --- low-level request plumbing ----------------------------------------
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, method: str, url: str) -> dict[str, str]:
+        """Build this request's headers, including CSRFTOKEN when this request should carry one.
+
+        CSRFTOKEN is attached only when **all** of the following hold: a token has actually been
+        harvested from a prior :meth:`login` (never fabricated, never fetched proactively -- a
+        missing token simply means this header is omitted, never a blocking failure); the request
+        is a ``POST`` (a second capture confirmed this header on both this collection's
+        ``post_webvar`` reads, ``getselentries.asp`` and ``getsessioninfo.asp`` -- both POST); and
+        the URL is not the login endpoint itself (``WEBSES``), matching the vendor JS's own rule in
+        ``/lib/xmit.js``: ``if (this.url.indexOf("WEBSES") == -1) { ... setRequestHeader("CSRFTOKEN",
+        ...) }``. The BMC issues the very token this header would carry from that same login call,
+        so sending it back on the login request itself is nonsensical as well as contrary to the
+        vendor's own rule.
+
+        **Deliberately narrower than the vendor's rule for `GET`.** The vendor's own check is
+        URL-based, not method-based, so its real client likely attaches this header to non-WEBSES
+        `GET`s too -- but this collection's `GET` reads (`get_webvar`, `get_host_status`,
+        `get_session_token`, the JNLP fetch) are independently confirmed working without it, and
+        widening this now, on an inference rather than a capture of a `GET` carrying the header,
+        would risk changing already-working behaviour for no sourced reason. If a future capture
+        shows a `GET` carrying CSRFTOKEN too, widen this then, with that evidence cited.
+
+        Whether this firmware actually *enforces* CSRFTOKEN on any request -- `GET` or `POST` -- is
+        **unverified**: the existing `GET` reads succeed without ever sending one. This header is
+        attached on a best-effort, match-the-vendor basis, not because refusal without it has ever
+        been observed.
+        """
         headers = {}
         if self._session_cookie:
             headers["Cookie"] = f"SessionCookie={self._session_cookie}"
+        if self._csrf_token and method == "POST" and "WEBSES" not in url:
+            headers["CSRFTOKEN"] = self._csrf_token
         return headers
 
     def _send_once(
@@ -474,7 +520,7 @@ class AspClient:
                     url,
                     data=data,
                     params=params,
-                    headers=self._headers(),
+                    headers=self._headers(method, url),
                     timeout=(self._connect_timeout, self._timeout),
                 )
             except requests.exceptions.ConnectTimeout as exc:
@@ -561,11 +607,20 @@ class AspClient:
     # --- session lifecycle --------------------------------------------------
 
     def login(self) -> str:
-        """Authenticate and store the session cookie for subsequent requests.
+        """Authenticate, store the session cookie, and harvest CSRFTOKEN if this response carried one.
 
         See ``_FAILURE_LOGIN_PREFIX``'s docstring: this checks the
         SESSION_COOKIE value's content, not just the HTTP status, because
         this BMC answers a bad password with HTTP 200 (PR #40).
+
+        Also captures ``CSRFTOKEN`` from the same response body, when present
+        (see ``_CSRFTOKEN_RE``), for :meth:`post_webvar` to attach to later
+        `POST` requests -- matching the vendor JS's own behaviour of storing
+        this value at login and replaying it on every subsequent non-login
+        request. A response with no ``CSRFTOKEN`` field is **not** an error:
+        this method does not require one to succeed, since this collection's
+        `GET` reads already work without it and whether `POST` genuinely
+        needs it has not been tested either -- see :meth:`post_webvar`.
         """
         response = self._request(
             "POST",
@@ -598,6 +653,10 @@ class AspClient:
             )
 
         self._session_cookie = session_cookie
+
+        csrf_match = _CSRFTOKEN_RE.search(response.text)
+        self._csrf_token = csrf_match.group(1) if csrf_match and csrf_match.group(1) else None
+
         return session_cookie
 
     def get_session_token(self) -> str | None:
@@ -719,11 +778,112 @@ class AspClient:
         body -- deliberately not smoothed into an empty result, since a silently
         empty record list is indistinguishable from a device with nothing to
         report.
+
+        See :meth:`post_webvar` for this method's sibling, for the handful of
+        endpoints that need their query parameters submitted as a `POST` body
+        to return anything at all.
         """
         path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
         op = operation or f"get_webvar:{endpoint}"
         body = self._request("GET", path, operation=op).text
         return parse_webvar(body, endpoint=endpoint, operation=op)
+
+    def post_webvar(self, endpoint: str, data: dict[str, str], *, operation: str | None = None) -> WebVarResponse:
+        """POST a `/rpc/<endpoint>.asp` read that requires its parameters in the request body, and parse its WEBVAR payload.
+
+        **Why this exists as its own method rather than a widened `get_webvar`.** `get_webvar` is
+        this collection's read-only guarantee: every informational module in this collection can
+        state "this only ever issues `GET`" as a fact about the code, not a promise about intent,
+        precisely because `get_webvar` issues nothing else and takes no `data` parameter that could
+        make it issue anything else. Two of this BMC's endpoints -- `getselentries.asp` (the SEL's
+        paged sibling of `getallselentries.asp`, selected via `WEBVAR_LASTEVENTID`) and
+        `getsessioninfo.asp` (the per-service active-session directory, selected via `SERVICEBIT`)
+        -- do not return anything useful over `GET` at all: they require their selector submitted as
+        a `POST` body, confirmed by a real save-action capture (see
+        `tests/unit/fixtures/asp/README.md`'s "POST-parameterized reads" section for exactly which
+        fixtures back this). Reading either at all requires a `POST`-capable method, and bolting an
+        `if data: method = "POST"` branch onto `get_webvar` would make every existing caller's
+        "this only issues `GET`" claim silently false the moment anyone passed it a `data` argument
+        -- so this is a new, separately-named method instead, exactly as `get_webvar`'s own
+        docstring already warns must happen for anything beyond a plain read.
+
+        **This is still not a general request escape hatch, despite being a `POST`.** Both of this
+        method's current callers (`asmb8_sel`'s paged SEL read, `asmb8_sessions`' active-session
+        directory read) are reads, `POST` notwithstanding -- the BMC's own choice of HTTP method for
+        a read is not this collection's to relitigate. `data` is passed straight through as the
+        request body with no validation that it is read-shaped, so this method must never be used
+        to reach an endpoint that actually mutates state (for example, the sourced-but-unimplemented
+        `setvmediacfg.asp` write convention recorded in `docs/protocol-notes.md`). A genuine write
+        must get its own explicit, separately-named method -- mirroring :meth:`set_power`'s existing
+        precedent below -- specifically so a write is only ever reachable by a caller writing its
+        name, never by reusing this one for "just one more POST".
+
+        Attaches the `CSRFTOKEN` header captured at :meth:`login`, when one was captured -- see
+        :meth:`_headers`'s docstring for exactly when and why, and for the honest caveat that
+        whether this firmware enforces that header on a `POST` at all is unverified. A missing
+        token never blocks this call; the header is simply omitted.
+
+        Every endpoint used with this must be one observed in a real capture, per this collection's
+        sourcing policy -- see :meth:`get_webvar`'s own docstring, which applies identically here.
+        """
+        path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
+        op = operation or f"post_webvar:{endpoint}"
+        body = self._request("POST", path, operation=op, data=data).text
+        return parse_webvar(body, endpoint=endpoint, operation=op)
+
+    def set_webvar(self, endpoint: str, data: dict[str, str], *, operation: str | None = None) -> WebVarResponse:
+        """POST a `/rpc/<endpoint>.asp` WRITE, parse its WEBVAR reply, and raise if the BMC reported failure.
+
+        **This is this collection's first, and so far only, way to mutate BMC configuration.** It
+        exists as its own method -- not a `data=` branch bolted onto `get_webvar()` or `post_webvar()`
+        -- for exactly the reason both of those methods' own docstrings already give: `get_webvar()`
+        is this collection's read-only guarantee (`GET` only, no `data` parameter that could make it
+        issue anything else) and `post_webvar()` is a `POST` that is still only ever a read (both of
+        its current callers are reads, `POST` notwithstanding). Naming this method distinctly, with a
+        name that says "write" and nothing else, is deliberate: a caller reaching for "just one more
+        POST through an existing read method" is exactly how a read-only guarantee stops being true,
+        and requiring a caller to type `set_webvar` -- never reachable by accident, never the default
+        branch of an `if` -- is the whole point.
+
+        **Raises on a non-zero `HAPI_STATUS`, always.** A write that gets an HTTP 200 back and is
+        treated as successful because nobody looked past the transport layer is the single worst
+        outcome this method exists to prevent -- see `errors.RemoteOperationError`, this collection's
+        class for exactly this shape ("well-formed and accepted, but the BMC itself reported
+        failure"). Every corpus write sample seen so far reports `HAPI_STATUS:0`; this method has no
+        evidence for what a real failure value looks like beyond "not zero", so it does not try to
+        interpret the number further than that.
+
+        Attaches the `CSRFTOKEN` header the same way `post_webvar()` does (same `_headers()` call,
+        same best-effort/never-blocking rule) -- see that method's docstring for the full reasoning.
+        Whether this firmware actually enforces the header on a write is just as unverified here as
+        it is for `post_webvar()`'s reads.
+
+        Every endpoint used with this must be one observed in a real write capture, per this
+        collection's sourcing policy -- see `get_webvar()`'s own docstring, which applies identically
+        here. As of this writing that is exactly two endpoints, both from the same save-action
+        capture backing `asmb8_ntp`: `setdatetime.asp` and `setntpcfg.asp` -- see
+        `docs/protocol-notes.md`'s "A sourced write convention, now implemented" section for the
+        field-name convention each one actually uses (they are NOT the same convention as each
+        other -- see that section before reaching for this method against a third endpoint on the
+        assumption that they generalise). A third, `setvmediacfg.asp`, is sourced but deliberately
+        `TestNoWriteEndpointIsReachable`-style unimplemented; see that same doc section and
+        `tests/unit/plugins/module_utils/test_asp.py`'s structural tests, which this method must
+        continue to pass for every endpoint it does not implement.
+        """
+        path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
+        op = operation or f"set_webvar:{endpoint}"
+        body = self._request("POST", path, operation=op, data=data).text
+        response = parse_webvar(body, endpoint=endpoint, operation=op)
+        if response.hapi_status != 0:
+            raise RemoteOperationError(
+                f"{endpoint}.asp reported HAPI_STATUS={response.hapi_status} for a write -- the BMC accepted "
+                "the request but reported the operation itself failed. No BMC state should be assumed changed.",
+                endpoint=self.endpoint,
+                operation=op,
+                diagnostic=f"records={response.records!r}",
+                return_value=response.hapi_status,
+            )
+        return response
 
     def get_host_status(self) -> str:
         """Fetch the raw ``hoststatus.asp`` response body.

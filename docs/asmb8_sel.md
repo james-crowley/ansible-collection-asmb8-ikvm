@@ -39,15 +39,40 @@ of (every fixture under `tests/unit/fixtures/asp/` is a `get*`/status/login
 read, by policy), or the IPMI path's own `get_event_log(clear=True))`/Clear
 SEL command. This module is scoped strictly read-only, on purpose.
 
-**Pagination.** `getselentries.asp` is this board's paged sibling of
-`getallselentries.asp`, but it is a `POST` endpoint, not a `GET`. This
-corpus's own `getselentries.txt` fixture (a `GET` capture made without the
-POST parameters that endpoint actually needs) returns only the empty
-sentinel — evidence that endpoint needs its documented POST form to return
-anything, not evidence of an empty log. `AspClient.get_webvar()` is `GET`-only
-by deliberate design, so this module reads `getallselentries.asp` instead,
-which returned the BMC's entire 24-entry log in one `GET` in this corpus with
-no evidence of internal truncation.
+**Pagination via `after_event_id`.** `getselentries.asp` is this board's paged
+sibling of `getallselentries.asp`, and it is a `POST` endpoint, not a `GET`: a
+real save-action capture (2026-08-10) sourced its request shape as
+`POST /rpc/getselentries.asp` with a `WEBVAR_LASTEVENTID` form field,
+returning entries **after** that SEL record ID. `AspClient.get_webvar()`
+remains `GET`-only by deliberate design, so this module reads this endpoint
+through the separate, explicitly-named `AspClient.post_webvar()` instead —
+see that method's own docstring for why it is not a widening of
+`get_webvar()`. `after_event_id` is optional; the default, unset behaviour is
+unchanged — read `getallselentries.asp` in full, which returned the BMC's
+entire 24-entry log in one `GET` in this corpus with no evidence of internal
+truncation. `limit` applies identically to either path, after whichever read
+ran.
+
+**An empty `after_event_id` result can legitimately mean "nothing newer", not
+a failure.** This module's own `getselentries_post_lasteventid24.txt`
+fixture — the real capture backing `after_event_id` — issued
+`WEBVAR_LASTEVENTID=24` against a log holding exactly 24 entries, and got
+back zero records. That is the **correct** answer, not evidence the request
+failed — contrast this with `getselentries.txt`, a different, older fixture
+in the same corpus captured as a bare `GET` with none of this endpoint's
+actual parameters, which is evidence only that a parameterless request
+returns nothing useful, not that the log itself was empty. Do not treat
+`entries` being empty after `after_event_id` as a signal to retry or
+escalate; check `entries_available` against the value you passed instead.
+
+**The paged endpoint's own field-level record shape is unverified beyond its
+outer envelope.** The one real capture of `getselentries.asp` returned zero
+records, so there is no captured evidence for what fields a non-empty page of
+this specific endpoint actually carries — only that its outer envelope
+matches every other `.asp` read this collection parses. This module reuses
+`getallselentries.asp`'s own field mapping for any record `after_event_id`
+does return, on the reasoning that both endpoints read the same underlying
+SEL table — an inference, not something this corpus has directly confirmed.
 
 `sel_policy` is reported exactly as `getselcfg.asp`'s `SEL_POLICY` field
 returns it, with no interpretation attached — this corpus's one sample is
@@ -77,16 +102,28 @@ plain `GET`, and it never mutates board configuration.
 | `timeout` | `int` | `30` | no | — |
 | `connect_timeout` | `int` | `10` | no | — |
 | `limit` | `int` | — | no | — (must not be negative) |
+| `after_event_id` | `int` | — | no | — (must not be negative) |
 
 Verified against `argument_spec()` in `plugins/modules/asmb8_sel.py`.
 
 ### `limit`
 
-Return at most this many entries. Applied client-side, after
-`getallselentries.asp` has already returned its full response. Entries are
-kept in exactly the order the BMC returned them (highest-`RecordID`-first,
-newest first, in this corpus's own fixture) — `limit` simply takes the first
-`limit` of that order without resorting it. Omit to return every entry.
+Return at most this many entries. Applied client-side, after whichever read
+ran (`getallselentries.asp`, or `getselentries.asp` if `after_event_id` was
+given) has already returned its full response. Entries are kept in exactly
+the order the BMC returned them (highest-`RecordID`-first, newest first, in
+this corpus's own fixture) — `limit` simply takes the first `limit` of that
+order without resorting it. Omit to return every entry.
+
+### `after_event_id`
+
+If given, read `getselentries.asp` (`POST`, `WEBVAR_LASTEVENTID`) for entries
+**after** this SEL record ID instead of `getallselentries.asp`'s full read.
+See the synopsis above for exactly what was and was not sourced about this
+endpoint, including why an empty `entries` result here is often the
+**correct** answer, not a failure. Must not be negative. Omit (the default)
+to keep reading `getallselentries.asp` in full, unchanged from before this
+option existed.
 
 ## Return values
 
@@ -102,7 +139,7 @@ newest first, in this corpus's own fixture) — `limit` simply takes the first
 | `entries[].event_dir_type` | `int` | always | `EventDirType`, raw — assertion/deassertion bit and event-reading-type field not decoded. |
 | `entries[].event_data_1` / `_2` / `_3` | `int` | always | `EventData1`/`2`/`3`, raw and undecoded. |
 | `entries[].extra` | `dict` | always | Any field on this entry not named above, keyed as the BMC sent it — empty for every entry in this corpus. |
-| `entries_available` | `int` | always | Number of entries `getallselentries.asp` actually returned, before `limit`. This module has no evidence this endpoint paginates. |
+| `entries_available` | `int` | always | Number of entries this call's own read returned, before `limit`. Without `after_event_id`, this is `getallselentries.asp`'s count (no evidence this endpoint paginates); with `after_event_id`, it is `getselentries.asp`'s count after that record ID — `0` is a legitimate value. |
 | `entries_returned` | `int` | always | `len(entries)` after `limit`. |
 | `max_entries` | `int` | always | `getmaxselentries.asp`'s `COUNT` field — the SEL's reported total capacity, not its current entry count. |
 | `sel_policy` | `int` | always | `getselcfg.asp`'s `SEL_POLICY` field, raw. Not decoded — see the module description. |
@@ -158,6 +195,22 @@ creating the `.asp` session itself. `diff_mode` is not supported.
   ansible.builtin.debug:
     msg: "SEL has {{ sel.entries_available }} of {{ sel.max_entries }} entries"
   when: sel.entries_available > (sel.max_entries * 0.9)
+
+- name: Only entries newer than the last one this run already saw
+  james_crowley.asmb8_ikvm.asmb8_sel:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    after_event_id: "{{ last_seen_record_id }}"
+  delegate_to: localhost
+  no_log: true
+  register: new_sel
+
+- name: An empty result after after_event_id is not necessarily a problem
+  ansible.builtin.debug:
+    msg: "no SEL entries newer than {{ last_seen_record_id }}"
+  when: new_sel.entries_returned == 0
 ```
 
 ## See also

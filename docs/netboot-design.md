@@ -37,8 +37,16 @@ The fix this document works out: attach only a **small bootstrap image
 (≤16 MiB budget)** over iUSB. That bootstrap's only job is to bring up the
 target's real NIC and pull the actual Proxmox installer over plain HTTP, at
 LAN speed, completely bypassing the BMC for the bulk transfer. This document
-is the research behind that design — it does not implement it. Nothing in
-`roles/` or `plugins/` currently does what is described here.
+is the research behind that design.
+
+**Update: this design is now partially implemented** — see section 10 at the
+end of this document for exactly what `plugins/modules/asmb8_bootstrap_image.py`
+and the `asmb8_baremetal_install` role's `ipxe_http` delivery mode actually
+build from the recommendation below, and precisely which open questions from
+section 8 remain open regardless. Nothing in section 10 should be read as
+retracting this document's own "unverified"/"not measured" markers elsewhere
+below — implementing a recommendation is not the same as verifying it against
+real hardware, and section 10 is explicit about which is which.
 
 **Read `docs/hardware-evidence-2026-08-08.md` and `docs/proxmox-autoinstall.md`
 first** — this document assumes their findings (the ~800 KB/s figure, the
@@ -784,3 +792,102 @@ Listed honestly as "not yet known," matching this collection's own standard
   the `auto-installer-mode.toml` GRUB gate, and the existing
   `asmb8_autoinstall_iso`/`asmb8_baremetal_install` architecture this design
   extends.
+
+---
+
+## 10. Implementation status
+
+Added after the fact, once `plugins/modules/asmb8_bootstrap_image.py` and the
+`asmb8_baremetal_install` role's `ipxe_http` delivery mode were built from the
+recommendation above. Read this section as "what got implemented," never as
+a retraction of anything marked unverified elsewhere in this document —
+building the recommended shape is not the same claim as having booted it.
+
+### What is now implemented
+
+- **Recommendation 1 (§1, §4): prebuilt `ipxe.lkrn` + `grub-mkrescue`, no
+  compiler.** `asmb8_bootstrap_image` builds exactly this shape: it stages
+  `boot/{ipxe.lkrn,script.ipxe}` plus a generated `boot/grub/grub.cfg` and
+  invokes `grub-mkrescue` against that staging directory. It never fetches
+  `ipxe.lkrn` itself (a caller-supplied, cacheable local file, per §4's own
+  note that this file needs no rebuild) and never reaches for the
+  Docker/`EMBED=` alternative this document's §6 ranks second — see that
+  module's own `DOCUMENTATION` for the trade-off stated for an operator.
+- **Recommendation 2 (§1, §5): static IP, never a bare `dhcp`.**
+  `asmb8_bootstrap_image` defaults to `network_mode=static`, requires
+  `address`/`netmask`/`gateway` in that mode, and renders exactly the
+  `set net0/ip ...`/`ifopen net0` block this document's §5 specifies — never
+  emitting `dhcp` unless a caller explicitly opts into `network_mode=dhcp`.
+- **The 16 MiB size budget (§1, §4, §8.1).** `asmb8_bootstrap_image` enforces
+  `size_budget_bytes` (default 16 MiB) after every build and deletes an
+  oversized result rather than leaving it in place — see §8.1 below for what
+  this does and does not settle.
+- **The `chain` hand-off.** Rather than baking Proxmox's own
+  `vmlinuz`/`initrd.img`/ISO-`initrd` sequence (§3) directly into the
+  bootstrap, `asmb8_bootstrap_image`'s embedded script does one thing only:
+  bring up the NIC, then `chain` to a caller-given URL. The
+  `asmb8_baremetal_install` role's `ipxe_http` delivery mode is what supplies
+  that URL — an `asmb8_http_origin` session serving whatever a caller staged
+  there (e.g. `proxmox-auto-install-assistant --pxe`'s own output, per §3,
+  with its generated `boot.ipxe`'s leading `dhcp` line already replaced per
+  §1's own step 2). This keeps `asmb8_bootstrap_image` itself generic and
+  Proxmox-unaware, at the cost of leaving the §3 mechanics (exactly what
+  `--pxe` output looks like, and replacing its `boot.ipxe`'s `dhcp` line) as
+  something the caller must still do by hand — that specific gap is listed
+  under "what remains unimplemented" below.
+- **The origin's lifetime, sized from the install's own timeout, not a
+  second independent guess.** The role's `asmb8_baremetal_install_ipxe_origin_lifetime_seconds`
+  default is computed from `asmb8_baremetal_install_handoff_timeout` plus the
+  postcondition-probe window plus a fixed safety margin — see that role's own
+  README.md for why an origin that expires mid-install (an incident from this
+  design's own investigation, not a hypothetical) is exactly the failure this
+  sizing exists to prevent.
+- **POST-code sampling across the hand-off wait.** Wired into
+  `asmb8_baremetal_install`'s `wait_for_handoff.yml`, using
+  `asmb8_postcode` — not something this document's own research discusses at
+  all (it is purely about the netboot mechanism, not about diagnosing a
+  hand-off that never arrives), but a direct answer to this document's own
+  §9 spirit: an install that fails partway through this design should not
+  report only "timed out."
+
+### What remains unverified regardless (see §8 above for the full list)
+
+- **§8.1: actually build and measure the bootstrap ISO.** Still not done —
+  `asmb8_bootstrap_image`'s own unit tests mock the `grub-mkrescue` boundary
+  deliberately (see its module docstring and `tests/unit/plugins/module_utils/test_bootstrap_image.py`)
+  specifically because this collection was told not to make any network
+  request to a BMC or lab host while building this, which does not license
+  invoking real build tooling either without knowing it produces a
+  genuinely bootable result. The size-budget *mechanism* is implemented and
+  tested; whether a real `grub-mkrescue` run against a real `ipxe.lkrn`
+  actually produces something under 16 MiB, or something that boots at all,
+  is still open.
+- **§8.2 (what loop-mounts `/proxmox.iso` onto `/cdrom`) and §8.3
+  (`dhclient -v`'s real behaviour with no DHCP server present)** are
+  properties of Proxmox's own installer environment, not of
+  `asmb8_bootstrap_image` or `asmb8_baremetal_install` — nothing in this
+  implementation touches either question, and nothing could from the
+  controller side. Still open.
+- **§8.4: the exact GRUB2 command syntax.** `asmb8_bootstrap_image` renders
+  `linux16`/`initrd16` rather than `linux`/`initrd` — see that module's own
+  `DOCUMENTATION` for the reasoning (the same choice real-world configurations
+  make for `memtest86+`, another non-Linux payload reusing the Linux kernel
+  image format) — but this is this module's own best-effort translation of
+  §4's legacy-GRUB example, not something this document or any real
+  `grub-mkrescue` run has confirmed.
+- **§8.5: `net0/dns` vs. the global `dns` setting.** `asmb8_bootstrap_image`
+  renders `net0/dns` when a DNS value is given, matching the form §5 quotes
+  first; still not independently confirmed as canonical over the global form.
+- **§8.6: confirm the tool actually emits the exact
+  `--fetch-from`/`--pxe` combination assumed in §3.** Still not run.
+  `asmb8_baremetal_install`'s `ipxe_http` mode README documents the expected
+  `proxmox-auto-install-assistant --pxe --pxe-loader ipxe` output shape by
+  citation to this document, and requires the caller to stage that output
+  directory and pre-edit its `boot.ipxe` themselves — it does not run that
+  command, inspect its real output, or edit `boot.ipxe` on the caller's
+  behalf. That gap (turning §3's citation into an automated step) is not yet
+  built anywhere in this collection.
+- **§8.7: UEFI vs. BIOS.** Not applicable to any implementation decision made
+  here — this hardware's legacy-BIOS boot chain (per
+  `docs/hardware-evidence-2026-08-08.md`) is the only case
+  `asmb8_bootstrap_image` was built against.

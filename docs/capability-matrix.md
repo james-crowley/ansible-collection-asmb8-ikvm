@@ -121,6 +121,33 @@ VERIFIED`/`UNCONFIRMED` in their *own* default behaviour — a mock faithfully
 reproducing an assumption is not the same claim as this tier's rows above,
 which are about this collection's client code, not the mock's fidelity.
 
+### `asmb8_http_origin` — real forked-process tests, no BMC involved
+
+Unlike every row above, `asmb8_http_origin` never talks to a BMC at all —
+see Tier 4 below for what that leaves unproven. What it *does* have is a
+real background process bound to a real loopback socket, exercised with a
+real HTTP client, not a mocked transport:
+
+| Claim | Where tested | Where used |
+|---|---|---|
+| `state=started` forks a real, detached background process that binds a real socket and serves real bytes over a real `HTTPConnection` | `tests/unit/plugins/module_utils/test_http_origin.py::TestSpawnSessionRealFork`, `TestRealServerRequestHandling` | `plugins/module_utils/http_origin.py` (`spawn_session`) |
+| `GET`/`HEAD` return `200` with the correct body/`Content-Length`; a directory request is `404`, never a generated listing | `test_http_origin.py::TestRealServerRequestHandling` | `plugins/module_utils/http_origin.py` |
+| `Range: bytes=10-19` and a suffix range (`bytes=-10`) both return a correct `206` with the right `Content-Range`/sliced body; a range past EOF returns `416` with `Content-Range: bytes */<size>` | `test_http_origin.py::TestRealServerRequestHandling` (`test_range_request_returns_206_with_correct_slice`, `test_suffix_range_request_returns_last_n_bytes`, `test_unsatisfiable_range_returns_416_with_content_range_star`) | `plugins/module_utils/http_origin.py` (`parse_range_header`) |
+| A literal `..` traversal and a double-percent-encoded traversal (`%252e%252e`) both resolve through a *real* filesystem walk to `404`, and the outside file's real content is never present in the response | `test_http_origin.py::TestRealServerRequestHandling` (`test_traversal_attempt_is_404_and_never_serves_outside_content`, `test_double_encoded_traversal_attempt_is_404`), `TestResolveWithinRoot` | `plugins/module_utils/http_origin.py` (`resolve_within_root`) |
+| Every served, refused, and traversal-blocked request is appended to the real access-log file as a valid JSON-lines record, with the correct `outcome` per request | `test_http_origin.py::TestRealServerRequestHandling` (`test_access_log_records_every_request_with_outcome`, `test_access_log_is_valid_json_lines_and_never_empty_on_a_served_request`) | `plugins/module_utils/http_origin.py` (`_append_access_log`) |
+| `state=started`/`state=stopped` idempotency, check-mode's never-forks/never-signals guarantee, and the `indeterminate=true` timeout classification when `start_timeout` elapses on a still-running daemon | `tests/unit/plugins/modules/test_asmb8_http_origin.py` (`TestStartIdempotency`, `TestStartCheckMode`, `TestStop`, `TestIndeterminateStartTimeout`) | `plugins/modules/asmb8_http_origin.py` |
+
+**A real forked process answering real HTTP requests on a real socket is not
+the same claim as having served a booting machine.** No installer, no
+bootloader, and no BMC-attached target has ever fetched a byte from this
+module — see Tier 4.
+
+### `asmb8_reset`
+
+| Claim | Where tested | Where used |
+|---|---|---|
+| Both `mode=cold` (`Command.reset_bmc()`) and `mode=warm` (`raw_command(netfn=0x06, command=0x03)`) are issued exactly as documented, a `pyghmi` exception or an `'error'`-carrying response both become `RemoteOperationError`, and check mode never opens an IPMI connection | `tests/unit/plugins/modules/test_asmb8_reset.py` (`TestWarmReset`, `TestColdReset`, `TestCheckMode`, `TestErrorHandling`) | `plugins/modules/asmb8_reset.py`, `plugins/module_utils/ipmi.py` (`IpmiClient.reset_bmc`) |
+
 ## Tier 3: Verified against real firmware
 
 Every row cites
@@ -202,6 +229,16 @@ firmware 1.14/1.14.2) on 2026-08-08.
 | `get_power()` returned `on`; `get_bootdev()` returned `{'bootdev': 'default', 'persistent': False, 'uefimode': False}` | "IPMI" |
 | `set_bootdev('cd', persist=False)` set the override, and it reverted to `default` after the following reset — confirming true one-time semantics | "IPMI" |
 | `get_mci()` returns a bare string, not a dict | "IPMI" |
+
+### BMC self-reset (`asmb8_reset`)
+
+| Claim | Evidence |
+|---|---|
+| A Cold Reset (`mode=cold`) completes with completion code 0 and the host itself unaffected — `get_power()` reported `on` immediately before the reset, and the host never rebooted, stayed on, and was never interrupted | "Redirection rejection status `3` means \"bad token\"" |
+| Recovery is staged, not uniform: ICMP and IPMI (UDP 623) answered several minutes before the `.asp` web/HTTPS stack (port 443) did | "Redirection rejection status `3` means \"bad token\"" |
+
+**This is `mode=cold` only.** `mode=warm` (Warm Reset, netfn `0x06` cmd
+`0x03`) has never been issued against the target board — see Tier 4.
 
 ## Tier 4: Still unproven
 
@@ -356,6 +393,24 @@ documentation pass adds from reading the code against that evidence.
     firmware revision other than 1.14/1.14.2** is entirely untested — the
     unit suite's mocked `AspClient` never exercises real HTTP, TLS, or BMC
     timing at all for these nine.
+- **`asmb8_reset`'s `mode=warm` (Warm Reset, netfn `0x06` cmd `0x03`).**
+  Only `mode=cold` was issued against the target board (see Tier 3);
+  `raw_command(netfn=0x06, command=0x03)` has never been sent to real
+  firmware, so whether this board's Warm Reset actually recovers faster than
+  Cold Reset, as the IPMI 2.0 specification predicts in general, is untested
+  here.
+- **`asmb8_http_origin` has never served a real provisioning target.** It
+  has real forked-process, real-socket unit and integration tests (see
+  Tier 2's `asmb8_http_origin` subsection) — a real `HTTPConnection` client
+  driving `GET`/`HEAD`/`Range`/traversal cases against a real background
+  process on a real loopback socket. That is genuine evidence the server
+  itself behaves correctly; it is **not** the same claim as a real
+  bootloader or installer, attached to the BMC's virtual media and booting
+  from it, ever having fetched a single byte from this module. No such run
+  has happened — `docs/netboot-design.md`'s own HTTP-hand-off design remains
+  unimplemented, and the one attempt recorded in
+  `docs/hardware-evidence-2026-08-08.md` ("The HTTP hand-off from a booted
+  iPXE bootstrap") never saw a request arrive at all.
 - **Hardware-in-the-loop CI.** `.circleci/config.yml`'s `hardware` workflow
   (observe → login → media-attach → boot-once → reset → kvm, each behind its
   own approval gate) is fully wired, and every hardware playbook it invokes

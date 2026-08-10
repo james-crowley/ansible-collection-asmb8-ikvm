@@ -16,17 +16,56 @@ description:
     C(tests/unit/fixtures/asp/) -- AMI has not published a specification for this surface (see
     C(plugins/module_utils/asp.py)'s module docstring).
   - >-
-    B(A directory of currently-active sessions is not implemented here, and this is a known,
-    reported gap, not an oversight.) The corpus's C(getsessioninfo.asp) capture was made with a
-    B(POST) request, not a C(GET) -- unlike every other endpoint this module (and its siblings
-    M(james_crowley.asmb8_ikvm.asmb8_users)/M(james_crowley.asmb8_ikvm.asmb8_network)) reads.
-    C(plugins/module_utils/asp.py)'s C(AspClient.get_webvar) is deliberately, permanently
-    C(GET)-only -- see its own docstring's warning against exactly the kind of "just one POST
-    through the read path" escape hatch this module would need to read C(getsessioninfo.asp), and
-    this module does not build one. RV(active_sessions) is therefore always V(null); reading it for
-    real needs a properly-named, POST-capable client method (e.g. C(AspClient.get_session_info()))
-    added to C(asp.py) first, which this module's author flags as follow-up work rather than
-    attempting to invent.
+    B(A directory of currently-active sessions, via O(active_session_services).) C(getsessioninfo.asp)
+    is a B(POST) endpoint, not a C(GET) -- unlike every other endpoint this module (and its
+    siblings M(james_crowley.asmb8_ikvm.asmb8_users)/M(james_crowley.asmb8_ikvm.asmb8_network))
+    reads. A real save-action capture (2026-08-10) sourced its request shape as
+    C(POST /rpc/getsessioninfo.asp) with a C(SERVICEBIT) form field selecting which service's
+    session(s) to return. C(plugins/module_utils/asp.py)'s C(AspClient.get_webvar) remains
+    deliberately, permanently C(GET)-only; this module reads C(getsessioninfo.asp) through the
+    separate, explicitly-named C(AspClient.post_webvar()) instead. O(active_session_services) is
+    optional; omit it (the default) and RV(active_sessions) stays V(null), exactly as before this
+    capability existed.
+  - >-
+    B(C(SERVICEBIT) reuses C(getallservicescfg.asp)'s own C(SERVICEID) values -- confirmed for
+    exactly one service, inferred for the rest.) The captured C(SERVICEBIT=4) is C(cd-media)'s own
+    C(SERVICEID) in this corpus's C(getallservicescfg.txt) -- two independent captures agreeing on
+    the same value is what makes that identity sourced rather than assumed. This module therefore
+    never hardcodes a second name-to-bit mapping: O(active_session_services) is resolved against
+    B(this run's own, live) C(getallservicescfg.asp) read (RV(services)'s own C(SERVICEID) values),
+    not a copy baked into this file. B(Only C(cd-media)'s C(SERVICEBIT) is independently confirmed
+    by a real capture) -- applying the same C(SERVICEID) value as C(SERVICEBIT) for any other
+    service rests on the strength of the C(SERVICEID)/C(SERVICEBIT) identity holding generally, not
+    on a second capture for each one. Treat a non-C(cd-media) RV(active_sessions) entry accordingly
+    until a further capture confirms it.
+  - >-
+    B(RV(active_sessions[].ip_address)/RV(active_sessions[].username) are returned, deliberately --
+    unlike M(james_crowley.asmb8_ikvm.asmb8_users)'s opposite choice for its own C(EmailID)/
+    C(SSHKeyInfo) fields, and that is not an inconsistency.) C(asmb8_users) reduces those two fields
+    to booleans because they are incidental personal data an account listing happens to expose, not
+    what that module's callers are actually asking for. Here, "which client address and which
+    account is connected to which service, right now" B(is) the entire point of reading
+    C(getsessioninfo.asp) at all -- collapsing C(IPADDRESS)/C(UNAME) to booleans would leave
+    RV(active_sessions) unable to do the one thing it exists for. Both fields are still
+    identifying: treat a registered result containing them the same way this module's own
+    C(EXAMPLES) already do (C(no_log: true) on the task), and do not log or persist RV(active_sessions)
+    anywhere that is not itself access-controlled the same as this module's own credentials.
+  - >-
+    B(RV(active_sessions[].privilege_raw) (C(UPRIV)) is returned exactly as reported, undecoded.) It
+    reads V(4) for the one C(admin) session this corpus's capture shows, which is suggestively
+    similar to C(getrole.asp)'s own C(CURPRIV) field (see M(james_crowley.asmb8_ikvm.asmb8_users)) --
+    but no source this module's author found confirms C(getsessioninfo.asp)'s C(UPRIV) uses the
+    B(same) encoding as C(getrole.asp)'s C(CURPRIV), rather than merely the same numeric value by
+    coincidence on this one sample. Per this collection's policy of never asserting a protocol fact
+    it cannot source, this module does not assume that identity and reports C(UPRIV) raw, with this
+    caveat, exactly like every other undecoded privilege-limit field this collection's C(asmb8_users)
+    already reports the same way.
+  - >-
+    A typo'd O(active_session_services) name is only caught B(after) logging in and reading
+    C(getallservicescfg.asp), since valid names are derived live from that response rather than
+    from a second, static list this module maintains -- see the previous bullet. This is a
+    deliberate trade against fail-fast validation, in favour of never letting a hardcoded name
+    list quietly drift out of sync with what the BMC actually reports.
   - >-
     B(C(getremotesession.asp)'s live behaviour is unverified, and RV(remote_session) may
     legitimately be V(null) even immediately after a successful login.) This corpus's fixture for
@@ -70,6 +109,23 @@ author:
   - Jim Crowley (@james-crowley)
 extends_documentation_fragment:
   - james_crowley.asmb8_ikvm.connection
+options:
+  active_session_services:
+    description:
+      - >-
+        Which services' active-session directories to read via C(getsessioninfo.asp) (C(POST),
+        C(SERVICEBIT)). Omit (the default) to skip this read entirely -- RV(active_sessions) stays
+        V(null), exactly as before this option existed.
+      - >-
+        Pass a list of service names (the same names RV(services) is keyed by, e.g. V(cd-media))
+        to query only those, or include the literal element V(all) to query every service this
+        run's own C(getallservicescfg.asp) reported. See the module description for exactly what
+        is and is not sourced about applying C(SERVICEBIT) to a service other than C(cd-media).
+      - >-
+        A name this run's own C(getallservicescfg.asp) did not report fails the module -- see the
+        module description for why that validation can only happen after logging in, not before.
+    type: list
+    elements: str
 seealso:
   - module: james_crowley.asmb8_ikvm.asmb8_info
   - module: james_crowley.asmb8_ikvm.asmb8_users
@@ -111,10 +167,32 @@ EXAMPLES = r"""
     msg: "remote session config was not readable this run (read outcome: {{ sessions_report.remote_session_read.outcome }})"
   when: sessions_report.remote_session is none
 
-- name: active_sessions is always null -- see the module description for why
+- name: active_sessions is null unless active_session_services is set
   ansible.builtin.assert:
     that:
       - sessions_report.active_sessions is none
+
+- name: Read the active session directory for cd-media only -- the one SERVICEBIT this collection has independently confirmed
+  james_crowley.asmb8_ikvm.asmb8_sessions:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    active_session_services: [cd-media]
+  delegate_to: localhost
+  no_log: true
+  register: cd_media_sessions
+
+- name: Read the active session directory for every service getallservicescfg.asp reported
+  james_crowley.asmb8_ikvm.asmb8_sessions:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    active_session_services: [all]
+  delegate_to: localhost
+  no_log: true
+  register: all_sessions
 """
 
 RETURN = r"""
@@ -233,12 +311,49 @@ remote_session_read:
       type: str
 active_sessions:
   description: >-
-    Always V(null). A live directory of active sessions would come from C(getsessioninfo.asp), but
-    that endpoint's real invocation requires C(POST) and C(AspClient.get_webvar) is deliberately
-    C(GET)-only -- see the module description for exactly what would need to be added before this
-    can be implemented.
+    V(null) unless O(active_session_services) is given (the default) -- one entry per session
+    C(getsessioninfo.asp) reported, across every service O(active_session_services) named,
+    flattened into a single list rather than grouped per service (see RV(active_sessions[].service)
+    for that grouping instead). See the module description for exactly what is and is not sourced
+    about C(SERVICEBIT) for a service other than C(cd-media), and about RV(active_sessions[].ip_address)/
+    RV(active_sessions[].username) being returned at all.
   type: list
   elements: dict
+  returned: always
+  contains:
+    service:
+      description: Which O(active_session_services) name this session was read under -- RV(services)'s own key, e.g. V(cd-media).
+      type: str
+    session_id_raw:
+      description: Raw C(SID).
+      type: int
+    session_type_raw:
+      description: Raw C(STYPE). Encoding not sourced -- see the module description.
+      type: int
+    user_id_raw:
+      description: Raw C(UID).
+      type: int
+    username:
+      description: >-
+        Raw C(UNAME), or V(null) if empty. Returned deliberately, unlike M(james_crowley.asmb8_ikvm.asmb8_users)'s
+        opposite choice for C(EmailID) -- see the module description for why, and treat this field
+        as identifying data.
+      type: str
+    ip_address:
+      description: Raw C(IPADDRESS), or V(null) if empty. Same deliberate-return reasoning and identifying-data caveat as RV(active_sessions[].username).
+      type: str
+    privilege_raw:
+      description: Raw C(UPRIV), undecoded -- see the module description for why no mapping is assumed for it.
+      type: int
+active_sessions_queried:
+  description: >-
+    Which service names O(active_session_services) actually resolved to and queried this run --
+    every name literally, or every C(getallservicescfg.asp)-reported name if V(all) was given.
+    Empty when O(active_session_services) was omitted. Lets a caller tell "not requested" apart
+    from "requested, but that service currently has no active session" (the latter still appears
+    here even if it contributed zero entries to RV(active_sessions)).
+  type: list
+  elements: str
   returned: always
 operation:
   description: >-
@@ -260,7 +375,7 @@ operation:
       description: Always V(false).
       type: bool
     observed:
-      description: Mirrors RV(services) and RV(remote_session) together.
+      description: Mirrors RV(services), RV(remote_session), and RV(active_sessions) together.
       type: dict
     error_class:
       description: A stable machine-readable failure class. V(null) on success.
@@ -291,6 +406,15 @@ _SESSION_COUNT_SENTINEL = 255
 #: secure port, the media services' inactivity timeout).
 _UINT32_NOT_APPLICABLE = 4294967295
 
+#: getsessioninfo.asp is a POST endpoint (see the module description) and is read through
+#: AspClient.post_webvar(), never through the GET-only get_webvar() -- this is the one and only
+#: place this module's source may name it.
+_SESSION_INFO_ENDPOINT = "getsessioninfo"
+
+#: The literal opt-in value for O(active_session_services) that means "every service this run's
+#: own getallservicescfg.asp reported" -- see resolve_requested_session_services().
+_ALL_SERVICES_SENTINEL = "all"
+
 
 def _connection_argument_spec() -> dict[str, dict]:
     return {
@@ -309,7 +433,9 @@ def _connection_argument_spec() -> dict[str, dict]:
 
 
 def argument_spec() -> dict[str, dict]:
-    return _connection_argument_spec()
+    spec = _connection_argument_spec()
+    spec["active_session_services"] = {"type": "list", "elements": "str"}
+    return spec
 
 
 def build_asp_client(params: dict) -> AspClient:
@@ -373,6 +499,83 @@ def build_services_report(records: list[dict[str, Any]]) -> dict[str, dict[str, 
     return services
 
 
+def known_service_ids(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Build this run's own SERVICENAME -> SERVICEID mapping straight from getallservicescfg.asp's
+    own records -- never a second, hardcoded copy. See the module description for why
+    O(active_session_services) is resolved against this, not a static table."""
+    return {record["SERVICENAME"]: record["SERVICEID"] for record in records if record.get("SERVICENAME")}
+
+
+def resolve_requested_session_services(requested: list[str] | None, known_ids: dict[str, int]) -> list[str]:
+    """Resolve O(active_session_services) against this run's own, live getallservicescfg.asp names.
+
+    ``None``/empty -> no services requested; the caller skips the getsessioninfo.asp read entirely
+    and RV(active_sessions) stays ``None``, exactly as before this capability existed.
+
+    The literal element :data:`_ALL_SERVICES_SENTINEL` (``"all"``), anywhere in the list -> every
+    service this run's own getallservicescfg.asp reported, in that response's own order.
+
+    Raises :class:`ValueError` -- not one of this collection's :class:`errors.IkvmError`
+    subclasses -- if a requested name is not one ``known_ids`` contains. This is a caller-input
+    problem only discoverable after a live read (see the module description on why
+    O(active_session_services) has no static, hardcoded choices list to validate against up
+    front), not a BMC-side failure, so :func:`main` handles it distinctly from an ``IkvmError``.
+    """
+    if not requested:
+        return []
+    if _ALL_SERVICES_SENTINEL in requested:
+        return list(known_ids)
+    unknown = [name for name in requested if name not in known_ids]
+    if unknown:
+        raise ValueError(
+            f"active_session_services named {unknown!r}, which getallservicescfg.asp did not report this run "
+            f"(known this run: {sorted(known_ids)}). This module derives the SERVICEBIT mapping live from "
+            "getallservicescfg.asp rather than a hardcoded copy -- see the module description -- so an unknown "
+            "name here means the BMC's own service list does not currently include it, not a bug in this module."
+        )
+    resolved: dict[str, None] = {}
+    for name in requested:
+        resolved.setdefault(name, None)
+    return list(resolved)
+
+
+def decode_session_record(record: dict[str, Any], *, service_name: str) -> dict[str, Any]:
+    """Decode one getsessioninfo.asp session record for RV(active_sessions).
+
+    ``ip_address``/``username`` are returned deliberately -- see the module description for why
+    this is the opposite of asmb8_users' EmailID/SSHKeyInfo treatment and is not an inconsistency:
+    "who is connected, from where" is the entire point of reading this endpoint, not incidental
+    data it happens to expose. ``privilege_raw`` (``UPRIV``) is returned exactly as reported,
+    undecoded -- see the module description for why no mapping is assumed for it, even though its
+    one sampled value coincides with getrole.asp's own CURPRIV.
+    """
+    return {
+        "service": service_name,
+        "session_id_raw": record.get("SID"),
+        "session_type_raw": record.get("STYPE"),
+        "user_id_raw": record.get("UID"),
+        "username": record.get("UNAME") or None,
+        "ip_address": record.get("IPADDRESS") or None,
+        "privilege_raw": record.get("UPRIV"),
+    }
+
+
+def fetch_active_sessions(asp_client: AspClient, service_names: list[str], service_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """Read getsessioninfo.asp (POST, SERVICEBIT) once per name in ``service_names``, via post_webvar().
+
+    Never through get_webvar() -- get_webvar() is GET-only by design and this endpoint requires
+    POST; see AspClient.post_webvar()'s own docstring for why that is a separate, explicitly-named
+    method rather than a widening of get_webvar(). Every service's sessions are flattened into one
+    list, tagged with RV(active_sessions[].service), rather than grouped -- see the RETURN
+    documentation.
+    """
+    sessions: list[dict[str, Any]] = []
+    for name in service_names:
+        response = asp_client.post_webvar(_SESSION_INFO_ENDPOINT, data={"SERVICEBIT": str(service_ids[name])})
+        sessions.extend(decode_session_record(record, service_name=name) for record in response.records)
+    return sessions
+
+
 def decode_remote_session_config(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "kvm_encryption_enabled": bool(record.get("KVMENCRYPTION")),
@@ -408,17 +611,28 @@ def fetch_remote_session_config(asp_client: AspClient) -> tuple[dict[str, Any] |
     return decode_remote_session_config(response.records[0]), {"outcome": "read", "error_class": None}
 
 
-def gather_report(asp_client: AspClient) -> dict[str, Any]:
-    """Log in and read what this module can. The only place this module's login happens."""
+def gather_report(asp_client: AspClient, *, requested_session_services: list[str] | None = None) -> dict[str, Any]:
+    """Log in and read what this module can. The only place this module's login happens.
+
+    ``requested_session_services`` is O(active_session_services), already validated by the
+    caller's argument spec to be a list of strings (or ``None``) -- see
+    :func:`resolve_requested_session_services` for how it is resolved against this run's own live
+    service names, and :func:`main` for how a :class:`ValueError` from that resolution is reported.
+    """
     asp_client.login()
     services_response = asp_client.get_webvar("getallservicescfg")
+    service_ids = known_service_ids(services_response.records)
     remote_session, remote_session_read = fetch_remote_session_config(asp_client)
+
+    queried_services = resolve_requested_session_services(requested_session_services, service_ids)
+    active_sessions = fetch_active_sessions(asp_client, queried_services, service_ids) if queried_services else None
 
     return {
         "services": build_services_report(services_response.records),
         "remote_session": remote_session,
         "remote_session_read": remote_session_read,
-        "active_sessions": None,
+        "active_sessions": active_sessions,
+        "active_sessions_queried": queried_services,
     }
 
 
@@ -443,13 +657,19 @@ def main() -> None:
             remote_session=None,
             remote_session_read=None,
             active_sessions=None,
+            active_sessions_queried=None,
             operation=receipt.to_dict(),
         )
         return
 
     try:
         asp_client = build_asp_client(params)
-        report = gather_report(asp_client)
+        report = gather_report(asp_client, requested_session_services=params["active_session_services"])
+    except ValueError as exc:
+        # An unknown active_session_services name, only discoverable after logging in and reading
+        # getallservicescfg.asp live -- see resolve_requested_session_services()'s docstring.
+        module.fail_json(msg=str(exc))
+        return
     except IkvmError as err:
         module.fail_json(**err.to_result())
         return
@@ -458,7 +678,7 @@ def main() -> None:
         action="asmb8_sessions.report",
         endpoint=asp_client.endpoint,
         changed=False,
-        observed={"services": report["services"], "remote_session": report["remote_session"]},
+        observed={"services": report["services"], "remote_session": report["remote_session"], "active_sessions": report["active_sessions"]},
     )
     module.exit_json(changed=False, **report, operation=receipt.to_dict())
 

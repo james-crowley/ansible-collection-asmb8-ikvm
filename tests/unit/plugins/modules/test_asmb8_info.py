@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from ansible.module_utils import basic
 from ansible.module_utils.common.text.converters import to_bytes
 
-from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import AuthenticationError, RemoteOperationError
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import AuthenticationError, ProtocolError, RemoteOperationError
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.webvar import parse_webvar
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.modules import asmb8_info
 
 PASSWORD = "Sup3rSecret!"
@@ -29,6 +31,19 @@ BASE_ARGS = {
     "username": "admin",
     "password": PASSWORD,
 }
+
+FIXTURES_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "asp"
+
+#: What a session-expired HTML page (getremotesession.asp's documented, unverified failure mode
+#: against a programmatic client -- see asmb8_info's own DOCUMENTATION and
+#: asmb8_sessions.py's identical, independently observed gap) looks like to parse_webvar: not the
+#: WEBVAR_JSONVAR_ shape at all, so it raises ProtocolError. Used to exercise the degrade-to-None
+#: path without needing a real such capture.
+SESSION_EXPIRED_HTML = "<html><body>Your session has expired. Please log in again.</body></html>"
+
+
+def _read_fixture(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
 
 
 def _set_module_args(args: dict) -> None:
@@ -69,6 +84,28 @@ def _fake_ipmi_client() -> Mock:
 
 def _wire_fake_ipmi_client(monkeypatch, fake_client) -> None:
     monkeypatch.setattr(asmb8_info, "build_ipmi_client", lambda params: fake_client)
+
+
+def _fake_asp_client_with_fixtures(**fixture_overrides: str) -> Mock:
+    """A fake AspClient whose ``get_webvar()`` replays real fixtures through the real parser.
+
+    Defaults to the real, checked-in ``getremotesession.txt``/``getvmediacfg.txt`` fixtures --
+    per this collection's rule of testing against captured hardware responses, never invented
+    payloads. Pass e.g. ``getremotesession=SESSION_EXPIRED_HTML`` to exercise a specific
+    endpoint's degrade/failure path instead.
+    """
+    fixtures = {
+        "getremotesession": _read_fixture("getremotesession.txt"),
+        "getvmediacfg": _read_fixture("getvmediacfg.txt"),
+    }
+    fixtures.update(fixture_overrides)
+
+    client = Mock()
+    client.endpoint = "10.0.0.5:443"
+    client.login.return_value = "session-cookie-not-real"
+    client.get_host_status.return_value = "raw hoststatus.asp body"
+    client.get_webvar = Mock(side_effect=lambda endpoint, **_kwargs: parse_webvar(fixtures[endpoint], endpoint=endpoint))
+    return client
 
 
 def _run_ok(args: dict) -> dict:
@@ -290,3 +327,171 @@ class TestNoCredentialLeakage:
         result = _run_fail(dict(BASE_ARGS))
         assert PASSWORD not in json.dumps(result)
         assert "[REDACTED]" in result["msg"]
+
+
+class TestDecodeMediaSessionCount:
+    """The +128 offset, applied to getvmediacfg.asp's V_MAX_CD_SESSIONS/V_ACTIVE_CD_SESSIONS on the
+    strength of asmb8_sessions.py's independently-confirmed evidence for the same offset -- see
+    that module's DOCUMENTATION and this module's own description."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (129, 1),  # getvmediacfg.asp's V_MAX_CD_SESSIONS -- the same raw value getallservicescfg.asp's own cd-media MAXSESS reports.
+            (128, 0),  # V_ACTIVE_CD_SESSIONS baseline: zero active sessions right now.
+        ],
+    )
+    def test_offset_decoding(self, raw, expected):
+        assert asmb8_info.decode_media_session_count(raw) == expected
+
+    def test_255_is_a_not_applicable_sentinel_not_127(self):
+        assert asmb8_info.decode_media_session_count(255) is None
+
+    def test_none_passes_through(self):
+        assert asmb8_info.decode_media_session_count(None) is None
+
+
+class TestFetchRemoteSessionPreconditions:
+    """getremotesession.asp's documented, unverified failure mode: a session-expired-looking
+    response even after a fresh login. Must degrade, never raise."""
+
+    def test_a_parseable_fixture_reads_normally(self):
+        client = _fake_asp_client_with_fixtures()
+        fields, read = asmb8_info.fetch_remote_session_preconditions(client)
+        assert fields == {"media_encryption_enabled": False, "attach_raw": 0}
+        assert read == {"outcome": "read", "error_class": None}
+
+    def test_a_session_expired_html_page_degrades_to_none_without_raising(self):
+        client = _fake_asp_client_with_fixtures(getremotesession=SESSION_EXPIRED_HTML)
+        fields, read = asmb8_info.fetch_remote_session_preconditions(client)
+        assert fields is None
+        assert read == {"outcome": "failed", "error_class": "protocol"}
+
+    def test_a_non_protocol_error_still_propagates(self):
+        client = _fake_asp_client_with_fixtures()
+        client.get_webvar = Mock(side_effect=AuthenticationError("session expired for real", endpoint="10.0.0.5:443", operation="get_webvar"))
+        with pytest.raises(AuthenticationError):
+            asmb8_info.fetch_remote_session_preconditions(client)
+
+
+class TestFetchVmediacfgPreconditions:
+    def test_a_parseable_fixture_reads_normally(self):
+        client = _fake_asp_client_with_fixtures()
+        fields = asmb8_info.fetch_vmediacfg_preconditions(client)
+        assert fields["secure_channel_enabled"] is False
+        assert fields["license_status_raw"] == 1
+        assert fields["device_counts"] == {"cd": 1, "fd": 1, "hd": 1}
+        assert fields["sessions"] == {"cd": {"max": 1, "current": 0}}
+        assert fields["status_raw"] == 1
+
+    def test_a_session_expired_html_page_raises_rather_than_degrading(self):
+        # Unlike getremotesession.asp, getvmediacfg.asp has shown no equivalent quirk in this
+        # project's testing -- a parse failure here is a real problem and must not be swallowed.
+        client = _fake_asp_client_with_fixtures(getvmediacfg=SESSION_EXPIRED_HTML)
+        with pytest.raises(ProtocolError):
+            asmb8_info.fetch_vmediacfg_preconditions(client)
+
+
+class TestMediaPreconditionsOption:
+    def test_defaults_to_false(self):
+        assert asmb8_info.argument_spec()["include_media_preconditions"]["default"] is False
+
+    def test_requires_include_web_session(self, monkeypatch):
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        result = _run_fail(dict(BASE_ARGS, include_media_preconditions=True))
+        assert "include_web_session" in result["msg"]
+
+    def test_not_read_when_not_requested(self, monkeypatch):
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        fake_asp = _fake_asp_client_with_fixtures()
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: fake_asp)
+
+        result = _run_ok(dict(BASE_ARGS, include_web_session=True))
+
+        assert result["asmb8"]["media"]["preconditions"] is None
+        fake_asp.get_webvar.assert_not_called()
+
+    def test_reads_and_decodes_session_counts_not_raw(self, monkeypatch):
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        fake_asp = _fake_asp_client_with_fixtures()
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: fake_asp)
+
+        result = _run_ok(dict(BASE_ARGS, include_web_session=True, include_media_preconditions=True))
+
+        preconditions = result["asmb8"]["media"]["preconditions"]
+        # The fixture's raw V_MAX_CD_SESSIONS/V_ACTIVE_CD_SESSIONS are 129/128 -- never reported.
+        assert preconditions["sessions"]["cd"] == {"max": 1, "current": 0}
+        assert "129" not in json.dumps(preconditions)
+        assert preconditions["encryption"] == {"media_encryption_enabled": False, "secure_channel_enabled": False}
+        assert preconditions["licensing"] == {"license_status_raw": 1}
+        assert preconditions["attach"] == {"attach_raw": 0}
+        assert preconditions["device_counts"] == {"cd": 1, "fd": 1, "hd": 1}
+        assert preconditions["status_raw"] == 1
+        assert preconditions["remote_session_read"] == {"outcome": "read", "error_class": None}
+        fake_asp.login.assert_called_once()  # One session shared for web_management + preconditions, not two.
+
+    def test_session_expired_getremotesession_degrades_without_failing_the_module(self, monkeypatch):
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        fake_asp = _fake_asp_client_with_fixtures(getremotesession=SESSION_EXPIRED_HTML)
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: fake_asp)
+
+        result = _run_ok(dict(BASE_ARGS, include_web_session=True, include_media_preconditions=True))
+
+        preconditions = result["asmb8"]["media"]["preconditions"]
+        assert preconditions["encryption"]["media_encryption_enabled"] is None
+        assert preconditions["attach"]["attach_raw"] is None
+        assert preconditions["remote_session_read"]["outcome"] == "failed"
+        # getvmediacfg.asp-sourced fields are unaffected by getremotesession.asp's failure.
+        assert preconditions["encryption"]["secure_channel_enabled"] is False
+        assert preconditions["sessions"]["cd"] == {"max": 1, "current": 0}
+
+    def test_getvmediacfg_failure_fails_the_whole_module(self, monkeypatch):
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        fake_asp = _fake_asp_client_with_fixtures(getvmediacfg=SESSION_EXPIRED_HTML)
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: fake_asp)
+
+        result = _run_fail(dict(BASE_ARGS, include_web_session=True, include_media_preconditions=True))
+        assert result["error_class"] == "protocol"
+
+
+class TestBackwardCompatibleOutputSurface:
+    """Pins the published surface: every key that existed before include_media_preconditions must
+    still be present with the same meaning. New data is additive only."""
+
+    def test_default_run_output_is_unchanged(self, monkeypatch):
+        fake_client = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_client)
+
+        result = _run_ok(dict(BASE_ARGS))
+        asmb8 = result["asmb8"]
+
+        assert asmb8["reachable"] is True
+        assert asmb8["ipmi"] == {
+            "power_state": {"powerstate": "on"},
+            "boot_device": {"bootdev": "default", "persistent": True},
+            "mc_info": "some-mc-identifier",
+        }
+        assert asmb8["web_management"] is None
+        assert asmb8["media"]["port_mode"] == "unknown"
+        assert asmb8["capabilities"]["ipmi_power"]["proven"] is True
+        assert asmb8["capabilities"]["virtual_media"]["supported"] is None
+        assert asmb8["capabilities"]["virtual_media"]["proven"] is False
+        assert asmb8["capabilities"]["redfish"] == {
+            "supported": False,
+            "proven": True,
+            "note": asmb8_info.build_capabilities(web_management=None, include_web_session=False)["redfish"]["note"],
+        }
+        assert result["operation"]["schema"] == "asmb8-ikvm-operation/v1"
+        assert result["operation"]["action"] == "get_facts"
+        assert result["operation"]["changed"] is False
+        assert result["operation"]["error_class"] is None
+        assert set(result["operation"]["ipmi_reads"]) == {"power_state", "boot_device", "mc_info"}
+
+        # The only change: an additive, always-None-by-default key.
+        assert "preconditions" in asmb8["media"]
+        assert asmb8["media"]["preconditions"] is None

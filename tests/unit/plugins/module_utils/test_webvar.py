@@ -39,7 +39,31 @@ FIXTURES_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "asp"
 #: The one fixture known to be naturally malformed -- see module docstring.
 _MALFORMED_FIXTURE_NAME = "create.txt"
 
-ALL_FIXTURES = sorted(FIXTURES_DIR.glob("*.txt"))
+#: Two fixtures added after the original 54-file batch this file's docstring and the "54"/"49 of
+#: 54"/"5 of 54" figures throughout webvar.py describe -- a separate, later save-action capture
+#: exercising AspClient.post_webvar()'s two POST-parameterized reads (getselentries.asp paging,
+#: getsessioninfo.asp's per-service session directory). See
+#: tests/unit/fixtures/asp/README.md's "POST-parameterized reads" section for their provenance.
+#: Excluded here so the "54" figure stays a stable, accurate fact about that original batch rather
+#: than being silently redefined by every later addition to this directory; they are well-formed
+#: WEBVAR bodies (proving the envelope is identical to the GET-read corpus -- see
+#: docs/protocol-notes.md), just parsed and checked in tests/unit/plugins/module_utils/test_asp.py
+#: instead, alongside the AspClient.post_webvar() behaviour they actually exist to exercise.
+_POST_CAPTURE_FIXTURE_NAMES = frozenset({"getselentries_post_lasteventid24.txt", "getsessioninfo_post_servicebit4.txt"})
+
+#: Two more fixtures added later still, from the distinct save-action capture backing
+#: `asmb8_ntp` -- the reply bodies for this collection's first real `.asp` writes
+#: (`setntpcfg.asp`/`setdatetime.asp`; see `docs/protocol-notes.md`'s NTP write-convention
+#: section and `tests/unit/fixtures/asp/README.md`'s "Write replies" section for exactly what is
+#: and is not sourced about them). Excluded from the corpus count for the same reason
+#: `_POST_CAPTURE_FIXTURE_NAMES` is: they parse and are checked in
+#: `tests/unit/plugins/module_utils/test_asp.py`'s `TestSetWebvar`, not here, and the "54" figure
+#: describes one specific, closed batch that neither of these additions was ever part of.
+_WRITE_REPLY_FIXTURE_NAMES = frozenset({"setntpcfg_write.txt", "setdatetime_write.txt"})
+
+_EXTRA_FIXTURE_NAMES = _POST_CAPTURE_FIXTURE_NAMES | _WRITE_REPLY_FIXTURE_NAMES
+
+ALL_FIXTURES = sorted(path for path in FIXTURES_DIR.glob("*.txt") if path.name not in _EXTRA_FIXTURE_NAMES)
 WELL_FORMED_FIXTURES = [path for path in ALL_FIXTURES if path.name != _MALFORMED_FIXTURE_NAME]
 
 #: Sanity check on the corpus itself, not on the parser: if this ever fails,
@@ -56,6 +80,15 @@ def _read(name: str) -> str:
 def test_corpus_has_the_expected_fixture_count():
     assert len(ALL_FIXTURES) == _EXPECTED_FIXTURE_COUNT
     assert len(WELL_FORMED_FIXTURES) == _EXPECTED_FIXTURE_COUNT - 1
+
+
+def test_post_capture_fixtures_are_the_real_reason_the_directory_has_more_files_than_the_corpus_count():
+    """Guards `_EXTRA_FIXTURE_NAMES` (both exclusion sets combined) against drift: if this ever
+    fails, either a fixture named there was deleted/renamed, or the directory grew a `.txt` file
+    neither exclusion set (nor this file's own docstring) yet knows about."""
+    all_txt_names = {path.name for path in FIXTURES_DIR.glob("*.txt")}
+    assert _EXTRA_FIXTURE_NAMES <= all_txt_names
+    assert all_txt_names - {path.name for path in ALL_FIXTURES} == _EXTRA_FIXTURE_NAMES
 
 
 class TestCorpusWide:

@@ -102,12 +102,23 @@ def _run_fail(args: dict) -> dict:
     return excinfo.value.args[0]
 
 
+#: The real getselentries_post_lasteventid24.txt fixture: a sourced POST capture
+#: (WEBVAR_LASTEVENTID=24 against a 24-entry log) that legitimately returns zero records -- see
+#: tests/unit/fixtures/asp/README.md's "POST-parameterized reads" section and this module's own
+#: DOCUMENTATION on why that empty result is correct, not a failure.
+_PAGED_ENTRIES_FIXTURE = "getselentries_post_lasteventid24"
+
+
 def _fake_client_from_real_fixtures(endpoint: str = "10.0.0.5:443") -> Mock:
-    """A fake AspClient whose get_webvar() parses the real fixture for whichever endpoint is asked for."""
+    """A fake AspClient whose get_webvar()/post_webvar() parse the real fixture for whichever
+    endpoint (and, for post_webvar, WEBVAR_LASTEVENTID) is asked for."""
     client = Mock()
     client.endpoint = endpoint
     client.login.return_value = "session-cookie-not-real"
     client.get_webvar.side_effect = lambda name, operation=None: parse_webvar(_fixture_text(name), endpoint=endpoint, operation=operation)
+    client.post_webvar.side_effect = lambda name, data=None, operation=None: parse_webvar(
+        _fixture_text(_PAGED_ENTRIES_FIXTURE), endpoint=endpoint, operation=operation
+    )
     return client
 
 
@@ -121,6 +132,9 @@ class TestArgumentSpec:
 
     def test_limit_has_no_default(self):
         assert asmb8_sel.argument_spec()["limit"].get("default") is None
+
+    def test_after_event_id_has_no_default(self):
+        assert asmb8_sel.argument_spec()["after_event_id"].get("default") is None
 
     def test_there_is_no_clear_option(self):
         # This module is strictly read-only -- see its DOCUMENTATION's "no clear option, and there
@@ -236,7 +250,7 @@ class TestLimit:
         assert result["entries_available"] == 24
 
 
-class TestNeverUsesThePagedPostEndpoint:
+class TestDefaultPathNeverUsesThePagedPostEndpoint:
     def test_only_the_three_get_endpoints_are_ever_requested(self, monkeypatch):
         fake_client = _fake_client_from_real_fixtures()
         _wire_fake_client(monkeypatch, fake_client)
@@ -244,6 +258,100 @@ class TestNeverUsesThePagedPostEndpoint:
         requested = {call.args[0] for call in fake_client.get_webvar.call_args_list}
         assert requested == {"getallselentries", "getmaxselentries", "getselcfg"}
         assert "getselentries" not in requested
+        fake_client.post_webvar.assert_not_called()
+
+
+class TestAfterEventId:
+    """O(after_event_id) -- the sourced, POST-only paged read. See the module DOCUMENTATION and
+    tests/unit/fixtures/asp/README.md for exactly what the one real capture of this endpoint
+    shows (a legitimately empty result)."""
+
+    def test_after_event_id_reads_via_post_webvar_not_get_webvar(self, monkeypatch):
+        fake_client = _fake_client_from_real_fixtures()
+        _wire_fake_client(monkeypatch, fake_client)
+
+        _run_ok(dict(BASE_ARGS, after_event_id=24))
+
+        fake_client.post_webvar.assert_called_once()
+        args, kwargs = fake_client.post_webvar.call_args
+        assert args[0] == "getselentries"
+        assert kwargs["data"] == {"WEBVAR_LASTEVENTID": "24"}
+        get_webvar_requested = {call.args[0] for call in fake_client.get_webvar.call_args_list}
+        assert "getselentries" not in get_webvar_requested
+
+    def test_the_real_capture_is_a_legitimately_empty_result_not_a_failure(self, monkeypatch):
+        fake_client = _fake_client_from_real_fixtures()
+        _wire_fake_client(monkeypatch, fake_client)
+
+        result = _run_ok(dict(BASE_ARGS, after_event_id=24))
+
+        assert result["changed"] is False
+        assert result["entries"] == []
+        assert result["entries_available"] == 0
+        assert result["entries_returned"] == 0
+        assert result["operation"]["error_class"] is None
+
+    def test_max_entries_and_sel_policy_are_still_read_alongside_the_paged_query(self, monkeypatch):
+        fake_client = _fake_client_from_real_fixtures()
+        _wire_fake_client(monkeypatch, fake_client)
+
+        result = _run_ok(dict(BASE_ARGS, after_event_id=24))
+
+        assert result["max_entries"] == 3000
+        assert result["sel_policy"] == 0
+
+    def test_limit_still_applies_on_top_of_the_paged_read(self, monkeypatch):
+        # The real paged capture returned zero records (see test_the_real_capture_is_a_...
+        # above), which cannot exercise limit-truncation on its own. This test stands in
+        # getallselentries.txt's 24 real records as post_webvar's response purely to exercise the
+        # limit-after-paged-read code path -- it is not a claim that getselentries.asp itself was
+        # ever captured returning that many records.
+        fake_client = Mock()
+        fake_client.endpoint = "10.0.0.5:443"
+        fake_client.login.return_value = "session-cookie-not-real"
+        fake_client.get_webvar.side_effect = lambda name, operation=None: parse_webvar(_fixture_text(name), endpoint="10.0.0.5:443", operation=operation)
+        fake_client.post_webvar.side_effect = lambda name, data=None, operation=None: parse_webvar(
+            _fixture_text("getallselentries"), endpoint="10.0.0.5:443", operation=operation
+        )
+        _wire_fake_client(monkeypatch, fake_client)
+
+        result = _run_ok(dict(BASE_ARGS, after_event_id=0, limit=5))
+
+        assert result["entries_returned"] == 5
+        assert result["entries_available"] == 24  # before limit -- the paged read's own record count
+
+    def test_negative_after_event_id_is_rejected_before_any_login(self, monkeypatch):
+        fake_client = _fake_client_from_real_fixtures()
+        _wire_fake_client(monkeypatch, fake_client)
+
+        result = _run_fail(dict(BASE_ARGS, after_event_id=-1))
+
+        assert "after_event_id" in result["msg"]
+        fake_client.login.assert_not_called()
+
+    def test_after_event_id_zero_is_allowed(self, monkeypatch):
+        fake_client = _fake_client_from_real_fixtures()
+        _wire_fake_client(monkeypatch, fake_client)
+
+        result = _run_ok(dict(BASE_ARGS, after_event_id=0))
+
+        assert result["changed"] is False
+
+    def test_read_paged_entries_reuses_parse_entry_field_mapping(self):
+        client = Mock()
+        client.endpoint = "10.0.0.5:443"
+        client.post_webvar.return_value = WebVarResponse(
+            variable_name="HL_GETSELENTRIES",
+            struct_name="HL_GETSELENTRIES",
+            records=[dict(_EXPECTED_FIRST_RECORD)],
+            hapi_status=0,
+        )
+
+        entries, entries_available = asmb8_sel.read_paged_entries(client, after_event_id=10, limit=None)
+
+        assert entries_available == 1
+        assert entries[0]["record_id"] == _EXPECTED_FIRST_RECORD["RecordID"]
+        client.post_webvar.assert_called_once_with("getselentries", data={"WEBVAR_LASTEVENTID": "10"})
 
 
 class TestFieldLevelHelpers:

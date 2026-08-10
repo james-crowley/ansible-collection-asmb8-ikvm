@@ -55,20 +55,66 @@
       asmb8_baremetal_install_allow_insecure_transport must be explicitly true when
       asmb8_baremetal_install_use_tls is false. See plugins/doc_fragments/connection.py.
 
-- name: Require an installer ISO -- this role has exactly one boot path
+- name: Require a recognised delivery mode
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_delivery in ['full_iso', 'ipxe_http']
+    fail_msg: >-
+      asmb8_baremetal_install_delivery={{ asmb8_baremetal_install_delivery }} is
+      not recognised. Valid values are full_iso (the default -- stream the
+      whole ISO over iUSB, exactly as this role has always worked) and
+      ipxe_http (attach only a small bootstrap image over iUSB and fetch
+      everything else over plain HTTP -- see README.md#ipxe_http and
+      docs/netboot-design.md).
+
+- name: Require an installer ISO -- the full_iso delivery mode's only boot path
   # asmb8_media has no PXE/floppy/answer-file fallback: it attaches exactly one
-  # read-only ISO to the CD-ROM slot (see its DOCUMENTATION), and that is this
-  # role's entire reason to exist -- get a bare-metal host booting a local ISO
-  # with no PXE/DHCP/TFTP/NFS/CIFS infrastructure. There is no other source of
-  # bootable media for this role to fall back to.
+  # read-only ISO to the CD-ROM slot (see its DOCUMENTATION). full_iso's
+  # entire reason to exist is booting a local ISO with no PXE/DHCP/TFTP/NFS/
+  # CIFS infrastructure -- there is no other source of bootable media for
+  # that mode to fall back to. Not required for ipxe_http, whose boot media
+  # is built by asmb8_bootstrap_image instead -- see the guard immediately
+  # below.
   ansible.builtin.assert:
     that:
       - asmb8_baremetal_install_iso_path is truthy
     fail_msg: >-
-      asmb8_baremetal_install_iso_path is required -- this role has exactly one
-      boot path (a local ISO attached as virtual media over iUSB) and no PXE or
-      other fallback. See defaults/main.yml's comment on this variable for the
-      stock-ISO-stops-at-a-menu limitation before choosing one.
+      asmb8_baremetal_install_iso_path is required for delivery mode full_iso
+      -- this mode has exactly one boot path (a local ISO attached as
+      virtual media over iUSB) and no PXE or other fallback. See
+      defaults/main.yml's comment on this variable for the
+      stock-ISO-stops-at-a-menu limitation before choosing one. If you meant
+      to use the ipxe_http delivery mode instead, set
+      asmb8_baremetal_install_delivery=ipxe_http explicitly.
+  when: asmb8_baremetal_install_delivery == 'full_iso'
+
+- name: Require ipxe_http delivery settings when that mode is selected
+  # asmb8_baremetal_install_ipxe_origin_bind_address has no default at all,
+  # on purpose -- same reasoning as asmb8_baremetal_install_handoff_host
+  # immediately below: a wrong guess here is only discovered after the
+  # destructive reset. This role does NOT run
+  # `proxmox-auto-install-assistant --pxe` or edit a generated boot.ipxe's
+  # leading `dhcp` line for the caller -- see README.md#ipxe_http -- so this
+  # guard can only verify the variables naming those artefacts are set, not
+  # that they were prepared correctly.
+  ansible.builtin.assert:
+    that:
+      - asmb8_baremetal_install_ipxe_origin_path is truthy
+      - asmb8_baremetal_install_ipxe_origin_bind_address is truthy
+      - asmb8_baremetal_install_ipxe_lkrn_path is truthy
+      - asmb8_baremetal_install_ipxe_network_mode != 'static' or
+        (asmb8_baremetal_install_ipxe_address is truthy and
+         asmb8_baremetal_install_ipxe_netmask is truthy and
+         asmb8_baremetal_install_ipxe_gateway is truthy)
+    fail_msg: >-
+      asmb8_baremetal_install_delivery=ipxe_http requires
+      asmb8_baremetal_install_ipxe_origin_path,
+      asmb8_baremetal_install_ipxe_origin_bind_address, and
+      asmb8_baremetal_install_ipxe_lkrn_path to all be set, and -- when
+      asmb8_baremetal_install_ipxe_network_mode is the default 'static' --
+      asmb8_baremetal_install_ipxe_address/_netmask/_gateway to all be set
+      too. See README.md#ipxe_http.
+  when: asmb8_baremetal_install_delivery == 'ipxe_http'
 
 - name: Require an explicit hand-off endpoint when the hand-off wait is enabled
   # asmb8_baremetal_install_handoff_host has no default at all, on purpose -- see

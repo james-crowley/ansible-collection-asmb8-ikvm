@@ -52,3 +52,10 @@ action_groups:
     # set_identify() falls through to the standard command for this board, so
     # this needs no .asp endpoint and carries no lockout risk.
     - asmb8_identify
+    # Builds a small bootable iPXE image carrying an embedded chain script.
+    # Local-only: it produces a file and never contacts the BMC. Registered in
+    # the group for module_defaults consistency with the rest of the install path.
+    - asmb8_bootstrap_image
+    # First module with a real .asp write. Endpoints setntpcfg/setdatetime are
+    # sourced from a save-action capture; see docs/protocol-notes.md.
+    - asmb8_ntp

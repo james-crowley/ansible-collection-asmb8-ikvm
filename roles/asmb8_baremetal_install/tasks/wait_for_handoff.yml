@@ -24,11 +24,95 @@
 # that is what was attached, this wait will run its full
 # asmb8_baremetal_install_handoff_timeout and then fail -- correctly. That
 # failure means "hand-off genuinely never happened", not "this task is broken".
+#
+# POST-CODE SAMPLING ACROSS THIS WAIT. asmb8_postcode exists specifically
+# because IPMI Serial-over-LAN does not work on this board and
+# asmb8_console's video channel cannot be decoded into pixels -- see that
+# module's own DOCUMENTATION, which calls it "the highest-value module in
+# this batch" for exactly this reason. Without this, a hand-off that never
+# arrives reports nothing more than "timed out"; with it, a failed run
+# reports the last BIOS POST code this role actually observed the board
+# reach -- the single biggest diagnostic improvement available here for
+# close to no cost. Gated by
+# asmb8_baremetal_install_sample_post_code_during_handoff, which defaults to
+# enabled for ipxe_http and disabled for full_iso (see defaults/main.yml's
+# comment on that variable for why) -- override either explicitly if you
+# want the opposite.
+#
+# IMPLEMENTATION NOTE: this waits in bounded CHUNKS
+# (asmb8_baremetal_install_post_code_poll_interval_seconds apart) rather than
+# one long ansible.builtin.wait_for call, specifically so a POST-code read can
+# be interleaved between chunks. Each chunk's wait_for is given failed_when:
+# false so this task file can inspect the outcome itself instead of letting a
+# single chunk's timeout end the whole role. ansible.builtin.wait_for's own
+# documented return value carries no `msg` key on a genuine success, and
+# always carries one when it times out or the connection is refused -- that
+# is the signal this file uses to decide "keep sampling" versus "hand-off
+# confirmed", because that module offers no dedicated boolean for it. This is
+# not obvious from that module's own docs alone, which is why it is spelled
+# out here.
 
-- name: Wait for the installed/booted OS to answer, confirming hand-off
+- name: Wait for hand-off in one bounded call, without POST-code sampling
   ansible.builtin.wait_for:
     host: "{{ asmb8_baremetal_install_handoff_host }}"
     port: "{{ asmb8_baremetal_install_handoff_port }}"
     timeout: "{{ asmb8_baremetal_install_handoff_timeout }}"
     delay: "{{ asmb8_baremetal_install_handoff_delay }}"
   delegate_to: localhost
+  when: not (asmb8_baremetal_install_sample_post_code_during_handoff | bool)
+
+- name: Reset hand-off progress tracking for this attempt
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_handoff_confirmed: false
+    asmb8_baremetal_install_last_post_code: null
+    asmb8_baremetal_install_post_code_history: []
+  when: asmb8_baremetal_install_sample_post_code_during_handoff | bool
+
+- name: Compute the maximum number of POST-code sampling chunks for this wait
+  # Bounds this loop to roughly asmb8_baremetal_install_handoff_timeout worth
+  # of chunks, each asmb8_baremetal_install_post_code_poll_interval_seconds
+  # long, plus one extra for the initial delay and one more for rounding --
+  # NOT an exact-to-the-second bound (the total wait can run up to one extra
+  # poll interval past asmb8_baremetal_install_handoff_timeout), the same
+  # "never starts a poll that would push meaningfully past it" spirit as
+  # asmb8_postcode's own sample() bound, not a byte-exact guarantee. Computed
+  # unconditionally (not only when sampling is enabled) because Jinja renders
+  # the loop list below before evaluating any task's own `when`, and an
+  # undefined variable there would fail even on a run that skips every
+  # iteration.
+  ansible.builtin.set_fact:
+    asmb8_baremetal_install_post_code_max_chunks: >-
+      {{ ((((asmb8_baremetal_install_handoff_timeout | int) + (asmb8_baremetal_install_handoff_delay | int))
+           / (asmb8_baremetal_install_post_code_poll_interval_seconds | int))
+          | round(0, 'ceil') | int) + 1 }}
+
+- name: Wait for hand-off in bounded chunks, sampling the POST code between each
+  # A looped include_tasks, not a looped block -- `loop:` is not a valid
+  # attribute of a `block:` task in Ansible, so the actual chunk body lives
+  # in tasks/sample_post_code_chunk.yml instead. See that file's own header
+  # comment.
+  ansible.builtin.include_tasks: sample_post_code_chunk.yml
+  when:
+    - asmb8_baremetal_install_sample_post_code_during_handoff | bool
+    - not asmb8_baremetal_install_handoff_confirmed
+  loop: "{{ range(0, asmb8_baremetal_install_post_code_max_chunks | int) | list }}"
+  loop_control:
+    label: "hand-off chunk {{ item }} (confirmed={{ asmb8_baremetal_install_handoff_confirmed | default(false) }})"
+
+- name: Fail loudly, with the last observed POST code, if hand-off was never confirmed
+  ansible.builtin.fail:
+    msg: >-
+      asmb8_baremetal_install did not observe hand-off from
+      {{ asmb8_baremetal_install_handoff_host }}:{{ asmb8_baremetal_install_handoff_port }}
+      within asmb8_baremetal_install_handoff_timeout
+      ({{ asmb8_baremetal_install_handoff_timeout }}s). Last BIOS POST code
+      observed: {{ asmb8_baremetal_install_last_post_code
+                    | default('(none read -- see asmb8_baremetal_install_post_code_history and the .asp session '
+                               ~ 'for why asmb8_postcode itself may be failing)') }}.
+      Full history: {{ asmb8_baremetal_install_post_code_history }}.
+      See asmb8_postcode's own DOCUMENTATION for why no meaning is attached
+      to that code, and README.md's "Expected duration" section before
+      assuming this is a hang rather than a genuinely slow install.
+  when:
+    - asmb8_baremetal_install_sample_post_code_during_handoff | bool
+    - not asmb8_baremetal_install_handoff_confirmed

@@ -18,14 +18,56 @@ and shape is sourced from the real, redacted capture corpus under
 `tests/unit/fixtures/asp/` — AMI has not published a specification for this
 surface.
 
-**A directory of currently-active sessions is not implemented here, and this
-is a known, reported gap, not an oversight.** The corpus's `getsessioninfo.asp`
-capture was made with a `POST` request, not a `GET` — unlike every other
+**A directory of currently-active sessions, via `active_session_services`.**
+`getsessioninfo.asp` is a `POST` endpoint, not a `GET` — unlike every other
 endpoint this module (and its siblings `asmb8_users`/`asmb8_network`) reads.
-`AspClient.get_webvar` is deliberately, permanently `GET`-only. `active_sessions`
-is therefore always `null`; reading it for real needs a properly-named,
-POST-capable client method added to `asp.py` first — flagged as follow-up
-work, not attempted here.
+A real save-action capture (2026-08-10) sourced its request shape as
+`POST /rpc/getsessioninfo.asp` with a `SERVICEBIT` form field selecting which
+service's session(s) to return. `AspClient.get_webvar` remains deliberately,
+permanently `GET`-only; this module reads `getsessioninfo.asp` through the
+separate, explicitly-named `AspClient.post_webvar()` instead.
+`active_session_services` is optional; omit it (the default) and
+`active_sessions` stays `null`, exactly as before this capability existed.
+
+**`SERVICEBIT` reuses `getallservicescfg.asp`'s own `SERVICEID` values —
+confirmed for exactly one service, inferred for the rest.** The captured
+`SERVICEBIT=4` is `cd-media`'s own `SERVICEID` in this corpus's
+`getallservicescfg.txt` — two independent captures agreeing on the same
+value is what makes that identity sourced rather than assumed. This module
+therefore never hardcodes a second name-to-bit mapping:
+`active_session_services` is resolved against **this run's own, live**
+`getallservicescfg.asp` read, not a copy baked into this file. **Only
+`cd-media`'s `SERVICEBIT` is independently confirmed by a real capture** —
+applying the same `SERVICEID` value as `SERVICEBIT` for any other service
+rests on the strength of the `SERVICEID`/`SERVICEBIT` identity holding
+generally, not on a second capture for each one.
+
+**`active_sessions[].ip_address`/`.username` are returned, deliberately —
+unlike `asmb8_users`'s opposite choice for its own `EmailID`/`SSHKeyInfo`
+fields, and that is not an inconsistency.** `asmb8_users` reduces those two
+fields to booleans because they are incidental personal data an account
+listing happens to expose, not what that module's callers are actually
+asking for. Here, "which client address and which account is connected to
+which service, right now" **is** the entire point of reading
+`getsessioninfo.asp` at all — collapsing `IPADDRESS`/`UNAME` to booleans
+would leave `active_sessions` unable to do the one thing it exists for. Both
+fields are still identifying: treat a registered result containing them the
+same way this module's own `EXAMPLES` already do (`no_log: true` on the
+task), and do not log or persist `active_sessions` anywhere that is not
+itself access-controlled the same as this module's own credentials.
+
+**`active_sessions[].privilege_raw` (`UPRIV`) is returned exactly as
+reported, undecoded.** It reads `4` for the one `admin` session this
+corpus's capture shows, which is suggestively similar to `getrole.asp`'s own
+`CURPRIV` field (see `asmb8_users`) — but no source confirms
+`getsessioninfo.asp`'s `UPRIV` uses the **same** encoding as `getrole.asp`'s
+`CURPRIV`, rather than merely the same numeric value by coincidence on this
+one sample. This module does not assume that identity and reports `UPRIV`
+raw, with this caveat.
+
+A typo'd `active_session_services` name is only caught **after** logging in
+and reading `getallservicescfg.asp`, since valid names are derived live from
+that response rather than from a second, static list this module maintains.
 
 **`getremotesession.asp`'s live behaviour is unverified, and `remote_session`
 may legitimately be `null` even immediately after a successful login.** This
@@ -86,9 +128,21 @@ mid-session with no independent path back in.
 | `tls_fingerprint` | `str` | — | no | — (mutually exclusive with `ca_path`; recommended trust mode for this board) |
 | `timeout` | `int` | `30` | no | — |
 | `connect_timeout` | `int` | `10` | no | — |
+| `active_session_services` | `list` of `str` | — | no | — (validated live against `getallservicescfg.asp`, not statically; `all` is a recognised literal element) |
 
-This module takes only the shared connection options. Verified against
-`argument_spec()` in `plugins/modules/asmb8_sessions.py`.
+Verified against `argument_spec()` in `plugins/modules/asmb8_sessions.py`.
+
+### `active_session_services`
+
+Which services' active-session directories to read via `getsessioninfo.asp`
+(`POST`, `SERVICEBIT`). Omit (the default) to skip this read entirely —
+`active_sessions` stays `null`. Pass a list of service names (the same names
+`services` is keyed by, e.g. `cd-media`) to query only those, or include the
+literal element `all` to query every service this run's own
+`getallservicescfg.asp` reported. See the synopsis above for exactly what is
+and is not sourced about applying `SERVICEBIT` to a service other than
+`cd-media`. A name this run's own `getallservicescfg.asp` did not report
+fails the module, after login.
 
 ## Return values
 
@@ -107,12 +161,18 @@ This module takes only the shared connection options. Verified against
 | `remote_session.local_media_enabled` / `.remote_media_enabled` / `.vmedia_attach_raw` | — | always | `LMEDIAENABLE`, `RMEDIAENABLE`, `VMEDIAATTACH`. |
 | `remote_session.host_lock_enabled` / `.host_lock_auto_enabled` / `.sd_card_status_raw` | — | always | `HOSTLOCK`, `HOSTLOCKAUTO`, `SDCARD_STATUS`. |
 | `remote_session_read.outcome` / `.error_class` | `str` | always | `read` if `remote_session` was populated, `failed` if the read did not parse; the failure class on `failed` only. |
-| `active_sessions` | `list` | always | Always `null`. See the module description for exactly what would need to be added before this can be implemented. |
+| `active_sessions` | `list` of `dict` | always | `null` unless `active_session_services` is given. One entry per session `getsessioninfo.asp` reported, across every queried service, flattened (see `.service` for grouping). |
+| `active_sessions[].service` | `str` | — | Which `active_session_services` name this session was read under — `services`'s own key. |
+| `active_sessions[].session_id_raw` / `.session_type_raw` | `int` | — | Raw `SID`/`STYPE`. `STYPE`'s encoding is not sourced. |
+| `active_sessions[].user_id_raw` | `int` | — | Raw `UID`. |
+| `active_sessions[].username` / `.ip_address` | `str` | — | Raw `UNAME`/`IPADDRESS`, or `null` if empty. Returned deliberately — see the synopsis — and both are identifying data. |
+| `active_sessions[].privilege_raw` | `int` | — | Raw `UPRIV`, undecoded — see the synopsis. |
+| `active_sessions_queried` | `list` of `str` | always | Which service names `active_session_services` actually resolved to and queried this run. Empty when the option was omitted; lets a caller tell "not requested" apart from "requested, but currently no active session". |
 | `operation.schema` | `str` | always | Always `"asmb8-ikvm-operation/v1"`. |
 | `operation.action` | `str` | always | Always `"asmb8_sessions.report"`. |
 | `operation.endpoint` | `str` | always | The `host:port` this read was performed against. |
 | `operation.changed` | `bool` | always | Always `false`. |
-| `operation.observed` | `dict` | always | Mirrors `services` and `remote_session` together. |
+| `operation.observed` | `dict` | always | Mirrors `services`, `remote_session`, and `active_sessions` together. |
 | `operation.error_class` | `str` | always | `null` on success. |
 
 Verified against the `RETURN` block in `plugins/modules/asmb8_sessions.py`,
@@ -128,6 +188,11 @@ and against `tests/unit/fixtures/asp/getallservicescfg.txt` (`web` service
   `protocol`-class parse failure is caught internally and reported through
   `remote_session_read` instead of failing the module — see the module
   description.
+- A name in `active_session_services` that this run's own
+  `getallservicescfg.asp` did not report fails the module via a plain
+  `msg` (no `error_class`), since this is a caller-input problem discovered
+  only after a live read, not one of this collection's BMC-side failure
+  classes — see the synopsis.
 
 ## Check-mode behaviour
 
@@ -160,10 +225,21 @@ no write path here whose effect a check-mode run could be predicting.
     msg: "remote session config was not readable this run (read outcome: {{ sessions_report.remote_session_read.outcome }})"
   when: sessions_report.remote_session is none
 
-- name: active_sessions is always null -- see the module description for why
+- name: active_sessions is null unless active_session_services is set
   ansible.builtin.assert:
     that:
       - sessions_report.active_sessions is none
+
+- name: Read the active session directory for cd-media only -- the one SERVICEBIT this collection has independently confirmed
+  james_crowley.asmb8_ikvm.asmb8_sessions:
+    host: "{{ asmb8_host }}"
+    username: "{{ asmb8_username }}"
+    password: "{{ asmb8_password }}"
+    tls_fingerprint: "{{ asmb8_tls_fingerprint }}"
+    active_session_services: [cd-media]
+  delegate_to: localhost
+  no_log: true
+  register: cd_media_sessions
 ```
 
 ## See also
