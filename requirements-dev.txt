@@ -27,5 +27,15 @@ ansible-lint==26.6.0
 antsibull-changelog==0.35.1
 pytest==9.1.1
 pytest-mock==3.15.1
+# pytest-xdist is here so a contributor can reproduce CI's execution model, not
+# merely its test list. `ansible-test units` runs pytest with `-n auto`, and a
+# test that is order- or timing-sensitive can pass every serial local run and
+# still fail in CI. That happened: an access-log assertion waited for the log
+# file to EXIST rather than to have content, passed locally and on Python 3.12
+# and 3.13, and failed on 3.10 and 3.11 under parallelism. Without this pin the
+# stress run that proves such a fix cannot even be attempted locally -- `-n` is
+# simply an unrecognised argument, which looks like a failing test rather than a
+# missing plugin.
+pytest-xdist==3.8.0
 ruff==0.16.0
 yamllint==1.38.0

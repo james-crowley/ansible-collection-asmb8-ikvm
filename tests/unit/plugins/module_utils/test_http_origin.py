@@ -618,9 +618,22 @@ class TestRealServerRequestHandling:
         conn.request("GET", "/file.txt")
         conn.getresponse().read()
         conn.close()
-        assert _wait_until(server.access_log_path.exists)
-        raw = server.access_log_path.read_text(encoding="utf-8")
-        lines = [line for line in raw.splitlines() if line.strip()]
+
+        # Wait for the log to have CONTENT, not merely to exist. The handler
+        # opens the file and appends the record in two separate steps, so
+        # waiting on existence alone is a real race: this failed under
+        # `pytest -n auto` on CI (ansible-core 2.17 / Python 3.10 and 3.11)
+        # having passed everywhere else, which is exactly how a timing race
+        # presents. The sibling assertion above already waits on record count;
+        # this one was the outlier.
+        def nonblank_log_lines():
+            if not server.access_log_path.exists():
+                return []
+            raw_text = server.access_log_path.read_text(encoding="utf-8")
+            return [line for line in raw_text.splitlines() if line.strip()]
+
+        assert _wait_until(lambda: len(nonblank_log_lines()) == 1)
+        lines = nonblank_log_lines()
         assert len(lines) == 1
         parsed = json.loads(lines[0])
         assert parsed["status"] == 200
