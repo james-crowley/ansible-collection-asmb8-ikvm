@@ -34,6 +34,7 @@ import json
 import pytest
 from ipmi_server import (
     AUTH_FAILURE_MESSAGE,
+    BLINK_UNSUPPORTED_MESSAGE,
     DEFAULT_MC_INFO,
     DEFAULT_PASSWORD,
     DEFAULT_USERNAME,
@@ -380,6 +381,60 @@ class TestResetBmc:
             command.raw_command(netfn=0x04, command=0x2D, retry=False)
 
 
+class TestSetIdentify:
+    def test_on_indefinitely_succeeds_with_no_return_value(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        assert command.set_identify(on=True) is None
+        assert fixture.state.last_identify_on is True
+        assert fixture.state.last_identify_duration is None
+        assert fixture.state.identify_count == 1
+
+    def test_off_succeeds_with_no_return_value(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        assert command.set_identify(on=False) is None
+        assert fixture.state.last_identify_on is False
+
+    def test_bounded_duration_ignores_the_on_flag(self):
+        # The exact footgun ipmi.py's docstring calls out: pyghmi's own
+        # standard-command fallback ignores `on` entirely whenever `duration`
+        # is not None.
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        command.set_identify(on=False, duration=30)
+        assert fixture.state.last_identify_on is True
+        assert fixture.state.last_identify_duration == 30
+
+    def test_duration_zero_is_off_regardless_of_on(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        command.set_identify(on=True, duration=0)
+        assert fixture.state.last_identify_on is False
+        assert fixture.state.last_identify_duration == 0
+
+    def test_duration_above_255_is_clamped(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        command.set_identify(on=True, duration=1000)
+        assert fixture.state.last_identify_duration == 255
+
+    def test_blink_true_always_raises_the_exact_pyghmi_message(self):
+        fixture = FakeIpmiBmc()
+        command = _connect(fixture)
+        with pytest.raises(real_ipmi_exceptions.IpmiException, match=BLINK_UNSUPPORTED_MESSAGE):
+            command.set_identify(on=True, blink=True)
+        assert fixture.state.identify_count == 0
+
+    def test_force_identify_rejected_raises_that_exact_message(self):
+        fixture = FakeIpmiBmc()
+        fixture.faults.force_identify_rejected = "identify request rejected"
+        command = _connect(fixture)
+        with pytest.raises(real_ipmi_exceptions.IpmiException, match="identify request rejected"):
+            command.set_identify(on=True)
+        assert fixture.state.identify_count == 0
+
+
 class TestCommandFactory:
     def test_factory_matches_the_real_command_constructor_signature(self):
         fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
@@ -578,6 +633,32 @@ class TestRealIpmiClientAgainstDouble:
             IpmiClient(host=HOST, username=USERNAME, password="wrong")
         assert PASSWORD not in str(excinfo.value)
         assert "wrong" not in str(excinfo.value)
+
+    def test_set_identify_on_indefinitely_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        client = _make_client(monkeypatch, fixture)
+        assert client.set_identify(on=True) is None
+        assert fixture.state.last_identify_on is True
+        assert fixture.state.last_identify_duration is None
+
+    def test_set_identify_bounded_duration_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        client = _make_client(monkeypatch, fixture)
+        client.set_identify(on=True, duration=120)
+        assert fixture.state.last_identify_duration == 120
+
+    def test_set_identify_off_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        client = _make_client(monkeypatch, fixture)
+        client.set_identify(on=False)
+        assert fixture.state.last_identify_on is False
+
+    def test_rejected_identify_becomes_remote_operation_error_through_the_real_client(self, monkeypatch):
+        fixture = FakeIpmiBmc(username=USERNAME, password=PASSWORD)
+        fixture.faults.force_identify_rejected = "identify request rejected"
+        client = _make_client(monkeypatch, fixture)
+        with pytest.raises(RemoteOperationError):
+            client.set_identify(on=True)
 
 
 class TestModuleLevelLifecycleThroughTheRealClient:

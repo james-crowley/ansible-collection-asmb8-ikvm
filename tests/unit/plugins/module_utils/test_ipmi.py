@@ -27,6 +27,7 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     ConnectionError_,
     RemoteOperationError,
     TimeoutError_,
+    UnsupportedCapabilityError,
 )
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.ipmi import IpmiClient
 
@@ -288,6 +289,73 @@ class TestResetBmc:
         client = make_client(monkeypatch, fake_command)
         with pytest.raises(RemoteOperationError) as excinfo:
             client.reset_bmc("cold")
+        assert PASSWORD not in str(excinfo.value)
+        assert "[REDACTED]" in str(excinfo.value)
+
+
+class TestSetIdentify:
+    def test_on_indefinitely_calls_pyghmi_with_duration_none_and_blink_false(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.set_identify.return_value = None
+        client = make_client(monkeypatch, fake_command)
+        assert client.set_identify(on=True) is None
+        fake_command.set_identify.assert_called_once_with(True, None, False)
+
+    def test_on_with_bounded_duration_is_passed_through(self, monkeypatch):
+        fake_command = Mock()
+        client = make_client(monkeypatch, fake_command)
+        client.set_identify(on=True, duration=300)
+        fake_command.set_identify.assert_called_once_with(True, 300, False)
+
+    def test_off_calls_pyghmi_with_on_false(self, monkeypatch):
+        fake_command = Mock()
+        client = make_client(monkeypatch, fake_command)
+        client.set_identify(on=False)
+        fake_command.set_identify.assert_called_once_with(False, None, False)
+
+    def test_never_passes_blink_true(self, monkeypatch):
+        # This client has no `blink` parameter at all -- see module_utils/ipmi.py's
+        # docstring on why: pyghmi's own generic fallback cannot honour it on this
+        # board, so this wrapper never offers it.
+        fake_command = Mock()
+        client = make_client(monkeypatch, fake_command)
+        client.set_identify(on=True, duration=5)
+        assert fake_command.set_identify.call_args.args[2] is False
+
+    def test_blink_unsupported_message_classifies_as_unsupported_capability(self, monkeypatch):
+        # Defensive: this client never sends blink=True, but a future pyghmi
+        # release could still surface this exact message some other way -- see
+        # ipmi.py's docstring and _BLINK_UNSUPPORTED_MESSAGE's own.
+        fake_command = Mock()
+        fake_command.set_identify.side_effect = real_ipmi_exceptions.IpmiException("Blink not supported with generic IPMI")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(UnsupportedCapabilityError):
+            client.set_identify(on=True)
+
+    def test_unsupported_functionality_classifies_as_unsupported_capability(self, monkeypatch):
+        # Defensive: as of pyghmi 1.6.19, Command.set_identify() always
+        # catches this internally and never lets it escape -- see
+        # ipmi.py's docstring -- but this client still classifies it
+        # correctly if a future pyghmi release ever changes that.
+        fake_command = Mock()
+        fake_command.set_identify.side_effect = real_ipmi_exceptions.UnsupportedFunctionality("nope")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(UnsupportedCapabilityError):
+            client.set_identify(on=True)
+
+    def test_bmc_rejection_becomes_remote_operation_error(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.set_identify.side_effect = real_ipmi_exceptions.IpmiException("bad completion code")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError):
+            client.set_identify(on=True)
+
+    def test_failure_never_leaks_the_password(self, monkeypatch):
+        fake_command = Mock()
+        fake_command.set_identify.side_effect = real_ipmi_exceptions.IpmiException(f"rejected password={PASSWORD}")
+        client = make_client(monkeypatch, fake_command)
+        with pytest.raises(RemoteOperationError) as excinfo:
+            client.set_identify(on=True)
         assert PASSWORD not in str(excinfo.value)
         assert "[REDACTED]" in str(excinfo.value)
 

@@ -88,6 +88,32 @@ board.
 | `asmb8_media`'s attach never reports success on anything short of the daemon reaching `STATE_ATTACHED`, and classifies an unconfirmed-but-still-running daemon as an `indeterminate` timeout rather than a plain failure | `tests/unit/plugins/modules/test_asmb8_media.py` | `plugins/modules/asmb8_media.py` |
 | `OperationReceipt.to_dict()` runs every string value through `errors.redact()` as a backstop | `tests/unit/plugins/module_utils/test_models.py` | `plugins/module_utils/models.py` |
 
+### Informational modules (`.asp`-only, added 2026-08-10)
+
+`asmb8_postcode`, `asmb8_sel`, `asmb8_sensors`, `asmb8_inventory`,
+`asmb8_users`, `asmb8_network`, `asmb8_sessions`, `asmb8_alerts`, and
+`asmb8_auditlog` read the BMC's `.asp` web-management surface only. Every one
+of their unit tests drives the module's real code against the real,
+checked-in **[asp-corpus 2026-08-10]** capture files under
+`tests/unit/fixtures/asp/` (parsed by the real `webvar.parse_webvar()`), with
+only `build_asp_client`/the network layer replaced by a fake — the same
+"real parser, fake socket" shape as the rows above. **None of these nine has
+ever been run against a live BMC** — see Tier 4 below for exactly what that
+leaves unconfirmed.
+
+| Claim | Where tested | Where used |
+|---|---|---|
+| `decode_bcd_byte()`/`parse_firmware()` decode `FirmwareRevision2=20` (`0x14`) to `firmware_version="1.14"` — never `"1.20"` | `tests/unit/plugins/modules/test_asmb8_inventory.py`, against `getfwinfo.txt` | `plugins/modules/asmb8_inventory.py` |
+| `normalize_sensor()` reports `reading.value` as `SensorReading / 1000` for `kind=threshold` sensors and `null` for `kind=discrete` ones (the seven `SettableReadableFlags=0` records), matching the corpus's `+12V`/`+VCORE1`/`CPU_FAN1`/discrete-sensor records exactly | `tests/unit/plugins/modules/test_asmb8_sensors.py`, against `getallsensors.txt` | `plugins/modules/asmb8_sensors.py` |
+| `decode_session_count()` decodes `MAXSESS`/`CURSESS` with a `+128` offset (`web` 148→20, `cd-media` 129→1) and treats the raw sentinel `255` (`ssh`/`telnet`) as `null`, never as `127` | `tests/unit/plugins/modules/test_asmb8_sessions.py`, against `getallservicescfg.txt` | `plugins/modules/asmb8_sessions.py` |
+| `decode_user_slot()`/`build_users_report()` never return `EmailID`/`SSHKeyInfo` raw text (only `email_configured`/`ssh_key_configured` booleans), and filter unconfigured (`UserName=''`) slots out of `users` into `slots` instead | `tests/unit/plugins/modules/test_asmb8_users.py`, against `getalluserinfo.txt` | `plugins/modules/asmb8_users.py` |
+| `decode_dns_entry()` never returns `TSIG_PRIVATE` raw text (only `tsig_key_configured`) | `tests/unit/plugins/modules/test_asmb8_network.py`, against `getdnscfg.txt` | `plugins/modules/asmb8_network.py` |
+| `build_remote_storage()` never returns `PWORD` raw text (only `password_configured`) | `tests/unit/plugins/modules/test_asmb8_auditlog.py`, against `getauditlogcfg.txt` | `plugins/modules/asmb8_auditlog.py` |
+| `extract_entries()` (via `webvar.py`'s quote-aware scanner) correctly parses an `AUDIT_LOG` entry containing literal `[`/`]` characters inside its own quoted value, without mistaking them for array syntax and without truncating the entry | `tests/unit/plugins/modules/test_asmb8_auditlog.py`, against `getauditlog.txt` | `plugins/modules/asmb8_auditlog.py`, `plugins/module_utils/webvar.py` |
+| `_smtp_channel()`/`_read_endpoint()` extract only the specific keys named in this module's own field tables, so an unrecognised key on a firmware revision this corpus has not seen is dropped rather than passed through | `tests/unit/plugins/modules/test_asmb8_alerts.py`, against `getsmtpcfg.txt` | `plugins/modules/asmb8_alerts.py` |
+| `read_post_code()`/`parse_post_code_hex()` read `getpostcode.asp`'s `CurrPostCode` field and its hex value, with no meaning attached to either | `tests/unit/plugins/modules/test_asmb8_postcode.py`, against `getpostcode.txt` | `plugins/modules/asmb8_postcode.py` |
+| `read_entries()`/`parse_entry()` return the full 24-entry SEL from one `getallselentries.asp` response, every field raw and undecoded | `tests/unit/plugins/modules/test_asmb8_sel.py`, against `getallselentries.txt` | `plugins/modules/asmb8_sel.py` |
+
 None of the above touches a real socket to a real BMC. See
 [`docs/testing.md`](testing.md) for how to run this tier and what the mock
 servers' own docstrings mark as `VERIFIED LIVE` versus `ASSUMED, NOT
@@ -286,6 +312,50 @@ documentation pass adds from reading the code against that evidence.
   any confidentiality or authentication guarantee independent of the
   underlying web session.** Not measured either way — see
   [SECURITY.md](../SECURITY.md).
+- **None of the nine informational modules (`asmb8_postcode`, `asmb8_sel`,
+  `asmb8_sensors`, `asmb8_inventory`, `asmb8_users`, `asmb8_network`,
+  `asmb8_sessions`, `asmb8_alerts`, `asmb8_auditlog`) has ever been run
+  against a live BMC.** Every fact they report is Tier 2 above: their own
+  code is exercised only against the real, checked-in **[asp-corpus
+  2026-08-10]** response captures, never against a real `.asp` session. The
+  capture itself is real hardware evidence of what the target board returned
+  *once*, on 2026-08-10 — but a module correctly parsing a static capture is
+  not the same claim as that module correctly authenticating, polling, and
+  degrading against a live, currently-running BMC session. Specifically
+  still open, per module (see each module's own `docs/asmb8_*.md` page for
+  the full detail):
+  - **`asmb8_sensors`'s `/1000` reading scale is an empirical match against
+    plausible nominal values (`+12V` raw 62 → 11.904 V), not a sourced IPMI
+    SDR M/B/exponent conversion table.** No other divisor has been
+    considered, and it has not been cross-checked against a live sensor
+    reading.
+  - **`asmb8_sessions`'s `+128` session-count offset**, while independently
+    corroborated by two separately-documented capacities (`web`'s 20-session
+    cap, `cd-media`'s 1-session cap), has never been confirmed by decoding a
+    live board's actual, currently-changing `CURSESS` value — the fixture's
+    own `CURSESS` values are static.
+  - **`asmb8_sessions`'s `getremotesession.asp` live behaviour is unverified
+    and may not work at all from a programmatic client** — a session-expired
+    HTML page was observed even immediately after a fresh login, for reasons
+    not yet identified.
+  - **`asmb8_users`'s privilege-limit encoding (`PrivLimit_Network`/
+    `PrivLimit_Serial` values `84`, `52`, `15`) remains completely
+    unsourced** — no third-party client or specification decodes it, and no
+    live probe has ever been attempted to narrow it down.
+  - **`asmb8_inventory`'s manufacturer-ID resolution to a vendor name** was
+    never attempted (deliberately) and remains unsourced; only the raw bytes
+    and their combined integer are reported.
+  - **`asmb8_network`'s redacted address/MAC fixture values are a redaction
+    artifact, not a hardware fact.** Every IPv4/IPv6/MAC value in the corpus
+    was replaced with an RFC 5737/RFC 3849/documentation value before this
+    module's author read it; nothing here is evidence about what a real
+    address on this board looks like, whether per-channel addresses are ever
+    equal, or any other inferred shape.
+  - **Whether any of these nine modules' `.asp` session behaves any
+    differently under real concurrent load, real session expiry, or a
+    firmware revision other than 1.14/1.14.2** is entirely untested — the
+    unit suite's mocked `AspClient` never exercises real HTTP, TLS, or BMC
+    timing at all for these nine.
 - **Hardware-in-the-loop CI.** `.circleci/config.yml`'s `hardware` workflow
   (observe → login → media-attach → boot-once → reset → kvm, each behind its
   own approval gate) is fully wired, and every hardware playbook it invokes

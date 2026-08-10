@@ -52,9 +52,11 @@ result of running it.
 
 **Read this before trusting anything in this module's `RETURN` block as
 settled fact — it is genuinely less proven than `asmb8_info`/`asmb8_power`/
-`asmb8_boot`/`asmb8_media`.** No live capture, and no unit/mock test, has ever
-exercised this module's IVTP handshake against anything. Everything below is
-sourced from decompiled vendor client analysis alone. Specifically:
+`asmb8_boot`/`asmb8_media`.** A mock server now exercises this module's IVTP
+handshake state machine (see the last bullet below) — but **no live capture
+beyond the bare 8-byte greeting has ever exercised it**, and everything the
+handshake itself relies on is still sourced from decompiled vendor client
+analysis alone, not from this board's own observed behaviour. Specifically:
 
 - **Whether the wire-level packet-size discrepancy in `VALIDATE_VIDEO_SESSION`
   matters is unverified.** The decompiled vendor client writes its own
@@ -81,11 +83,36 @@ sourced from decompiled vendor client analysis alone. Specifically:
   Treat it as **unverified** until it is backed by a real source — see
   [`docs/capability-matrix.md`](capability-matrix.md) Tier 4, which flags this
   explicitly as a claim that reads more confident than its evidence supports.
-- **No unit or mock test exists for `plugins/module_utils/ivtp.py`** as of
-  this writing (unlike every other `module_utils` file in this collection).
-  This module's own tests (`tests/unit/plugins/modules/test_asmb8_console.py`)
-  mock `ivtp.open_channel`/`ivtp.capture_one_frame` themselves rather than
-  exercising the real handshake state machine.
+- **A mock IVTP server now exists (`tests/integration/mock_servers/ivtp_server.py`,
+  self-tested by `tests/unit/mock_servers/test_ivtp_server.py`), and it drives
+  the real `ivtp.open_channel`/`ivtp.capture_one_frame` — not a stand-in —
+  over an actual loopback socket.** This module's own tests
+  (`tests/unit/plugins/modules/test_asmb8_console.py`) still mock
+  `ivtp.open_channel`/`ivtp.capture_one_frame` at the module boundary (as they
+  should — this module's own job is argument handling and result shaping, not
+  the wire protocol), but `plugins/module_utils/ivtp.py` itself is no longer
+  untested: `tests/unit/mock_servers/test_ivtp_server.py`'s
+  `TestRealClientAgainstMock` exercises the full successful handshake,
+  fragmented video-frame reassembly, a rejected session token, an unsolicited
+  `STOP_SESSION_IMMEDIATE` both mid-handshake and mid-frame, a truncated
+  header, a truncated body, and a `pktSize` that disagrees with the bytes
+  actually sent.
+  **Be precise about what this newly closes and what it still does not.**
+  This is Tier 2 evidence in `docs/capability-matrix.md`'s scheme — "unit/mock
+  tested" — which proves the shipped client *self-consistently implements
+  this collection's own understanding of the protocol*. It is emphatically
+  **not** Tier 3 ("verified against real firmware"): the mock server's own
+  module docstring is explicit that every wire-format fact it bakes in,
+  beyond the one live-captured 8-byte greeting, comes from the same
+  decompiled-vendor-client source `ivtp.py` itself cites, examined
+  independently so a shared bug would not silently cancel out — not from a
+  second, independent observation of real hardware. A mock that agrees with
+  a real client is evidence the *implementation* is internally coherent; it
+  says nothing about whether the *board* actually behaves this way. No
+  console frame has ever been decoded — or even captured beyond the bare
+  greeting — from real hardware, and nothing in this test suite changes
+  that. See `docs/capability-matrix.md`'s Tier 4 entry for this module, which
+  remains the accurate accounting of what is still genuinely unproven.
 
 ## Options
 

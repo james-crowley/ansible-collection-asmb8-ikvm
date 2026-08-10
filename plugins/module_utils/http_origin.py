@@ -53,7 +53,6 @@ only caller.
 from __future__ import annotations
 
 import contextlib
-import datetime
 import http.server
 import json
 import mimetypes
@@ -62,13 +61,46 @@ import signal
 import threading
 import time
 import urllib.parse
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.daemon_runtime import (
+    _now_iso,
+    _redirect_std_fds,
+    _write_state_atomic,
+    _write_state_if_absent,
+    generate_session_id,
+    is_pid_alive,
+    list_session_ids,
+    log_file_path,
+    read_state,
+    remove_paths,
+    request_stop,
+    state_file_path,
+    wait_for_exit,
+    wait_for_state,
+)
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import ErrorClass, ProtocolError, UnsupportedCapabilityError, redact
+
+#: Re-exported from daemon_runtime for this module's own callers
+#: (asmb8_http_origin.py, this module's own tests) to reach as
+#: http_origin.<name> -- unlike media_session.py, THIS daemon never scans for
+#: or reclaims other sessions, so none of these are called from within this
+#: file itself. See media_session.py's identical __all__ for why this is
+#: needed at all: without it, ruff/pyflakes' F401 would flag every one of
+#: these imports as unused, since it only sees this file, not
+#: asmb8_http_origin.py's own usage.
+__all__ = [
+    "generate_session_id",
+    "is_pid_alive",
+    "list_session_ids",
+    "read_state",
+    "request_stop",
+    "wait_for_exit",
+    "wait_for_state",
+]
 
 #: Observable session states, written to the state file's ``state`` key.
 STATE_STARTING = "starting"
@@ -126,11 +158,6 @@ DEFAULT_LIFETIME_SECONDS = 4 * 60 * 60
 #: its own thread and is not gated by this value.
 _CONTROL_POLL_INTERVAL = 0.2
 
-#: How often callers waiting on a state-file transition (start confirmation,
-#: stop confirmation) re-check the file. Mirrors
-#: ``media_session._STATE_POLL_INTERVAL``.
-_STATE_POLL_INTERVAL = 0.2
-
 #: Read/write chunk size used when streaming a file's bytes to a client.
 _COPY_BUFFER_SIZE = 64 * 1024
 
@@ -153,24 +180,18 @@ class SessionConfig:
 
 
 # --------------------------------------------------------------------------
-# State file plumbing -- shared by the daemon (writer) and the module (reader).
-# Mirrors media_session.py's identical functions; see that file for the fuller
-# rationale behind atomic writes, create-only writes, and treating a corrupt
-# read as "no session" rather than a hard failure.
+# State file plumbing -- shared by the daemon (writer) and the module
+# (reader). The primitives themselves (atomic write, create-only write, pid
+# liveness, bounded polling) now live in ``daemon_runtime.py``, shared with
+# ``media_session.py``'s daemon -- see that module's own docstring for
+# exactly why and what deliberately stayed out of it.
+# ``state_file_path``/``log_file_path``/``read_state``/``list_session_ids``/
+# ``is_pid_alive``/``generate_session_id``/``wait_for_state``/
+# ``wait_for_exit``/``request_stop`` are imported directly, unchanged, at the
+# top of this file. ``access_log_file_path`` below is the one path-producing
+# function that stays here -- this daemon is the only one of the two with a
+# request-level access log.
 # --------------------------------------------------------------------------
-
-
-def state_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
-    return Path(runtime_dir) / f"{session_id}.json"
-
-
-def log_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
-    """Where the daemon's own stdout/stderr are redirected -- crash diagnosis only.
-
-    Request-level diagnosis (which files were actually fetched, and any
-    404s) belongs in :func:`access_log_file_path`, a separate file, not here.
-    """
-    return Path(runtime_dir) / f"{session_id}.log"
 
 
 def access_log_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
@@ -183,45 +204,6 @@ def access_log_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -
     with the much rarer crash/traceback output on the same stream.
     """
     return Path(runtime_dir) / f"{session_id}-access.log"
-
-
-def read_state(runtime_dir: str | os.PathLike[str], session_id: str) -> dict[str, Any] | None:
-    """Read and parse the state file, or ``None`` if it does not exist or is unreadable."""
-    try:
-        raw = state_file_path(runtime_dir, session_id).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def list_session_ids(runtime_dir: str | os.PathLike[str]) -> list[str]:
-    """Every session_id with a state file under ``runtime_dir``. Empty if the
-    directory does not exist yet.
-    """
-    directory = Path(runtime_dir)
-    if not directory.is_dir():
-        return []
-    return [path.stem for path in directory.glob("*.json")]
-
-
-def _write_state_atomic(runtime_dir: str | os.PathLike[str], session_id: str, data: dict[str, Any]) -> None:
-    """Write ``data`` as the current state, atomically -- write-temp-then-rename."""
-    path = state_file_path(runtime_dir, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    os.replace(tmp_path, path)
 
 
 def _initial_state(*, session_id: str, pid: int, root: str, bind_address: str, port: int) -> dict[str, Any]:
@@ -253,100 +235,18 @@ def _initial_state(*, session_id: str, pid: int, root: str, bind_address: str, p
     }
 
 
-def _write_state_if_absent(runtime_dir: str | os.PathLike[str], session_id: str, data: dict[str, Any]) -> bool:
-    """Write ``data`` as the state record only if no record exists yet. Returns whether it wrote.
-
-    Create-only counterpart of :func:`_write_state_atomic` -- see
-    ``media_session._write_state_if_absent``'s docstring for the exact race
-    this closes: by the time :func:`spawn_session` returns, the daemon may
-    already have written ``serving`` or even its final ``error``, and an
-    unconditional write here would clobber that with an older, less
-    informative record.
-    """
-    path = state_file_path(runtime_dir, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(data, handle)
-    return True
-
-
 def remove_state(runtime_dir: str | os.PathLike[str], session_id: str) -> None:
     """Delete the state, daemon-log and access-log files for ``session_id``, if present.
 
-    Silent about files that are already gone -- callers call this defensively
-    without checking existence first.
+    Built on ``daemon_runtime.remove_paths``, which is silent about files
+    that are already gone -- callers call this defensively without checking
+    existence first.
     """
-    for path in (
+    remove_paths(
         state_file_path(runtime_dir, session_id),
         log_file_path(runtime_dir, session_id),
         access_log_file_path(runtime_dir, session_id),
-    ):
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-
-
-def is_pid_alive(pid: int | None) -> bool:
-    """Whether ``pid`` refers to a live process this user can at least signal-probe.
-
-    Identical reasoning to ``media_session.is_pid_alive`` -- see that
-    function's docstring for why ``None``/non-positive values are rejected
-    before ever reaching ``os.kill``.
-    """
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def generate_session_id() -> str:
-    return uuid.uuid4().hex
-
-
-def wait_for_state(
-    runtime_dir: str | os.PathLike[str],
-    session_id: str,
-    *,
-    until: Callable[[dict[str, Any]], bool],
-    timeout: float,
-    poll_interval: float = _STATE_POLL_INTERVAL,
-) -> dict[str, Any] | None:
-    """Poll the state file until ``until(state)`` is true or ``timeout`` elapses."""
-    deadline = time.monotonic() + timeout
-    observed: dict[str, Any] | None = None
-    while True:
-        observed = read_state(runtime_dir, session_id)
-        if observed is not None and until(observed):
-            return observed
-        if time.monotonic() >= deadline:
-            return observed
-        time.sleep(poll_interval)
-
-
-def wait_for_exit(pid: int | None, *, timeout: float, poll_interval: float = _STATE_POLL_INTERVAL) -> bool:
-    """Poll ``is_pid_alive(pid)`` until it goes false or ``timeout`` elapses. Returns whether it exited."""
-    deadline = time.monotonic() + timeout
-    while is_pid_alive(pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(poll_interval)
-    return True
-
-
-def request_stop(pid: int | None) -> None:
-    """Ask the daemon at ``pid`` to shut down. Silent if it is already gone or not a real pid."""
-    if pid is None or pid <= 0:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGTERM)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -757,35 +657,29 @@ def spawn_session(config: SessionConfig) -> int:
 # The daemon itself.
 # --------------------------------------------------------------------------
 
+#: Set only by :func:`_handle_sigterm`, read only by :func:`_run_daemon`'s own
+#: control loop below.
 _stop_flag = False
 
 
 def _handle_sigterm(_signum: int, _frame: object) -> None:
+    """Set a flag and return -- nothing else. See
+    ``media_session._handle_sigterm``'s docstring for the full reasoning this
+    mirrors exactly (a signal handler must not do real work; a self-pipe adds
+    nothing this daemon does not already have, since its control loop below
+    already wakes on a fixed cadence for the lifetime-cap check; a plain
+    ``bool`` assignment is atomic under the GIL, so there is no partial-write
+    hazard; and a second ``SIGTERM`` arriving mid-shutdown just re-sets an
+    already-``True`` flag, which is a no-op, not a re-entrant teardown).
+
+    This daemon's real teardown is `_run_daemon`'s ``finally`` block below
+    (``server.shutdown()`` + ``server.server_close()``), reached through the
+    SAME control-loop exit this flag drives whether the loop ends via
+    ``SIGTERM`` or via the hard lifetime cap elapsing -- there is exactly one
+    shutdown path, not a signal-specific second one grafted on beside it.
+    """
     global _stop_flag
     _stop_flag = True
-
-
-def _now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def _redirect_std_fds(log_path: Path) -> None:
-    """Detach stdin/stdout/stderr from whatever this process inherited across the fork.
-
-    Identical rationale to ``media_session._redirect_std_fds``: this daemon
-    deliberately outlives the Ansible module invocation that forked it, and a
-    duplicated stdout pipe would make the controller hang past the module's
-    own exit waiting for an EOF this long-lived process never provides.
-    """
-    devnull_fd = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull_fd, 0)
-    os.close(devnull_fd)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.dup2(log_fd, 1)
-    os.dup2(log_fd, 2)
-    os.close(log_fd)
 
 
 def _format_bound_url(bind_address: str, port: int) -> str:

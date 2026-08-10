@@ -123,6 +123,61 @@ a manually opened JViewer/browser session, or a daemon whose `runtime_dir` was
 deleted out from under it. In those cases the BMC cold reset above is the only
 remaining option.
 
+### Interrupting a play, and what this collection does about it
+
+Killing the controller process outright (`kill -9`, a hard host crash) is not
+the only way to leave a media daemon running with nobody left to detach it.
+**Interrupting the play itself** -- `Ctrl-C` on `ansible-playbook`, a CI job
+cancelling a running step, a supervisor sending a termination signal to the
+whole process group -- reaches `asmb8_media`'s own background daemon too, and
+on firmware with no server-side reclaim timeout for `cd-media` (see above),
+a daemon that does not tear its session down cleanly on that signal strands
+the slot exactly as permanently as a `kill -9` would. This collection's
+background daemons install a handler for **`SIGTERM` specifically** and treat
+it as equivalent to a normal `state=detached` request -- closing the iUSB
+session (which sends the TCP `FIN` the BMC needs to see to free the slot)
+through the same code path a clean detach already uses, not a second,
+signal-specific one. **`SIGINT` is deliberately not relied upon anywhere in
+this path**: a process started in the background by a shell inherits
+`SIG_IGN` for `SIGINT` from that shell's own job control, so `kill -INT` (or
+an interactive `Ctrl-C` reaching only the foreground process group) can be
+silently swallowed by a backgrounded daemon and never invoke a handler at
+all -- this was observed directly during this collection's own development,
+where a stray `pkill` against a test harness left a session's slot stranded
+for exactly this reason, and the eventual fix was recognising that `SIGTERM`,
+not `SIGINT`, is the signal a daemon can actually count on receiving when
+something upstream wants it to stop.
+
+**This closes the gap for a signal the daemon actually receives.** It does
+not, and cannot, help if the interruption is severe enough that the daemon
+never gets scheduled again at all (a `SIGKILL`, a hard power loss, an OOM
+kill) -- ordinary process termination in those cases still closes the
+daemon's own file descriptors as part of exit, including the TCP connection
+to the BMC, so this is usually still recoverable without a cold reset, but it
+is not a guarantee this collection can make the way it can for `SIGTERM`.
+
+**The symptom of a stranded slot is easy to misdiagnose, and worth stating
+precisely** (this is the same fact the "wedged session" note above gives,
+restated with the one discriminator that actually settles it): a TCP
+connection to port 5120 showing `ESTABLISHED`, with bytes sitting unread in
+the socket's own receive queue, is consistent with BOTH a healthy session
+that is merely idle (see
+["Distinguishing idle from a broken connection"](#distinguishing-idle-from-a-broken-connection))
+AND a stranded one where **zero** SCSI commands are ever serviced. An
+established socket is not, by itself, evidence that media is being served.
+The thing that actually distinguishes the two is whether the daemon's own log
+recorded a `vmedia: redirection accepted (instance N, port 5120)` line for
+this session at attach time -- present in every session that actually
+completed its handshake, absent in one that never did. Check that line (and
+`asmb8_media`'s own `session_state`/`bytes_read`/`sectors_served`) before
+concluding a socket answering on that port means the media is actually being
+served.
+
+**The recovery path when this collection's own software reclamation cannot
+see the session** (because its `runtime_dir` was lost, or the holder is a
+different controller entirely) is, as above, `asmb8_reset` with `mode: cold`
+-- it does not affect host power, only the BMC's own management controller.
+
 ## What this role does *not* decide for you
 
 - Which OS or installer to use, or how its answer file is built. This role

@@ -7,20 +7,40 @@
 
 Mostly scoped to logic that does not require a real fork or a real network
 connection -- state file read/write/atomicity, pid liveness, bounded waits,
-image validation, and the single-session reclamation scan. The *fork* half of
-the daemon path (``spawn_session``'s double fork, and a real iUSB handshake
-over a real socket) is exercised for real by the integration test target
-against the mock iUSB server, which is another agent's responsibility for
-this task -- forking a real detached daemon is exactly the kind of thing that
-is invisible to a mocked test and easy to get subtly wrong.
+image validation, and the single-session reclamation scan. A full end-to-end
+integration test (``spawn_session``'s double fork PLUS a real iUSB handshake
+over a real socket against a mock iUSB server) is out of scope here and is
+another agent's responsibility for this task -- forking a real detached
+daemon is exactly the kind of thing that is invisible to a mocked test and
+easy to get subtly wrong.
 
-:class:`TestRunDaemonIdleHandling` is the exception, and deliberately so:
-what ``_run_daemon`` does when its iUSB session goes quiet is the single most
-important correctness property in this whole collection (see this module's
-own module docstring and ``iusb.Session.serve_forever``'s docstring) --
-verified live at 130 continuous seconds of silence on a healthy session, so
-it is driven here frame by frame with the real ``iusb`` classes underneath a
-fake ``AspClient``/network layer, not mocked away.
+Two classes are the exception, and deliberately so:
+
+* :class:`TestRunDaemonIdleHandling` drives ``_run_daemon`` (in-process, not
+  forked) frame by frame with the real ``iusb`` classes underneath a fake
+  ``AspClient``/network layer: what it does when its iUSB session goes quiet
+  is the single most important correctness property in this whole collection
+  (see this module's own module docstring and
+  ``iusb.Session.serve_forever``'s docstring) -- verified live at 130
+  continuous seconds of silence on a healthy session.
+* :class:`TestSpawnSessionRealFork` forks a REAL daemon process (via the real
+  ``spawn_session``/``os.fork()``, not a mock of it) and sends it a REAL
+  ``SIGTERM`` via a real ``os.kill()`` -- this is the regression test for the
+  actual defect this task exists to fix: an uncleanly-terminated media
+  session permanently stranding the BMC's one-and-only virtual-media slot
+  (see this module's own module docstring point 2 and
+  ``docs/hardware-evidence-2026-08-08.md``). The network dial underneath
+  (``AspClient``, ``iusb.Session.connect``) is monkeypatched to the same fake
+  transport ``TestRunDaemonIdleHandling`` uses -- set BEFORE the fork, so the
+  forked child inherits it via ordinary copy-on-write, exactly the way a
+  monkeypatched attribute on a live object survives ``fork()`` without any
+  special plumbing. That is deliberately narrower than the full "mock iUSB
+  server over a real socket" integration test mentioned above, but it is
+  enough to prove the property that actually matters: a real SIGTERM,
+  delivered to a real separate process, actually reaches the running serve
+  loop and actually results in ``session.close()`` running (which sends a
+  real TCP FIN on the real code path) before the process exits -- not merely
+  that a handler was registered.
 """
 
 from __future__ import annotations
@@ -151,6 +171,7 @@ class TestInitialStateRecord:
             "idle_poll_interval_seconds",
             "current_idle_streak",
             "last_idle_streak",
+            "stop_reason",
         ):
             assert key in record, f"missing documented field {key!r}"
         assert record["state"] == media_session.STATE_STARTING
@@ -162,6 +183,7 @@ class TestInitialStateRecord:
         assert record["idle_poll_interval_seconds"] == media_session._RECV_POLL_TIMEOUT
         assert record["current_idle_streak"] is None
         assert record["last_idle_streak"] is None
+        assert record["stop_reason"] is None
 
     def test_never_contains_a_password_or_token_shaped_field(self):
         record = media_session._initial_state(session_id="abc", endpoint=EXAMPLE_ENDPOINT, pid=4242, image="/srv/x.iso")
@@ -592,6 +614,7 @@ class TestRunDaemonIdleHandling:
 
         assert final["state"] == media_session.STATE_DETACHED
         assert final["error"] == "BMC sent a redirection-terminate (opcode 0xF6)"
+        assert final["stop_reason"] == "bmc_terminate"
 
     def test_idle_then_a_real_request_is_served_and_counted(self, harness):
         script = self._handshake() + ["idle"] * 50 + [_read_capacity_frame(sequence_number=9)] + [_kill_frame()]
@@ -687,6 +710,7 @@ class TestRunDaemonIdleHandling:
         assert final["state"] == media_session.STATE_DETACHED
         assert final["error"] == "connection closed by peer"
         assert final["error_class"] is None
+        assert final["stop_reason"] == "peer_closed"
 
     def test_local_stop_flag_is_recorded_as_a_clean_detach(self, harness, monkeypatch):
         # _stop_flag is a module global the real SIGTERM handler sets. Simulate that
@@ -710,6 +734,12 @@ class TestRunDaemonIdleHandling:
         final = harness(script)
         assert final["state"] == media_session.STATE_DETACHED
         assert final["error"] is None
+        # This is the property that matters for the BMC's single-occupancy media
+        # slot: should_stop() (which _stop_flag drives) is what SIGTERM's handler
+        # sets in the real daemon -- see _handle_sigterm's docstring -- so a clean
+        # "signal" stop_reason here proves the same normal-exit path (session.close(),
+        # the TCP FIN that frees the slot) that a real SIGTERM would also reach.
+        assert final["stop_reason"] == "signal"
 
     def test_malformed_frame_after_attach_is_a_classified_protocol_error(self, harness):
         bad_header = bytearray(iusb.Header(data_packet_len=0).marshal())
@@ -718,6 +748,10 @@ class TestRunDaemonIdleHandling:
         final = harness(script)
         assert final["state"] == media_session.STATE_ERROR
         assert final["error_class"] == ErrorClass.PROTOCOL
+        # A crash is fully identified by state=error + error_class; stop_reason
+        # exists only to distinguish kinds of CLEAN stop from each other (see
+        # _initial_state's docstring) and stays None here, not "error".
+        assert final["stop_reason"] is None
 
     def test_auth_rejection_is_bmc_busy_not_a_generic_protocol_error(self, harness, monkeypatch):
         def _rejecting_connect(cls, *_args, **_kwargs):
@@ -781,6 +815,170 @@ class TestRunDaemonIdleHandling:
         assert "test-password-not-real" not in final["error"]
         raw = media_session.state_file_path(harness.runtime_dir, "password-leak-check").read_text()
         assert "test-password-not-real" not in raw
+
+
+# ===========================================================================
+# spawn_session's real fork, real SIGTERM -- the regression test for the
+# actual defect this task exists to fix. See this file's own module
+# docstring for the full reasoning; in short: a REAL daemon process is
+# forked via the REAL spawn_session()/os.fork(), and sent a REAL SIGTERM via
+# a real os.kill(). Only the network dial underneath (AspClient,
+# iusb.Session.connect) is faked, using the same technique
+# TestRunDaemonIdleHandling uses above -- monkeypatched onto the live class
+# BEFORE the fork, so the forked child inherits the patch via ordinary
+# copy-on-write, the same way it inherits every other already-initialised
+# object in the parent's memory at fork() time.
+# ===========================================================================
+
+
+class _ForkStopSignalTransport:
+    """Replays one scripted handshake frame, then reports idle indefinitely
+    (a short REAL sleep per poll, not a busy-loop) until closed.
+
+    Deliberately not the module's own :class:`_ScriptedTransport`, whose
+    "idle" entries are a FINITE, pre-scripted list -- it raises
+    ``AssertionError`` once that list runs out (see its own ``recv_exact``).
+    This test cannot know in advance how many poll cycles will elapse before
+    a real ``SIGTERM``, delivered asynchronously to a real separate process,
+    actually lands -- the idle behaviour here has to be unbounded, standing
+    in for a live, silent iUSB connection for as long as the test needs it
+    to.
+    """
+
+    def __init__(self, handshake_frame: bytes, *, idle_sleep: float = 0.01) -> None:
+        self._buffer = bytearray(handshake_frame)
+        self._idle_sleep = idle_sleep
+        self.sent: list[bytes] = []
+        self.closed = False
+        self.timeout: float | None = None
+
+    def set_timeout(self, seconds: float) -> None:
+        self.timeout = seconds
+
+    def recv_exact(self, n: int) -> bytes:
+        if len(self._buffer) < n:
+            # A real, small sleep -- not a busy-loop -- so the forked child spends
+            # this waiting period mostly idle rather than spinning a CPU core.
+            time.sleep(self._idle_sleep)
+            raise iusb.IdleTimeout
+        data = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return data
+
+    def send_all(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RealForkDaemonHandle:
+    def __init__(self, pid: int, runtime_dir, session_id: str) -> None:
+        self.pid = pid
+        self.runtime_dir = runtime_dir
+        self.session_id = session_id
+
+    def state(self) -> dict | None:
+        return media_session.read_state(self.runtime_dir, self.session_id)
+
+    def wait_for_attached(self, timeout: float = 5.0) -> dict:
+        state = media_session.wait_for_state(
+            self.runtime_dir,
+            self.session_id,
+            until=lambda s: s.get("state") in (media_session.STATE_ATTACHED, media_session.STATE_ERROR),
+            timeout=timeout,
+        )
+        assert state is not None, "daemon never wrote a state file at all"
+        return state
+
+
+@pytest.fixture
+def real_fork_spawn(tmp_path, monkeypatch):
+    image_path = tmp_path / "fork-boot.iso"
+    image_path.write_bytes(b"\x00" * (4 * iusb.CD_BLOCK_SIZE))
+    runtime_dir = tmp_path / "fork-runtime"
+
+    # Same substitution TestRunDaemonIdleHandling's own harness uses (see above) --
+    # set here, before spawn_session() ever calls os.fork(), so the forked child's
+    # copy of this module's globals already reflects it.
+    monkeypatch.setattr(media_session, "AspClient", _FakeAspClient)
+    monkeypatch.setattr(media_session, "resolve_local_ip", lambda _host: "203.0.113.1")
+    _FakeAspClient.instances = []
+
+    auth_header = iusb.Header(data_packet_len=iusb.AUTH_PAYLOAD_LEN)
+    handshake_frame = _ack_frame(auth_header)
+    monkeypatch.setattr(
+        iusb.Session,
+        "connect",
+        classmethod(lambda cls, *_a, **_k: cls.from_transport(_ForkStopSignalTransport(handshake_frame), "STOKEN-fake-not-real")),
+    )
+
+    spawned: list[_RealForkDaemonHandle] = []
+
+    def _spawn(*, session_id: str = "fork-sigterm-session") -> _RealForkDaemonHandle:
+        config = _config(session_id=session_id, runtime_dir=runtime_dir, image=str(image_path))
+        pid = media_session.spawn_session(config, username="admin", password="test-password-not-real")
+        handle = _RealForkDaemonHandle(pid, runtime_dir, session_id)
+        spawned.append(handle)
+        return handle
+
+    yield _spawn
+
+    # Always clean up: a leaked forked process here would hold no BMC slot (the
+    # network is faked), but would still be a leaked process from a test run.
+    for handle in spawned:
+        if media_session.is_pid_alive(handle.pid):
+            media_session.request_stop(handle.pid)
+            media_session.wait_for_exit(handle.pid, timeout=5.0)
+
+
+class TestSpawnSessionRealFork:
+    def test_forked_daemon_reports_attached_with_its_own_real_pid(self, real_fork_spawn):
+        handle = real_fork_spawn()
+        state = handle.wait_for_attached()
+        assert state["state"] == media_session.STATE_ATTACHED
+        assert state["pid"] == handle.pid
+        assert media_session.is_pid_alive(handle.pid) is True
+
+    def test_sigterm_produces_a_clean_detach_and_records_the_reason(self, real_fork_spawn):
+        # This is the regression test for the actual defect: an uncleanly-terminated
+        # media session permanently strands the BMC's one media slot, because
+        # cd-media's own SERVICE_TIMEOUT is 0xFFFFFFFF -- there is no server-side
+        # reclaim to fall back on (see this module's own module docstring point 2).
+        # Proving the fix means proving a REAL SIGTERM, sent to a REAL separate
+        # process, actually makes it exit through its normal teardown -- not just
+        # that a handler is registered.
+        handle = real_fork_spawn()
+        handle.wait_for_attached()
+
+        media_session.request_stop(handle.pid)  # a real os.kill(pid, signal.SIGTERM)
+        exited = media_session.wait_for_exit(handle.pid, timeout=5.0)
+        assert exited is True, "the daemon must actually exit after SIGTERM, not hang holding the slot"
+
+        final = handle.state()
+        assert final["state"] == media_session.STATE_DETACHED
+        assert final["stop_reason"] == "signal"
+        assert final["error"] is None
+
+    def test_a_second_sigterm_during_shutdown_does_not_wedge_or_raise(self, real_fork_spawn):
+        # _handle_sigterm only ever sets a flag (see its own docstring): a second
+        # SIGTERM arriving before the daemon has finished exiting must be a pure
+        # no-op -- never a re-entrant teardown, never an exception, and never
+        # something that leaves the process (and the slot it would otherwise have
+        # freed) stuck.
+        handle = real_fork_spawn()
+        handle.wait_for_attached()
+
+        media_session.request_stop(handle.pid)
+        media_session.request_stop(handle.pid)  # second real SIGTERM, sent immediately
+
+        exited = media_session.wait_for_exit(handle.pid, timeout=5.0)
+        assert exited is True, "a repeat signal must not prevent (or hang) the daemon's exit"
+
+        final = handle.state()
+        assert final["state"] == media_session.STATE_DETACHED
+        assert final["stop_reason"] == "signal"
+        assert final["error"] is None
 
 
 def _dead_pid() -> int:

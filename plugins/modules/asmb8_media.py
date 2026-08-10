@@ -347,6 +347,23 @@ operation:
             meaningful upper bound on this hardware (measured live at 130 continuous seconds of
             silence on a healthy session).
           type: str
+        stop_reason:
+          description:
+            - >-
+              Why a session that reached V(detached) actually stopped: V(signal) (asked to, via
+              O(state=detached) or an external C(SIGTERM) -- including the one this module's own
+              background daemon installs a handler for specifically so an interrupted play cannot
+              strand the BMC's single media slot, see the module description's single-media-session
+              note), V(peer_closed) (the BMC closed the TCP connection first), or V(bmc_terminate)
+              (the BMC sent an explicit redirection-terminate, opcode C(0xF6)). V(null) while still
+              V(attached), and also V(null) on V(error) -- a crash is already fully identified by
+              RV(ignore:session_state) plus RV(ignore:error_class); this field distinguishes kinds
+              of CLEAN stop from each other, not a clean stop from a crash.
+            - >-
+              Mirrors C(james_crowley.asmb8_ikvm.asmb8_http_origin)'s identically-named field
+              (whose own vocabulary is V(signal)/V(lifetime_expired) -- this module has no
+              lifetime cap of its own, so that second value never appears here).
+          type: str
         updated_at:
           description: >-
             Controller-clock ISO-8601 timestamp of the last time the background process wrote its
@@ -516,6 +533,11 @@ def _status_fields(state: dict | None) -> dict:
         "idle_polls": state.get("idle_polls", 0),
         "current_idle_streak": state.get("current_idle_streak"),
         "last_idle_streak": state.get("last_idle_streak"),
+        # Surfaced for the same reason asmb8_http_origin already surfaces its own
+        # stop_reason: it is what lets a post-mortem tell a signalled stop from a
+        # BMC-initiated one after the fact -- see media_session.py's module
+        # docstring point 2 and roles/asmb8_baremetal_install/README.md.
+        "stop_reason": state.get("stop_reason"),
     }
 
 

@@ -113,6 +113,69 @@ making a single request against any real BMC. Specifically:
   host-unaffected property (both modes are netfn ``0x06`` App-group
   management-controller self-resets, not chassis-power operations), but that
   expectation is not itself a live observation.
+* ``Command.set_identify(on=True, duration=None, blink=False)``
+  (``command.py:555-596``) is the standard IPMI Chassis Identify command
+  (netfn ``0x00``, cmd ``0x04``). Read directly from the installed source, in
+  a disposable virtualenv with no BMC reachable from it, never from memory:
+
+  - It always calls ``self.oem_init()`` first, which resolves an OEM handler
+    via ``pyghmi.ipmi.oem.lookup.get_oem_handler()`` keyed on the BMC's
+    manufacturer ID. That lookup's ``oemmap`` (``pyghmi/ipmi/oem/lookup.py``)
+    contains only three entries -- IBM x86/System X (20301), Lenovo x86
+    (19046), and 7154 -- all routed to the same Lenovo handler module. American
+    Megatrends (this board's manufacturer) is not a key in that map, so
+    ``get_oem_handler()`` falls through to its own ``else`` branch and returns
+    ``pyghmi.ipmi.oem.generic.OEMHandler`` instead.
+  - ``set_identify()`` then calls ``self._oem.set_identify(on, duration,
+    blink)`` inside a ``try``. ``generic.OEMHandler.set_identify()``
+    (``oem/generic.py:398-404``) unconditionally
+    ``raise exc.UnsupportedFunctionality()`` -- it has no real
+    implementation, it exists only so a real OEM handler can override it.
+    ``Command.set_identify()`` catches exactly that exception and falls
+    through to the standard-command body below it; it does NOT propagate to
+    this collection's caller on this board. (It also catches
+    ``exc.BypassGenericBehavior`` separately and returns immediately if an
+    OEM handler raises that instead -- not applicable here, since the generic
+    handler never raises it.)
+  - ``blink=True`` reaching the standard-command fallback always raises
+    ``exc.IpmiException('Blink not supported with generic IPMI')`` --
+    unconditionally, regardless of ``on``/``duration``. This module never
+    passes ``blink=True`` for exactly that reason: exposing a ``blink`` option
+    on this board would be offering a capability pyghmi itself cannot honour
+    here, per this collection's own policy against inventing options a wrapped
+    library cannot actually perform.
+  - When ``duration`` is not ``None`` (an integer number of seconds, clamped
+    by pyghmi itself to the range 0-255), the ``on`` argument is IGNORED
+    entirely: a single-byte raw command (``raw_command(netfn=0, command=4,
+    data=[duration])``) is sent, carrying only the Identify Interval byte with
+    no Force-Identify-On byte. Per the IPMI 2.0 specification this byte's
+    value governs identify on its own: ``0`` turns the LED off, any other
+    value (1-255) turns it on for that many seconds. This is why
+    :meth:`IpmiClient.set_identify` refuses ``duration=0`` combined with
+    ``on=True`` at the module boundary -- sending it would silently turn the
+    LED OFF despite the caller asking for "on".
+  - When ``duration`` is ``None``, a two-byte command is sent instead
+    (``data=[0, 1]`` for "on indefinitely", ``data=[0, 0]`` for "off"): byte 1
+    (Identify Interval) is always ``0``, and byte 2 (Force Identify On) is
+    ``1`` if ``on`` else ``0``. This is the only path that can request
+    indefinite-on.
+  - On success this method returns ``None`` -- a bare ``return`` on every
+    successful branch, never a dict the way ``get_power()``/``get_bootdev()``
+    do. A caller that expects a return payload to inspect will get nothing to
+    inspect; there is also no standard IPMI command to read identify state
+    back (Chassis Identify is fire-and-forget by the spec itself, not merely
+    by this module's choice), which is why :meth:`IpmiClient.set_identify`
+    likewise returns ``None`` and ``asmb8_identify`` cannot be idempotent.
+  - Any raw-command rejection (a non-zero completion code, surfaced by
+    ``raw_command()`` as a returned ``{'error': ...}`` dict) becomes
+    ``exc.IpmiException(response['error'])``, raised directly by
+    ``set_identify()`` itself -- the same "raises rather than returns an
+    error dict" shape ``reset_bmc()`` has for its own failure path.
+
+  Not exercised in a live capture against the target board (unlike Cold
+  Reset above) -- this is sourced entirely from reading pyghmi 1.6.19's
+  installed source directly, cited by file and line above, not from memory
+  and not from any request made to a real BMC.
 """
 
 from __future__ import annotations
@@ -140,6 +203,7 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     ConnectionError_,
     RemoteOperationError,
     TimeoutError_,
+    UnsupportedCapabilityError,
 )
 
 #: RMCP/IPMI-over-LAN's standard port. Deliberately a separate constant (and a
@@ -184,6 +248,15 @@ _TIMEOUT_MARKER = "timeout"
 #: acceptance shape on the target board.
 _RESET_NETFN = 0x06
 _WARM_RESET_COMMAND = 0x03
+
+#: The exact message text pyghmi's `Command.set_identify()` standard-command
+#: fallback raises, unconditionally, when `blink=True` -- see this module's
+#: docstring: `oem/generic.py`'s `OEMHandler.set_identify()` never implements
+#: blink, and the standard IPMI command has no blink concept at all. This
+#: client never passes `blink=True`, so this string is matched only
+#: defensively (a future pyghmi release changing the fallback's own defaults
+#: could still surface it) -- see `set_identify()` below.
+_BLINK_UNSUPPORTED_MESSAGE = "Blink not supported with generic IPMI"
 
 
 def _classify_session_error(message: str) -> type[AuthenticationError | TimeoutError_ | ConnectionError_]:
@@ -404,3 +477,56 @@ class IpmiClient:
                 secrets=self._known_secrets(),
             )
         return {"mode": mode, **response}
+
+    # --- chassis identify -----------------------------------------------------
+
+    def set_identify(self, *, on: bool, duration: int | None = None) -> None:
+        """Issue the standard IPMI Chassis Identify command (netfn 0x00, cmd 0x04).
+
+        Always resolves to pyghmi's standard-command fallback on this board --
+        see this module's docstring for exactly why (American Megatrends is
+        not a key in pyghmi's OEM ``oemmap``). ``blink`` is deliberately not a
+        parameter of this method at all: pyghmi's own generic fallback cannot
+        honour it (see the docstring), so this client never offers a caller
+        the option to ask for it.
+
+        Returns ``None`` on success -- pyghmi's real ``set_identify()``
+        returns nothing itself (see this module's docstring), and there is no
+        standard IPMI command to read identify state back at all, so this is
+        not a gap this wrapper could paper over even if it wanted to.
+
+        ``duration=0`` combined with ``on=True`` is refused by the calling
+        module before this method is ever reached (see ``asmb8_identify``'s
+        ``validate_duration()``) -- not re-validated here, since this class's
+        job is to wrap pyghmi faithfully, not to re-implement a policy its
+        caller already enforces.
+        """
+        try:
+            self._command.set_identify(on, duration, False)
+        except ipmi_exceptions.UnsupportedFunctionality as exc:
+            # Defensive only: as of pyghmi 1.6.19, Command.set_identify()
+            # always catches this itself and falls through to the standard
+            # command (see this module's docstring) -- it never reaches this
+            # far in practice on this board. Handled explicitly anyway in
+            # case a future pyghmi release changes that internal catch.
+            raise UnsupportedCapabilityError(
+                f"IPMI set-identify is not supported by this endpoint: {exc}",
+                endpoint=self._endpoint,
+                operation="set_identify",
+                secrets=self._known_secrets(),
+            ) from exc
+        except ipmi_exceptions.PyghmiException as exc:
+            message = str(exc)
+            if _BLINK_UNSUPPORTED_MESSAGE in message:
+                raise UnsupportedCapabilityError(
+                    f"IPMI set-identify failed: {message}",
+                    endpoint=self._endpoint,
+                    operation="set_identify",
+                    secrets=self._known_secrets(),
+                ) from exc
+            raise RemoteOperationError(
+                f"IPMI set-identify failed: {message}",
+                endpoint=self._endpoint,
+                operation="set_identify",
+                secrets=self._known_secrets(),
+            ) from exc

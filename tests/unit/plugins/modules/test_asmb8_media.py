@@ -237,6 +237,15 @@ class TestIdleStreakReporting:
         assert fields["idle_polls"] == 0
         assert fields["current_idle_streak"] is None
         assert fields["last_idle_streak"] is None
+        assert fields["stop_reason"] is None
+
+    def test_status_fields_surfaces_stop_reason(self):
+        # stop_reason is what lets a caller tell a signalled stop (SIGTERM, or a
+        # local state=detached call) from a BMC-initiated one after the fact --
+        # see media_session.py's module docstring point 2 and the role README's
+        # "single-media-session hazard" section.
+        fields = asmb8_media._status_fields({"state": "detached", "stop_reason": "bmc_terminate"})
+        assert fields["stop_reason"] == "bmc_terminate"
 
     def test_polling_an_existing_session_surfaces_idle_streak_via_operation_observed(self, runtime_dir, image):
         session_id = "idle-reporting-session"

@@ -18,6 +18,8 @@ module's own (new) tests.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -30,6 +32,19 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     ProtocolError,
 )
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.modules import asmb8_console
+
+#: `tests/integration/mock_servers` is not part of the `ansible_collections`
+#: namespace (never shipped in the built collection artifact), so it needs
+#: its own directory on `sys.path` -- mirrors
+#: `test_asmb8_power_lifecycle.py`'s own identical arrangement.
+_MOCK_SERVERS_DIR = str(Path(__file__).resolve().parents[3] / "integration" / "mock_servers")
+
+
+@pytest.fixture(autouse=True)
+def _mock_servers_importable():
+    if _MOCK_SERVERS_DIR not in sys.path:
+        sys.path.insert(0, _MOCK_SERVERS_DIR)
+
 
 PASSWORD = "Sup3rSecretPassw0rd!"
 TOKEN = "SuperSecretKvmTok"
@@ -180,6 +195,26 @@ class TestDecodedFrameAlwaysFailsHonestly:
         _wire_no_network(monkeypatch)
         result = _run_fail(dict(BASE_ARGS, capture="decoded_frame"))
         assert "frame" not in result or result.get("frame") is None
+
+    def test_decoded_frame_never_reaches_a_real_listening_kvm_port(self):
+        """Stronger version of the seam-mocked tests above: point O(kvm_port)
+        at a REAL, live ``IvtpMockServer`` on loopback -- reachable, correctly
+        speaking the handshake, and ready to accept -- rather than a
+        monkeypatched seam, and confirm the connection attempt this module
+        would otherwise make simply never happens. Nothing here is monkey-
+        patched: if C(capture=decoded_frame)'s early-return in C(main())
+        were ever accidentally moved after C(resolve_token_and_security())
+        or C(build_kvm_transport())'s call sites, this test -- unlike the
+        seam-mocked ones above -- would actually observe the resulting
+        connection and fail.
+        """
+        from ivtp_server import IvtpMockServer
+
+        with IvtpMockServer() as server:
+            result = _run_fail(dict(BASE_ARGS, host="127.0.0.1", kvm_port=server.port, capture="decoded_frame"))
+            assert result["error_class"] == "unsupported_capability"
+            with pytest.raises(TimeoutError):
+                server.wait_for_connection(timeout=0.2)
 
 
 class TestCheckMode:

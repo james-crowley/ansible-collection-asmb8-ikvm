@@ -161,6 +161,21 @@ it, never re-derived independently:
   command byte return ``{'error': ...}`` instead, standing in for the BMC
   actively rejecting the reset rather than this fixture simply not modelling
   it yet.
+* ``Command.set_identify(on=True, duration=None, blink=False)`` -- read
+  directly from pyghmi's installed source (``command.py:555-596``), cited in
+  full in ``ipmi.py``'s own docstring: American Megatrends is not a key in
+  pyghmi's OEM ``oemmap``, so this always resolves to the standard-command
+  fallback on this board, never a vendor path. That fallback ignores ``on``
+  entirely whenever ``duration`` is not ``None`` (sending only a one-byte
+  Identify Interval, where ``0`` always means "off" regardless of ``on``),
+  raises unconditionally for ``blink=True`` ("Blink not supported with
+  generic IPMI"), and returns ``None`` on every successful branch --
+  :meth:`FakeIpmiCommand.set_identify` models exactly those three properties,
+  and nothing else: this fixture has no basis to invent identify-state
+  read-back, because the real command has none either.
+  :attr:`IpmiFaultConfig.force_identify_rejected`, when set, makes it raise
+  instead of succeeding, standing in for the BMC returning a non-zero
+  completion code on the underlying raw command.
 """
 
 from __future__ import annotations
@@ -227,6 +242,16 @@ AUTH_FAILURE_MESSAGE = "Incorrect password provided"
 #: session code assigns to a session that timed out with no response at all.
 UNREACHABLE_MESSAGE = "timeout"
 
+#: VERIFIED, per ipmi.py's docstring citing pyghmi's own source directly
+#: (command.py:573-574): the exact message pyghmi's `Command.set_identify()`
+#: standard-command fallback raises, unconditionally, when `blink=True`.
+BLINK_UNSUPPORTED_MESSAGE = "Blink not supported with generic IPMI"
+
+#: The minimum duration this fixture treats as "on" rather than "off" for
+#: `set_identify()`'s single-byte Identify-Interval path -- see ipmi.py's
+#: docstring: an interval of 0 always means "turn off", regardless of `on`.
+_IDENTIFY_OFF_INTERVAL = 0
+
 #: The seven `asmb8_boot` device choices (module_utils/models.py's
 #: BOOT_DEVICES, itself sourced from community.general.ipmi_boot's
 #: documentation -- not invented here).
@@ -287,6 +312,16 @@ class IpmiBmcState:
     #: `ipmi.py` reads this back.
     reset_count: int = 0
     last_reset_mode: str | None = None
+    #: What the most recent successful `set_identify()` call actually sent,
+    #: normalized to "would this leave the LED on or off" plus the raw
+    #: `duration` argument -- purely for a test's own diagnostics, the same
+    #: way `last_reset_mode` is. There is no real IPMI read-back this could
+    #: model instead: `ipmi.py`'s docstring is explicit that standard IPMI
+    #: Chassis Identify has none, so this fixture does not pretend otherwise
+    #: either. `None` until `set_identify()` has been called at least once.
+    identify_count: int = 0
+    last_identify_on: bool | None = None
+    last_identify_duration: int | None = None
 
 
 @dataclass
@@ -331,6 +366,12 @@ class IpmiFaultConfig:
     #: reset command succeeds -- matching the live capture against the
     #: target board for Cold Reset.
     force_reset_rejected: str | None = None
+    #: `set_identify()` always raises `pyghmi.exceptions.IpmiException(...)`
+    #: with this text instead of applying the request, standing in for the
+    #: BMC returning a non-zero completion code on the underlying raw
+    #: command. `None` (the default) means every `set_identify()` call
+    #: succeeds.
+    force_identify_rejected: str | None = None
 
 
 class FakeIpmiBmc:
@@ -562,9 +603,45 @@ class FakeIpmiCommand:
         self._fixture._save()
         return {}
 
+    # -- chassis identify ------------------------------------------------------
+
+    def set_identify(self, on: bool = True, duration: int | None = None, blink: bool = False) -> None:
+        """Stand-in for `pyghmi.ipmi.command.Command.set_identify()`.
+
+        Always models the standard-command fallback, never a vendor OEM path
+        -- see this module's docstring and `ipmi.py`'s own: American
+        Megatrends is not a key in pyghmi's real `oemmap`, so on the target
+        board this is the only branch that is ever actually reachable.
+        Returns `None` on success, exactly like the real method (a bare
+        `return` on every successful branch -- see ipmi.py's docstring).
+        """
+        self._fixture.load()
+        if blink:
+            # Unconditional, regardless of `on`/`duration` -- see
+            # ipmi.py's docstring and BLINK_UNSUPPORTED_MESSAGE's own.
+            raise ipmi_exceptions.IpmiException(BLINK_UNSUPPORTED_MESSAGE)
+        if self._fixture.faults.force_identify_rejected:
+            raise ipmi_exceptions.IpmiException(self._fixture.faults.force_identify_rejected)
+
+        if duration is not None:
+            # `on` is IGNORED entirely on this path -- see ipmi.py's
+            # docstring: only the Identify Interval byte is sent, and an
+            # interval of 0 always means "off" regardless of what `on` was.
+            duration = max(0, min(int(duration), 255))
+            self._fixture.state.last_identify_on = duration != _IDENTIFY_OFF_INTERVAL
+            self._fixture.state.last_identify_duration = duration
+        else:
+            self._fixture.state.last_identify_on = bool(on)
+            self._fixture.state.last_identify_duration = None
+
+        self._fixture.state.identify_count += 1
+        self._fixture._save()
+        return None
+
 
 __all__ = [
     "AUTH_FAILURE_MESSAGE",
+    "BLINK_UNSUPPORTED_MESSAGE",
     "BOOT_DEVICE_ALIASES",
     "DEFAULT_MC_INFO",
     "DEFAULT_PASSWORD",

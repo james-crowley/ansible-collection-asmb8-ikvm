@@ -116,15 +116,15 @@ and why it is deliberately absent.
 
 | Module | Purpose | Mutates BMC? |
 |---|---|---|
-| [`asmb8_postcode`](plugins/modules/asmb8_postcode.py) | Read the BIOS POST code, optionally sampling it over a bounded window — the only out-of-band view of boot progress this board offers, since Serial-over-LAN does not work on it | No |
-| [`asmb8_sel`](plugins/modules/asmb8_sel.py) | Read the System Event Log and its policy. The IPMI path is generally preferable; this exists for web-management-only reachability and cross-checking | No (clearing is deliberately not offered) |
-| [`asmb8_sensors`](plugins/modules/asmb8_sensors.py) | Temperature, voltage and fan readings with decoded units. Discrete/event-only sensors report a null reading rather than a meaningless placeholder | No |
-| [`asmb8_inventory`](plugins/modules/asmb8_inventory.py) | BMC firmware and auxiliary revision, device and product IDs, FRU area and platform feature list | No |
-| [`asmb8_users`](plugins/modules/asmb8_users.py) | Configured accounts, their status and role groups. Unconfigured slots are reported as counts, not as accounts | No |
-| [`asmb8_network`](plugins/modules/asmb8_network.py) | LAN channel, IP configuration, DNS and interface bonding | No |
-| [`asmb8_sessions`](plugins/modules/asmb8_sessions.py) | Per-service state, plain and secure ports, timeouts and session limits | No |
-| [`asmb8_alerts`](plugins/modules/asmb8_alerts.py) | Alerting configuration grouped by intent: where alerts go (SMTP, LAN destinations) and what fires them (event filters, policies, triggers) | No |
-| [`asmb8_auditlog`](plugins/modules/asmb8_auditlog.py) | Audit log entries and the logging configuration | No (clearing is deliberately not offered) |
+| [`asmb8_postcode`](docs/asmb8_postcode.md) | Read the BIOS POST code, optionally sampling it over a bounded window — the only out-of-band view of boot progress this board offers, since Serial-over-LAN does not work on it | No |
+| [`asmb8_sel`](docs/asmb8_sel.md) | Read the System Event Log and its policy. The IPMI path is generally preferable; this exists for web-management-only reachability and cross-checking | No (clearing is deliberately not offered) |
+| [`asmb8_sensors`](docs/asmb8_sensors.md) | Temperature, voltage and fan readings with decoded units. Discrete/event-only sensors report a null reading rather than a meaningless placeholder | No |
+| [`asmb8_inventory`](docs/asmb8_inventory.md) | BMC firmware and auxiliary revision, device and product IDs, FRU area and platform feature list | No |
+| [`asmb8_users`](docs/asmb8_users.md) | Configured accounts, their status and role groups. Unconfigured slots are reported as counts, not as accounts | No |
+| [`asmb8_network`](docs/asmb8_network.md) | LAN channel, IP configuration, DNS and interface bonding | No |
+| [`asmb8_sessions`](docs/asmb8_sessions.md) | Per-service state, plain and secure ports, timeouts and session limits | No |
+| [`asmb8_alerts`](docs/asmb8_alerts.md) | Alerting configuration grouped by intent: where alerts go (SMTP, LAN destinations) and what fires them (event filters, policies, triggers) | No |
+| [`asmb8_auditlog`](docs/asmb8_auditlog.md) | Audit log entries and the logging configuration | No (clearing is deliberately not offered) |
 
 **Credential-shaped values are never returned.** Where the BMC exposes one —
 an SMTP password, a DNS TSIG key, SSH key material, a user's email address —
@@ -135,7 +135,7 @@ entries are the one exception and are returned verbatim: sanitising free-text
 log entries would corrupt the record and give false assurance, so they may
 contain usernames or addresses and are documented as such.
 
-All seventeen are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
+All eighteen are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
 their shared connection options centrally with `module_defaults`:
 
 ```yaml
@@ -353,7 +353,7 @@ body never lands in a task result verbatim.
 
 ## Project status
 
-**0.3.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
+**0.4.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
 hedge; it is an accurate description of where this collection is today.
 
 On one ASUS Z10PE-D16 WS / ASMB8-iKVM board (firmware 1.14, aux 1.14.2), this

@@ -48,3 +48,7 @@ action_groups:
     - asmb8_sessions
     - asmb8_alerts
     - asmb8_auditlog
+    # Chassis identify LED over standard IPMI (netfn 0x00 cmd 0x04). pyghmi's
+    # set_identify() falls through to the standard command for this board, so
+    # this needs no .asp endpoint and carries no lockout risk.
+    - asmb8_identify

@@ -70,25 +70,48 @@ nothing about Ansible; ``plugins/modules/asmb8_media.py`` is the only caller.
 from __future__ import annotations
 
 import contextlib
-import datetime
-import json
 import os
 import signal
-import time
-import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import iusb
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp import AspClient
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.daemon_runtime import (
+    _now_iso,
+    _redirect_std_fds,
+    _write_state_atomic,
+    _write_state_if_absent,
+    generate_session_id,
+    is_pid_alive,
+    list_session_ids,
+    log_file_path,
+    read_state,
+    remove_paths,
+    request_stop,
+    state_file_path,
+    wait_for_exit,
+    wait_for_state,
+)
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import (
     IkvmError,
     ProtocolError,
     UnsupportedCapabilityError,
     redact,
 )
+
+#: generate_session_id/wait_for_state are re-exported from daemon_runtime for
+#: this module's own callers (asmb8_media.py, this module's own tests) to reach
+#: as media_session.<name> -- nothing in THIS file calls them itself, unlike
+#: e.g. read_state/is_pid_alive/request_stop/wait_for_exit/list_session_ids
+#: below, which the reclamation scan uses directly and so need no such
+#: declaration. Without this, ruff/pyflakes' F401 would flag both imports as
+#: unused, since it only sees this file, not asmb8_media.py's own usage.
+__all__ = [
+    "generate_session_id",
+    "wait_for_state",
+]
 
 #: Observable session states, written to the state file's ``state`` key.
 STATE_STARTING = "starting"
@@ -113,10 +136,6 @@ DEFAULT_RUNTIME_DIR = "~/.ansible/asmb8_ikvm/media-sessions"
 #: raising or lowering it changes only how quickly a detach request is
 #: noticed, never how long an attached session may legitimately sit idle.
 _RECV_POLL_TIMEOUT = 2.0
-
-#: How often callers waiting on a state-file transition (attach confirmation,
-#: detach confirmation) re-check the file.
-_STATE_POLL_INTERVAL = 0.2
 
 #: Bound on waiting for another locally-tracked session (live process) to
 #: exit during the always-run reclamation pass (see module docstring point 2
@@ -156,69 +175,15 @@ class SessionConfig:
 
 
 # --------------------------------------------------------------------------
-# State file plumbing -- shared by the daemon (writer) and the module (reader).
+# State file plumbing -- shared by the daemon (writer) and the module
+# (reader). The primitives themselves (atomic write, create-only write, pid
+# liveness, bounded polling) now live in ``daemon_runtime.py``, shared with
+# ``http_origin.py``'s daemon -- see that module's own docstring for exactly
+# why and what deliberately stayed out of it. ``state_file_path``/
+# ``log_file_path``/``read_state``/``list_session_ids``/``is_pid_alive``/
+# ``generate_session_id``/``wait_for_state``/``wait_for_exit``/
+# ``request_stop`` are imported directly, unchanged, at the top of this file.
 # --------------------------------------------------------------------------
-
-
-def state_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
-    return Path(runtime_dir) / f"{session_id}.json"
-
-
-def log_file_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
-    """Where the daemon's stdout/stderr are redirected -- see :func:`_redirect_std_fds`."""
-    return Path(runtime_dir) / f"{session_id}.log"
-
-
-def read_state(runtime_dir: str | os.PathLike[str], session_id: str) -> dict[str, Any] | None:
-    """Read and parse the state file, or ``None`` if it does not exist or is unreadable.
-
-    A parse failure degrades to ``None`` (treated as "no session") rather
-    than raising: the atomic write below makes a torn read very unlikely,
-    but this file is a best-effort receipt, not a source of truth a caller
-    should ever fail hard on.
-    """
-    try:
-        raw = state_file_path(runtime_dir, session_id).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def list_session_ids(runtime_dir: str | os.PathLike[str]) -> list[str]:
-    """Every session_id with a state file under ``runtime_dir``, for the
-    reclamation scan in :func:`find_conflicting_sessions`. Empty if the
-    directory does not exist yet.
-    """
-    directory = Path(runtime_dir)
-    if not directory.is_dir():
-        return []
-    return [path.stem for path in directory.glob("*.json")]
-
-
-def _write_state_atomic(runtime_dir: str | os.PathLike[str], session_id: str, data: dict[str, Any]) -> None:
-    """Write ``data`` as the current state, atomically.
-
-    Write to a sibling temp path then ``os.replace()`` it over the real
-    path -- see the sibling collection's identical rationale for why this,
-    and why the temp file is created ``0600`` explicitly rather than left to
-    the umask.
-    """
-    path = state_file_path(runtime_dir, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    os.replace(tmp_path, path)
 
 
 def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> dict[str, Any]:
@@ -236,6 +201,17 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
     in this module's own docstring point 1 -- populated by :func:`_run_daemon`'s
     ``_on_idle``/``_on_request`` callbacks and :func:`_close_idle_streak`,
     never by anything outside this file.
+
+    ``stop_reason`` records WHY a session that reached ``STATE_DETACHED``
+    actually stopped -- ``"signal"`` (asked to, via ``state=detached`` or an
+    external ``SIGTERM``), ``"peer_closed"`` (the BMC closed the TCP
+    connection first), or ``"bmc_terminate"`` (the BMC sent an explicit
+    redirection-terminate, opcode ``0xF6``) -- set only in :func:`_run_daemon`'s
+    normal-exit branch, mirroring ``http_origin.py``'s identical field
+    (``"signal"``/``"lifetime_expired"`` there). Stays ``None`` on
+    ``STATE_ERROR``: a crash is already fully identified by ``state`` +
+    ``error_class``, and this field exists to distinguish kinds of *clean*
+    stop from each other, not to duplicate that.
     """
     now = _now_iso()
     return {
@@ -255,6 +231,7 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
         "idle_poll_interval_seconds": _RECV_POLL_TIMEOUT,
         "current_idle_streak": None,
         "last_idle_streak": None,
+        "stop_reason": None,
     }
 
 
@@ -278,114 +255,14 @@ def _close_idle_streak(state: dict[str, Any], *, now: str) -> None:
     state["current_idle_streak"] = None
 
 
-def _write_state_if_absent(runtime_dir: str | os.PathLike[str], session_id: str, data: dict[str, Any]) -> bool:
-    """Write ``data`` as the state record only if no record exists yet. Returns whether it wrote.
-
-    Create-only counterpart of :func:`_write_state_atomic`, for exactly the
-    race the sibling collection's ``media_session.py`` documents in detail:
-    by the time :func:`spawn_session` returns, the daemon may already have
-    written ``connecting`` or even its final ``error``, and an unconditional
-    write here would clobber that with an older, less informative record.
-    ``O_CREAT | O_EXCL`` makes the kernel the tiebreaker rather than
-    scheduling luck.
-    """
-    path = state_file_path(runtime_dir, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(data, handle)
-    return True
-
-
 def remove_state(runtime_dir: str | os.PathLike[str], session_id: str) -> None:
     """Delete the state and log files for ``session_id``, if present.
 
-    Frees the session_id for reuse. Silent about files that are already
-    gone -- callers call this defensively without checking existence first.
+    Frees the session_id for reuse. Built on ``daemon_runtime.remove_paths``,
+    which is silent about files that are already gone -- callers call this
+    defensively without checking existence first.
     """
-    for path in (state_file_path(runtime_dir, session_id), log_file_path(runtime_dir, session_id)):
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-
-
-def is_pid_alive(pid: int | None) -> bool:
-    """Whether ``pid`` refers to a live process this user can at least signal-probe.
-
-    ``os.kill(pid, 0)`` sends no signal; it only asks the kernel whether the
-    target exists and is signalable. A ``PermissionError`` means it exists
-    but is owned by someone else -- treated as "alive" here, since the only
-    thing that matters for staleness detection is whether the pid has been
-    recycled for an unrelated process.
-
-    ``pid`` values that cannot be a live daemon's own pid by construction
-    (``None``; zero or negative, which ``os.kill`` treats as "every process
-    in a group" rather than one specific process) are rejected before ever
-    reaching ``os.kill`` -- a state file is untrusted-ish input, and
-    signalling an entire process group over a malformed pid field would be a
-    far worse failure mode than reporting "not alive".
-    """
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def generate_session_id() -> str:
-    return uuid.uuid4().hex
-
-
-def wait_for_state(
-    runtime_dir: str | os.PathLike[str],
-    session_id: str,
-    *,
-    until: Callable[[dict[str, Any]], bool],
-    timeout: float,
-    poll_interval: float = _STATE_POLL_INTERVAL,
-) -> dict[str, Any] | None:
-    """Poll the state file until ``until(state)`` is true or ``timeout`` elapses.
-
-    Returns whatever was last read -- which may not satisfy ``until`` if the
-    timeout won the race; the caller decides what an unsatisfied wait means.
-    """
-    deadline = time.monotonic() + timeout
-    observed: dict[str, Any] | None = None
-    while True:
-        observed = read_state(runtime_dir, session_id)
-        if observed is not None and until(observed):
-            return observed
-        if time.monotonic() >= deadline:
-            return observed
-        time.sleep(poll_interval)
-
-
-def wait_for_exit(pid: int | None, *, timeout: float, poll_interval: float = _STATE_POLL_INTERVAL) -> bool:
-    """Poll ``is_pid_alive(pid)`` until it goes false or ``timeout`` elapses. Returns whether it exited."""
-    deadline = time.monotonic() + timeout
-    while is_pid_alive(pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(poll_interval)
-    return True
-
-
-def request_stop(pid: int | None) -> None:
-    """Ask the daemon at ``pid`` to shut down. Silent if it is already gone or not a real pid.
-
-    See :func:`is_pid_alive` for why ``None``/non-positive values are
-    rejected before ever reaching ``os.kill``.
-    """
-    if pid is None or pid <= 0:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGTERM)
+    remove_paths(state_file_path(runtime_dir, session_id), log_file_path(runtime_dir, session_id))
 
 
 # --------------------------------------------------------------------------
@@ -584,37 +461,67 @@ def spawn_session(config: SessionConfig, *, username: str, password: str) -> int
 # The daemon itself.
 # --------------------------------------------------------------------------
 
+#: Set only by :func:`_handle_sigterm`, read only by the ``should_stop``
+#: lambda :func:`_run_daemon` hands to ``iusb.Session.serve_forever`` -- see
+#: that function's own docstring for exactly how this closes the slot instead
+#: of merely ending the daemon process.
 _stop_flag = False
 
 
 def _handle_sigterm(_signum: int, _frame: object) -> None:
+    """The ONLY thing a signal handler in this daemon is allowed to do.
+
+    Python signal handlers run on the main thread between bytecode
+    instructions, at a point the interpreter chooses, not one the handler
+    controls -- doing anything beyond an atomic-enough attribute set here
+    (network I/O, closing the iUSB session, even acquiring a lock) risks
+    re-entering code that was not ready to be re-entered, or deadlocking
+    against whatever the interrupted bytecode was in the middle of.
+
+    So this sets a flag and returns, immediately. The real teardown --
+    :func:`_run_daemon`'s existing normal-exit path: closing the iUSB
+    session (which sends the TCP FIN the BMC needs to free its one media
+    slot -- see this module's own docstring point 2) and writing a final
+    state record -- runs on the daemon's own main-thread control flow, at a
+    point it chooses: the top of ``iusb.Session.serve_forever``'s loop, via
+    the ``should_stop=lambda: _stop_flag`` callback already wired up below.
+    That loop wakes at least every ``_RECV_POLL_TIMEOUT`` seconds even on an
+    otherwise-silent connection (see that constant's own docstring), so this
+    flag is never stuck waiting on real traffic to be noticed.
+
+    A self-pipe (write a byte to a pipe from the handler; have the main loop
+    select()/recv() on it) was the other candidate here, and is the more
+    common pattern when a loop is blocked in ``select()``/``poll()`` with no
+    other periodic wake-up of its own. It buys nothing extra in THIS daemon,
+    which already re-checks a plain condition on a bounded cadence for an
+    unrelated reason (the idle-heartbeat/idle-streak bookkeeping in this
+    module's docstring point 1) -- adding a pipe fd into ``iusb``'s transport
+    layer just to multiplex a second wake source would be strictly more
+    moving parts for the same outcome. A boolean flag, set from the handler
+    and polled from the loop that was already polling something else, is the
+    simplest thing that is still signal-handler-safe: assigning a name to a
+    ``bool`` is atomic at the bytecode level in CPython (the GIL serialises
+    it), so there is no partial-write hazard between the handler and the
+    loop reading it, unlike a multi-step data structure would have.
+
+    This is also naturally idempotent: a second (or third, ...) ``SIGTERM``
+    arriving before the daemon has finished exiting just sets an
+    already-``True`` flag to ``True`` again -- a no-op, never a re-entrant
+    teardown, never an exception. There is nothing here that could "wedge"
+    on a repeat signal, because there is nothing here beyond one assignment.
+
+    Deliberately NOT ``SIGINT``: this daemon is always reached via
+    ``request_stop()``'s ``os.kill(pid, signal.SIGTERM)`` (see
+    ``daemon_runtime.request_stop``'s own docstring for why -- a backgrounded
+    process inherits ``SIG_IGN`` for ``SIGINT`` from its launching shell's
+    job control, so ``kill -INT`` on one is silently swallowed and never
+    invokes this handler at all; that is not a theoretical concern, it is
+    exactly what made a stray ``pkill`` during this collection's own
+    development look, for a while, like the daemon had no signal handling at
+    all).
+    """
     global _stop_flag
     _stop_flag = True
-
-
-def _now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def _redirect_std_fds(log_path: Path) -> None:
-    """Detach stdin/stdout/stderr from whatever this process inherited across the fork.
-
-    Correctness requirement, not cosmetic -- see the sibling collection's
-    identical rationale: this daemon deliberately outlives the Ansible
-    module invocation that forked it, and a duplicated stdout pipe would make
-    the controller hang past the module's own exit waiting for an EOF this
-    long-lived process never provides. Must run before any other daemon
-    logic.
-    """
-    devnull_fd = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull_fd, 0)
-    os.close(devnull_fd)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.dup2(log_fd, 1)
-    os.dup2(log_fd, 2)
-    os.close(log_fd)
 
 
 def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
@@ -752,6 +659,19 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
             state["last_request_at"] = now
             _persist(now)
 
+        # should_stop=lambda: _stop_flag is the ENTIRE effect SIGTERM has on this
+        # daemon: _handle_sigterm (above) only ever flips that flag, and this is
+        # the one place it is read. There is deliberately no second, signal-
+        # specific teardown path -- a SIGTERM makes serve_forever() return
+        # SERVE_STOPPED through the exact same route a local state=detached
+        # request already used, so it inherits everything below unchanged: the
+        # idle-streak close, the state-file write, and -- in the finally block
+        # at the bottom of this function -- session.close(), which is what
+        # actually sends the TCP FIN the BMC needs to see to free its one
+        # media slot (see this module's own docstring point 2). Writing a
+        # second, SIGTERM-only teardown here would risk it drifting out of
+        # sync with this one and would be exactly the kind of thing a signal
+        # handler must not attempt directly (see _handle_sigterm's docstring).
         outcome = session.serve_forever(device, should_stop=lambda: _stop_flag, on_idle=_on_idle, on_request=_on_request)
 
         # A normal exit (stopped/peer-closed/killed) may happen while a streak
@@ -764,20 +684,36 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
         state["bytes_read"] = device.bytes_served()
         state["sectors_served"] = device.blocks_served()
         if outcome == iusb.SERVE_STOPPED:
+            # Reached via SIGTERM (request_stop()/asmb8_media state=detached) just as
+            # often as via a direct in-process stop in a test -- see _handle_sigterm's
+            # docstring. "signal" mirrors http_origin.py's own stop_reason vocabulary.
             state["state"] = STATE_DETACHED
             state["error"] = None
+            state["stop_reason"] = "signal"
         elif outcome == iusb.SERVE_PEER_CLOSED:
             state["state"] = STATE_DETACHED
             state["error"] = "connection closed by peer"
+            state["stop_reason"] = "peer_closed"
         else:  # iusb.SERVE_KILLED
             state["state"] = STATE_DETACHED
             state["error"] = "BMC sent a redirection-terminate (opcode 0xF6)"
+            state["stop_reason"] = "bmc_terminate"
         _persist(now)
     except IkvmError as exc:
+        # stop_reason is deliberately left at its initial None here: a crash is
+        # already fully identified by state=error + error_class, and this field
+        # exists to tell apart kinds of CLEAN stop from each other (see
+        # _initial_state's docstring), not to duplicate that classification.
         _fail(str(exc), error_class=exc.error_class)
     except Exception as exc:  # last-resort: the daemon has no other way to report a crash.
         _fail(f"unexpected error: {exc}")
     finally:
+        # This close() is the daemon's one and only teardown of the iUSB
+        # session, reached on every exit path -- clean stop, peer close, BMC
+        # kill, or an exception above -- not just the SIGTERM one. See the
+        # comment above serve_forever() for why SIGTERM is routed through the
+        # normal exit path specifically so it ends up here too, rather than
+        # bypassing it.
         if session is not None:
             with contextlib.suppress(Exception):
                 session.close()
