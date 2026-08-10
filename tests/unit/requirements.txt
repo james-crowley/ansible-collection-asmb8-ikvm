@@ -7,6 +7,10 @@
 requests>=2.25.0
 pytest>=7.0.0
 pytest-mock>=3.10.0
+# TLS transport tests generate an ephemeral self-signed leaf in-process. This
+# keeps private keys out of the repository and avoids depending on an external
+# openssl executable in every supported Python matrix cell.
+cryptography>=3.4.0
 # module_utils/ipmi.py (asmb8_power/asmb8_boot/asmb8_info) wraps this directly
 # rather than shelling out to community.general.ipmi_power/ipmi_boot -- see
 # that module's docstring. tests/unit/plugins/module_utils/test_ipmi.py mocks

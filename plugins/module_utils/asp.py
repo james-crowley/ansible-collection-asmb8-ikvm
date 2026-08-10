@@ -262,6 +262,32 @@ class AmiLegacyTlsAdapter(HTTPAdapter):
             kwargs["assert_fingerprint"] = self._policy.fingerprint
         return super().proxy_manager_for(proxy, **kwargs)
 
+    def cert_verify(self, conn: Any, url: str, verify: Any, cert: Any) -> None:
+        """Keep Requests from replacing this adapter's resolved trust mode.
+
+        ``requests.Session.request()`` defaults ``verify`` to ``True`` and
+        :class:`requests.adapters.HTTPAdapter` applies that value after the
+        pool's custom ``ssl_context`` has been created.  Its default
+        ``cert_verify()`` therefore writes ``CERT_REQUIRED`` onto the
+        connection even when :class:`TlsTrustPolicy` deliberately selected
+        ``CERT_NONE`` so urllib3 could enforce a reviewed leaf fingerprint,
+        or when the caller explicitly selected ``validate_certs=False``.
+
+        Resolve that late Requests setting from the policy as well.  Ordinary
+        CA validation continues through the parent implementation unchanged;
+        a configured ``ca_path`` is passed as the effective CA bundle.  The
+        pin-only and explicit-no-validation modes pass ``False`` so the
+        connection agrees with their SSL context.  Fingerprint enforcement
+        itself remains urllib3's ``assert_fingerprint`` handshake check.
+        """
+        if self._policy.pinned or not self._policy.validate_certs:
+            effective_verify: Any = False
+        elif self._policy.ca_path:
+            effective_verify = self._policy.ca_path
+        else:
+            effective_verify = verify
+        super().cert_verify(conn, url, effective_verify, cert)
+
 
 # --- .asp RPC surface -------------------------------------------------------
 

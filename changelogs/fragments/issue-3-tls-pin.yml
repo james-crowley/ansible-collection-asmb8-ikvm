@@ -1,0 +1,7 @@
+---
+bugfixes:
+  - >-
+    TLS transport - preserve O(tls_fingerprint) pin-only trust and explicit
+    O(validate_certs=false) when Requests applies its per-request certificate
+    settings, while leaving ordinary CA validation intact
+    (https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues/3).

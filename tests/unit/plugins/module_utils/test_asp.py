@@ -15,13 +15,23 @@ through a real connection attempt.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import re
 import ssl
+import threading
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock
 
 import pytest
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
 
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import asp
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp import (
@@ -114,6 +124,71 @@ def mock_response(text: str) -> Mock:
     return response
 
 
+class _TlsFixtureHandler(BaseHTTPRequestHandler):
+    """Credential-free response used only to exercise the real TLS adapter."""
+
+    def do_GET(self) -> None:
+        payload = b"asmb8-tls-fixture\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format: str, *args: object) -> None:
+        # Keep test output deterministic and free of ephemeral port numbers.
+        return
+
+
+@pytest.fixture
+def self_signed_tls_endpoint(tmp_path):
+    """Serve a self-signed leaf through TLS 1.2 and the legacy BMC cipher set."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .sign(private_key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "self-signed-localhost-cert.pem"
+    key_path = tmp_path / "self-signed-localhost-key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.set_ciphers(BMC_CIPHERS)
+    context.load_cert_chain(cert_path, key_path)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TlsFixtureHandler)
+    server.daemon_threads = True
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    fingerprint = hashlib.sha256(certificate.public_bytes(serialization.Encoding.DER)).hexdigest()
+    try:
+        yield server.server_address[1], fingerprint
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 class TestTransportPolicy:
     def test_plaintext_without_acknowledgement_is_refused(self):
         with pytest.raises(TlsValidationError):
@@ -201,6 +276,51 @@ class TestAmiLegacyTlsAdapter:
 
         assert captured["ssl_context"].verify_mode == ssl.CERT_NONE
         assert "assert_fingerprint" not in captured
+
+    def test_matching_pin_accepts_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, tls_fingerprint=fingerprint, max_retries=0)
+
+        try:
+            response = client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+        assert response.status_code == 200
+        assert response.text == "asmb8-tls-fixture\n"
+
+    def test_wrong_pin_refuses_the_same_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, fingerprint = self_signed_tls_endpoint
+        wrong_fingerprint = ("0" if fingerprint[0] != "0" else "1") + fingerprint[1:]
+        client = AspClient(host="localhost", port=port, password=PASSWORD, tls_fingerprint=wrong_fingerprint, max_retries=0)
+
+        try:
+            with pytest.raises(TlsValidationError, match=r"[Ff]ingerprint"):
+                client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+    def test_validate_certs_false_accepts_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, _fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, validate_certs=False, max_retries=0)
+
+        try:
+            with pytest.warns(InsecureRequestWarning):
+                response = client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+        assert response.status_code == 200
+
+    def test_normal_ca_mode_still_refuses_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, _fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, validate_certs=True, max_retries=0)
+
+        try:
+            with pytest.raises(TlsValidationError, match="certificate verify failed"):
+                client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
 
     def test_adapter_is_the_slimmer_equivalent_the_task_allowed_for(self):
         # Confirms this module does not import the sibling intel_amt
