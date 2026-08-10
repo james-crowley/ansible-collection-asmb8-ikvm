@@ -456,26 +456,50 @@ not been taken yet: a timestamp immediately before and after the client's own
 and the next inbound request arriving (BMC-side turnaround). Whichever side
 that gap lands on is the next real lead — not another socket option.
 
-## Redirection rejection status `3` — an undocumented refusal code
+## Redirection rejection status `3` means "bad token"
 
-Observed 2026-08-09, after the events above. Every attempt to attach virtual
-media began failing with the client's own, correct diagnosis:
+Observed and then **resolved** 2026-08-09. Recorded in full because the
+diagnosis went wrong twice before going right, and the wrong turns are the
+instructive part.
 
 ```
 AckError: vmedia: redirection not accepted (status 3)
 ```
 
-This matters for two reasons.
+**The cause was a bad token, and the bug was in a diagnostic harness, not in
+this collection.** A JNLP's `<argument>` elements are a flat `-flag value`
+list. The harness read the token positionally, as the fourth argument. On this
+firmware that slot holds `-hostname`'s value — **the BMC's own IP address** — so
+every attach authenticated with an IP address where a 16-character token
+belonged, and the BMC refused. The shipped parser
+(`asp.parse_jnlp_arguments`) has always resolved by flag name and was never
+affected; a regression test now pins that, using this firmware's real argument
+order.
 
-**First, `3` is not a status this project had seen before.** `iusb.py` names
-exactly three connection-status values, all sourced from the decompiled vendor
-client: `CONN_OK = 1`, `CONN_ERR_IN_USE_5 = 5`, `CONN_ERR_IN_USE_8 = 8`. Since
-both known failures mean "already in use", and `3` is neither, **`3` is
-something other than occupancy** — most plausibly a refusal by configuration or
-policy rather than by contention. Its meaning is **not established**; do not
-guess at it in code or docs until it is sourced.
+The tell was in the logs the entire time and went unnoticed for hours: the
+working run printed `token acquired (16ch)`, every failing probe printed
+`token 13ch`. Thirteen characters is the length of a dotted-quad address.
+**When a protocol rejects a credential, compare the credential's shape against
+a known-good run before theorising about state.**
 
-**Second, the failure signature is easy to misread.** The symptoms were:
+`3` therefore joins the sourced status values — `CONN_OK = 1`,
+`CONN_ERR_IN_USE_5 = 5`, `CONN_ERR_IN_USE_8 = 8` — as an authentication
+rejection rather than an occupancy one. That distinction matters: it is **not**
+a busy signal, so retrying, waiting, or reclaiming sessions will never clear it.
+
+**Two wrong diagnoses, both worth recording.** First, the failure was blamed on
+a media session orphaned when a network outage cut the controller off
+mid-install — plausible, because `cd-media` allows one session with no
+server-side timeout and this collection cannot evict a session it does not
+track. Second, when a BMC cold reset did not help, it was blamed on that reset
+having reverted manually-set media settings. Both were consistent with the
+evidence and both were wrong. The JNLP dump that settled it — printing every
+argument with its index and length — cost one command and would have been the
+correct first move. Nothing was ever wedged, and **the cold reset was
+unnecessary**.
+
+**The failure signature is genuinely easy to misread**, and that part stands
+regardless of cause. The symptoms were:
 
 - TCP to port 5120 **connected** and stayed `ESTABLISHED`
 - 62 bytes sat **unread** in the socket's receive queue
@@ -490,16 +514,16 @@ reads nothing. A 30-second attach-only probe distinguishes this from every
 other failure mode without spending a boot cycle, and is far cheaper than
 inferring from a read trace.
 
-What is **not** yet known: what actually caused it. Two observations bound the
-question. It first appeared after a session was orphaned by a network outage
-that cut the controller off mid-install — and `cd-media` allows one session
-with **no** server-side timeout, so an orphaned session is not self-clearing.
-But a BMC cold reset (netfn `0x06` cmd `0x02`, completion code 0) did **not**
-clear it, which argues against simple occupancy and is consistent with `3`
-meaning something configuration-shaped. A candidate worth checking before
-anything else: whether the reset reverted the media-redirection or
-media-encryption settings that had been set manually in the web UI, since the
-client cannot speak the encrypted variant.
+After correcting the token lookup, the same probe returned
+`redirection accepted (instance 0, port 5120)` with no exception, immediately
+and repeatably.
+
+**Settings confirmed intact along the way.** The JNLP dump also reports the
+board's live redirection configuration, which is worth knowing since it was
+briefly suspected: `-cdstate 1` (CD redirection enabled), `-vmsecure 0` (media
+encryption off), `-singleportenabled 0`, `-cdport 5120`, `-cdnum 1`. A BMC cold
+reset did **not** revert any of these. That dump is the cheapest way to read
+this configuration and needs no web UI.
 
 Also recorded from that cold reset, since it is directly useful: the host was
 **unaffected** and stayed powered on, and recovery was **staged** — ICMP and
@@ -522,9 +546,6 @@ keyed on ping therefore reports success while the web stack is still down.
   only CD-ROM has been exercised.
 - **Any board other than this one.** One machine, one firmware version. This is
   repeatability at best, not a compatibility guarantee.
-- **The meaning of redirection status `3`.** Reproducibly refuses media attach
-  and is not one of the two known "in use" codes. Cause and meaning both
-  unestablished — see the section above.
 - **Whether this board boots a small iPXE image over iUSB.** A custom iPXE build
   with an embedded chain script was produced at **0.89 MiB** — against a 1,628
   MiB installer ISO, that is what the bootstrap approach rests on. It has **not**
