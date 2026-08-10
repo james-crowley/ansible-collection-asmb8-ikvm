@@ -1,0 +1,23 @@
+minor_changes:
+  - Add ``asmb8_users``, a read-only module reporting local BMC user accounts, the current
+    session's privilege role, and LDAP/AD role-group bindings (``getalluserinfo.asp``,
+    ``getrole.asp``, ``getallrolegroupcfg.asp``). Empty user-table slots are reported as slots, not
+    accounts; e-mail addresses and SSH key material are never returned, only booleans indicating
+    whether they are configured; unsourced numeric privilege-limit fields are returned raw with an
+    explicit caveat rather than decoded. No write capability is implemented -- account creation,
+    modification, and role-group changes are deliberately out of scope, since a mistake there can
+    lock an operator out of the BMC entirely.
+  - Add ``asmb8_network``, a read-only module reporting per-channel LAN configuration, the
+    LAN-channel-to-interface mapping, DNS configuration, and NIC-bonding configuration
+    (``getalllancfg.asp``, ``getlanchannelinfo.asp``, ``getdnscfg.asp``, ``getnwbondcfg.asp``,
+    ``checknwbond.asp``). DNS TSIG key material is never returned, only a boolean indicating
+    whether a key is configured. No write capability is implemented -- a mistaken network
+    configuration change can sever the management path this collection uses to reach the board at
+    all.
+  - Add ``asmb8_sessions``, a read-only module reporting per-service session capacity and
+    remote-session (KVM/media) configuration (``getallservicescfg.asp``, ``getremotesession.asp``).
+    Session-count fields are decoded from this board's +128 offset encoding, confirmed against two
+    independent capacity measurements already recorded elsewhere in this collection. A live
+    directory of active sessions (``getsessioninfo.asp``) is not implemented, because that
+    endpoint's real invocation requires ``POST`` and ``AspClient.get_webvar`` is deliberately
+    ``GET``-only; this is a documented gap pending a POST-capable client method, not an oversight.

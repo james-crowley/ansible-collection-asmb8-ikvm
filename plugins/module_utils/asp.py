@@ -71,6 +71,7 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors im
     TlsValidationError,
 )
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.models import JnlpSession
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.webvar import WebVarResponse, parse_webvar
 
 #: This board's web management port, per the connection doc fragment
 #: (plugins/doc_fragments/connection.py) -- observed default on the target
@@ -693,6 +694,36 @@ class AspClient:
     # to give asmb8_power/asmb8_info a plumbing point to call once that
     # evidence exists; they deliberately do not attempt to parse or validate
     # a response shape this collection has not seen.
+
+    def get_webvar(self, endpoint: str, *, operation: str | None = None) -> WebVarResponse:
+        """Fetch a read-only ``/rpc/<endpoint>.asp`` and parse its WEBVAR payload.
+
+        This is the shared read path for every informational module in this
+        collection. ``endpoint`` is a bare name such as ``"getallsensors"``; the
+        ``/rpc/`` prefix and ``.asp`` suffix are added here so callers cannot
+        drift on the path shape.
+
+        **Read-only by construction.** It issues a ``GET`` and nothing else, so
+        it cannot mutate BMC state no matter what is passed. Anything that
+        changes configuration must be a separate, explicitly-named method --
+        this must not become a general-purpose request escape hatch, because a
+        caller reaching for "just one POST through get_webvar" is exactly how a
+        read-only guarantee stops being true.
+
+        Every endpoint used with this must be one observed in a real capture.
+        The project rule is that no protocol fact is asserted unless it can be
+        sourced; the fixtures under ``tests/unit/fixtures/asp/`` are that source,
+        and an endpoint absent from them is a guess.
+
+        Raises whatever :func:`~...webvar.parse_webvar` raises on a malformed
+        body -- deliberately not smoothed into an empty result, since a silently
+        empty record list is indistinguishable from a device with nothing to
+        report.
+        """
+        path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
+        op = operation or f"get_webvar:{endpoint}"
+        body = self._request("GET", path, operation=op).text
+        return parse_webvar(body, endpoint=endpoint, operation=op)
 
     def get_host_status(self) -> str:
         """Fetch the raw ``hoststatus.asp`` response body.

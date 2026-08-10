@@ -1,0 +1,8 @@
+minor_changes:
+  - Add ``asmb8_postcode``, a read-only module that reads the current BIOS POST code from
+    ``getpostcode.asp`` and, with ``sample=true``, polls it repeatedly over a bounded duration to
+    return the observed sequence and the distinct codes seen. With IPMI Serial-over-LAN confirmed
+    dead on this board and ``asmb8_console`` unable to decode video, this is this collection's only
+    remote signal of boot progress. Reports raw POST code values only -- no code-to-meaning table
+    is included or invented, since none is sourced for this BIOS. Sampling is bounded and
+    serialized on purpose, given this BMC's HTTP/1.0, no-keep-alive, 20-session-cap web server.

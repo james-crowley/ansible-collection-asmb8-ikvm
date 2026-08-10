@@ -36,3 +36,15 @@ action_groups:
     - asmb8_console
     - asmb8_reset
     - asmb8_http_origin
+    # Read-only informational modules over the BMC's own .asp interface. Every
+    # endpoint they use is sourced from a real capture checked in under
+    # tests/unit/fixtures/asp/ -- see docs/protocol-notes.md.
+    - asmb8_postcode
+    - asmb8_sel
+    - asmb8_sensors
+    - asmb8_inventory
+    - asmb8_users
+    - asmb8_network
+    - asmb8_sessions
+    - asmb8_alerts
+    - asmb8_auditlog

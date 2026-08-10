@@ -104,7 +104,38 @@ ansible-galaxy collection install git+https://github.com/james-crowley/ansible-c
 | [`asmb8_reset`](plugins/modules/asmb8_reset.py) | Cold/warm-reset the BMC's management controller over IPMI — the recovery escape hatch for a wedged media session | Yes (BMC only; host power is unaffected) |
 | [`asmb8_http_origin`](plugins/modules/asmb8_http_origin.py) | Run (or stop) an ephemeral, path-confined, lifetime-capped local HTTP file server, for installers that fetch bulk files over LAN-speed HTTP instead of the slower iUSB path | No (local process only; does not touch the BMC) |
 
-All eight are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
+### Informational modules
+
+These read the BMC's own `.asp` web-management interface. Every endpoint they
+use is sourced from a capture of real hardware, checked in as fixtures under
+`tests/unit/fixtures/asp/` — see [`docs/protocol-notes.md`](docs/protocol-notes.md).
+**All of them are strictly read-only**: they issue `GET` requests and have no
+`state` option, so none of them can change BMC configuration. Where a write
+would be useful, each module's documentation describes what it would look like
+and why it is deliberately absent.
+
+| Module | Purpose | Mutates BMC? |
+|---|---|---|
+| [`asmb8_postcode`](plugins/modules/asmb8_postcode.py) | Read the BIOS POST code, optionally sampling it over a bounded window — the only out-of-band view of boot progress this board offers, since Serial-over-LAN does not work on it | No |
+| [`asmb8_sel`](plugins/modules/asmb8_sel.py) | Read the System Event Log and its policy. The IPMI path is generally preferable; this exists for web-management-only reachability and cross-checking | No (clearing is deliberately not offered) |
+| [`asmb8_sensors`](plugins/modules/asmb8_sensors.py) | Temperature, voltage and fan readings with decoded units. Discrete/event-only sensors report a null reading rather than a meaningless placeholder | No |
+| [`asmb8_inventory`](plugins/modules/asmb8_inventory.py) | BMC firmware and auxiliary revision, device and product IDs, FRU area and platform feature list | No |
+| [`asmb8_users`](plugins/modules/asmb8_users.py) | Configured accounts, their status and role groups. Unconfigured slots are reported as counts, not as accounts | No |
+| [`asmb8_network`](plugins/modules/asmb8_network.py) | LAN channel, IP configuration, DNS and interface bonding | No |
+| [`asmb8_sessions`](plugins/modules/asmb8_sessions.py) | Per-service state, plain and secure ports, timeouts and session limits | No |
+| [`asmb8_alerts`](plugins/modules/asmb8_alerts.py) | Alerting configuration grouped by intent: where alerts go (SMTP, LAN destinations) and what fires them (event filters, policies, triggers) | No |
+| [`asmb8_auditlog`](plugins/modules/asmb8_auditlog.py) | Audit log entries and the logging configuration | No (clearing is deliberately not offered) |
+
+**Credential-shaped values are never returned.** Where the BMC exposes one —
+an SMTP password, a DNS TSIG key, SSH key material, a user's email address —
+these modules return a boolean such as `password_configured` instead of the
+value. Field extraction is allow-list based, so a field on a firmware revision
+this project has not captured is dropped rather than passed through. Audit log
+entries are the one exception and are returned verbatim: sanitising free-text
+log entries would corrupt the record and give false assurance, so they may
+contain usernames or addresses and are documented as such.
+
+All seventeen are named in `meta/runtime.yml`'s `asmb8_ikvm` action group. Set
 their shared connection options centrally with `module_defaults`:
 
 ```yaml

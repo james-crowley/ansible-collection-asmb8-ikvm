@@ -1,0 +1,15 @@
+minor_changes:
+  - >-
+    asmb8_sensors - new read-only module for ``getallsensors.asp`` (48 real sensor records on the
+    target board). Scales ``SensorReading`` by the empirically-derived factor of 1000 into
+    ``reading.value`` (cross-checked against nominal rail voltages, a plausible CPU temperature, and
+    a plausible fan speed in the fixture) rather than presenting ``RawReading`` directly -- the
+    voltage sensors in particular prove ``RawReading`` alone is not a usable value. Splits sensors
+    into ``threshold`` (a real analog reading) versus ``discrete`` (event/state-only, where
+    ``SensorReading`` has been observed to carry a placeholder rather than a real value) using each
+    record's own ``SettableReadableFlags`` field. Decodes ``sensor_type``/reading unit from the
+    standard IPMI specification's Sensor Type/Unit Type Codes tables, leaving the vendor-OEM sensor
+    type range unmapped rather than inventing a name for it. Supports filtering by sensor name/type
+    and always groups the result by decoded type name. Documents how this differs from reading
+    sensors generically over IPMI via ``pyghmi`` (already a dependency of this collection) and when
+    to prefer each. Added to ``meta/runtime.yml``'s ``asmb8_ikvm`` action group.
