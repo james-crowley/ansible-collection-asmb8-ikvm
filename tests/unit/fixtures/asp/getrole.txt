@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GET_ROLE = 
+ { 
+ WEBVAR_STRUCTNAME_GET_ROLE : 
+ [ 
+ { 'CURUSERNAME' : 'admin','CURPRIV' : 4,'EXTENDED_PRIV' : 259 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

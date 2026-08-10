@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETEMAILFORMAT = 
+ { 
+ WEBVAR_STRUCTNAME_GETEMAILFORMAT : 
+ [ 
+ { 'EMAIL_FORMAT' : 'AMI-Format' },  { 'EMAIL_FORMAT' : 'FixedSubject-Format' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

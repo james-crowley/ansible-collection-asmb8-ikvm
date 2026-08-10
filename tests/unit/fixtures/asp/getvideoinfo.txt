@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETVIDEOFILE = 
+ { 
+ WEBVAR_STRUCTNAME_GETVIDEOFILE : 
+ [ 
+ {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

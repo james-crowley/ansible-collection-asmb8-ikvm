@@ -1,0 +1,9 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETLDAPCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETLDAPCFG : 
+ [ 
+ { 'ENABLE' : 0,'SSLENABLE' : 0,'PORTNUM' : 389,'IP' : '','BINDDN' : '','SEARCHBASE' : '','ATTRIBUTEOFUSERLOGIN' : 'cn' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end

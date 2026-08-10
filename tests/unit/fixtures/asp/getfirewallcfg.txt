@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETFWALLCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETFWALLCFG : 
+ [ 
+ { 'BLOCKALL' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETTRIGCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETTRIGCFG : 
+ [ 
+ { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  { 'ENABLE' : 0,'TIMESTAMP' : 1786380766 },  { 'ENABLE' : 0,'TIMESTAMP' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

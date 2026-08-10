@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_VIEWSSLCERT = 
+ { 
+ WEBVAR_STRUCTNAME_VIEWSSLCERT : 
+ [ 
+ { 'Version' : '3','SerialNo' : '92046422C980E206','SignAlg' : 'sha256WithRSAEncryption','PublicKey' : '','FromCommonName' : 'AMI','FromOrganization' : 'American Megatrends Inc','FromOrgUnit' : 'Service Processors','FromCity' : 'Atlanta','FromState' : 'Georgia','FromCountry' : 'US','FromEmailID' : 'support@ami.com','ValidFrom' : 'Jun  1 07:01:56 2016 GMT','ValidTo' : 'May 30 07:01:56 2026 GMT','ToCommonName' : 'AMI','ToOrganization' : 'American Megatrends Inc','ToOrgUnit' : 'Service Processors','ToCity' : 'Atlanta','ToState' : 'Georgia','ToCountry' : 'US','ToEmailID' : 'support@ami.com' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

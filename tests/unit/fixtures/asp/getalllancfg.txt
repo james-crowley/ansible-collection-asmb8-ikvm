@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETALLNETWORKCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETALLNETWORKCFG : 
+ [ 
+ { 'channelNum' : 1,'lanEnable' : 1,'macAddress' : '00:00:5E:00:53:00','v4IPSource' : 2,'v4IPAddr' : '192.0.2.10','v4Subnet' : '192.0.2.10','v4Gateway' : '192.0.2.10','v6Enable' : 1,'v6IPSource' : 2,'v6IPAddr' : '::','v6Prefix' : 0,'v6Gateway' : '::','vlanEnable' : 0,'vlanID' : 0,'vlanPriority' : 0 },  { 'channelNum' : 8,'lanEnable' : 1,'macAddress' : '00:00:5E:00:53:00','v4IPSource' : 1,'v4IPAddr' : '192.0.2.10','v4Subnet' : '192.0.2.10','v4Gateway' : '192.0.2.10','v6Enable' : 1,'v6IPSource' : 2,'v6IPAddr' : '::','v6Prefix' : 0,'v6Gateway' : '::','vlanEnable' : 0,'vlanID' : 0,'vlanPriority' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

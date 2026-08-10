@@ -1,0 +1,7 @@
+minor_changes:
+  - Add ``plugins/module_utils/webvar.py``, a parser for AMI MegaRAC's ``.asp`` WEBVAR/JSONVAR
+    response format (the JavaScript-object-literal shape returned by endpoints such as
+    ``getdatetime.asp``, ``getallsensors.asp`` and ``getfwinfo.asp``), backed by a 54-file
+    corpus of real, redacted responses captured from a live ASMB8-iKVM BMC
+    (``tests/unit/fixtures/asp/``). This is shared foundation for planned read-only
+    reporting modules and does not itself change any existing module's behavior.

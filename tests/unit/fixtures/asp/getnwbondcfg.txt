@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETNWBONDCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETNWBONDCFG : 
+ [ 
+ { 'BOND_ENABLE' : 0,'BOND_MODE' : 0,'BOND_IFC' : 1,'VLAN_ENABLE' : 0,'AUTO_CONF' : 1 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

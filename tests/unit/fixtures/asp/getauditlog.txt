@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETAUDITLOG = 
+ { 
+ WEBVAR_STRUCTNAME_GETAUDITLOG : 
+ [ 
+ { 'AUDIT_LOG' : 'Aug 11 00:48:53 localhost webgo: [2615 INFO]WEBGUI user admin login successfully from 192.0.2.10' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

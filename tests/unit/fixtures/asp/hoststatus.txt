@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_SYSTEM_STATE = 
+ { 
+ WEBVAR_STRUCTNAME_HL_SYSTEM_STATE : 
+ [ 
+ { 'JF_STATE' : 1 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

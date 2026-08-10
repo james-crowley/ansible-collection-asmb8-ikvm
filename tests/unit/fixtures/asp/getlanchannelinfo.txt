@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETLANINFO = 
+ { 
+ WEBVAR_STRUCTNAME_GETLANINFO : 
+ [ 
+ { 'ETH_INDEX' : 0,'INTERFACE_NAME' : 'eth0','CHANNEL_NUM' : 1,'INTERFACE_ENABLE' : 1 },  { 'ETH_INDEX' : 1,'INTERFACE_NAME' : 'eth1','CHANNEL_NUM' : 8,'INTERFACE_ENABLE' : 1 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

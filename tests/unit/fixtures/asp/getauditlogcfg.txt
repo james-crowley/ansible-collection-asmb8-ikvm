@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETAUDITLOGCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETAUDITLOGCFG : 
+ [ 
+ { 'RM_ENABLE' : 0,'SD_ENABLE' : 0,'REMOTE_STATUS' : 0,'SDCARD_STATUS' : 0,'IP_ADDR' : '','REMOTE_PATH' : '/home','SHR_TYPE' : 0,'UNAME' : '','PWORD' : '','DOMAIN_NAME' : '' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

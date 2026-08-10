@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETSELCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETSELCFG : 
+ [ 
+ { 'SEL_POLICY' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

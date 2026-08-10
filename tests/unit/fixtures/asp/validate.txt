@@ -1,0 +1,9 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_WEB_SESSION_VALIDATE = 
+ { 
+ WEBVAR_STRUCTNAME_WEB_SESSION_VALIDATE : 
+ [ 
+ { 'JViewerCount' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end

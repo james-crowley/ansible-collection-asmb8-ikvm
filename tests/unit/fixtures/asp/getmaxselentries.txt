@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_MAXSELENTRIES = 
+ { 
+ WEBVAR_STRUCTNAME_MAXSELENTRIES : 
+ [ 
+ { 'COUNT' : 3000 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

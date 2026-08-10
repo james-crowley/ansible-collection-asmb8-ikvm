@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_SSLCERTSTATUS = 
+ { 
+ WEBVAR_STRUCTNAME_SSLCERTSTATUS : 
+ [ 
+ { 'CERT_EXISTS' : 1,'CERT_INFO' : 'Thu Jan  1 08:00:00 1970','PRIVKEY_INFO' : 'Thu Jan  1 08:00:00 1970' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

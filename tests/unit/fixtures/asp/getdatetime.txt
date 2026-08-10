@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETDATETIME = 
+ { 
+ WEBVAR_STRUCTNAME_GETDATETIME : 
+ [ 
+ { 'SECONDS' : 1786409408,'UTCMINUTES' : 480,'TIMEZONE' : 'GMT+8' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

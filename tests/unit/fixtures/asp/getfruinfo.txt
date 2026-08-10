@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_GETALLFRUINFO = 
+ { 
+ WEBVAR_STRUCTNAME_HL_GETALLFRUINFO : 
+ [ 
+ {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

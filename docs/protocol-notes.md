@@ -38,6 +38,15 @@ the underlying dated hardware record.
   reference to any of the other sources here.
 - **[unverified]** — stated explicitly whenever a fact has not been confirmed
   by a live capture, even if it follows logically from something that has.
+- **[asp-corpus 2026-08-10]** — a corpus of 54 real ``.asp`` response bodies,
+  one per endpoint, captured from the target board's own web UI on
+  2026-08-10 (firmware 1.14, aux 1.14.2 — the same board and firmware as the
+  **[live capture]** tag above, captured two days later by a different
+  method: reading the web UI's own RPC traffic rather than a dedicated
+  capture session). Copied into `tests/unit/fixtures/asp/` — see that
+  directory's own `README.md` for redaction details — and parsed by
+  `plugins/module_utils/webvar.py`, whose own docstring cites the same
+  corpus for the parser-level facts §9 below does not repeat.
 
 ## 1. The 32-byte iUSB packet header
 
@@ -383,6 +392,54 @@ encountered where only single-port mode is available, this fact is recorded
 here so that work does not have to start from nothing — but no code in this
 collection has been written against it, and no claim is made about how it
 would behave.
+
+## 9. The `.asp` WEBVAR/JSONVAR response format
+
+**[asp-corpus 2026-08-10]** for everything in this section unless noted
+otherwise. This is the response shape returned by this board's older
+``*.asp`` RPC endpoints — ``getdatetime.asp``, ``getallsensors.asp``,
+``getfwinfo.asp``, and every sibling of them — as opposed to the JNLP
+document (§6-§8 above) or the narrow ``SESSION_COOKIE``/``STOKEN`` login
+fields ``asp.py`` already parses with its own regexes. It is a JavaScript
+object literal, not JSON (every one of the 54 samples uses single-quoted
+keys and string values; zero use double quotes anywhere), which
+``plugins/module_utils/webvar.py`` parses without ever calling ``eval`` — see
+that module's own docstring for the full shape, its sourcing, and exactly
+which corpus fixture backs which claim. This section records only the two
+facts below, because both matter to more than just that parser.
+
+### `getallservicescfg.asp` confirms the media session has no server-side reclaim timeout
+
+`getallservicescfg.asp` reports a `SERVICE_TIMEOUT` field per service. For
+`cd-media`, `fd-media`, and `hd-media` it is **4294967295** (`0xFFFFFFFF`) —
+the ``u32`` "no timeout" sentinel — while `web` and `kvm` report **1800**
+and `ssh` reports **600**. This is the BMC's **own stated configuration**,
+not an inference from behaviour: it directly confirms what this collection's
+`errors.py` (`ErrorClass.BMC_BUSY`'s docstring) and
+[`README.md`](../README.md#known-limitations) had previously stated only as
+something *observed* — that the single-occupancy virtual-media/KVM channel
+has no server-side timeout that will reclaim an abandoned session. The web
+and KVM *listener* services do have a timeout (1800s); the *media device
+services* riding over the JNLP-allocated session do not. Cross-reference
+this fact wherever this collection asserts the "no automatic reclaim" limit
+from observed behaviour alone — it no longer has to be.
+
+### `getfwinfo.asp`'s minor firmware revision is BCD-encoded
+
+`getfwinfo.asp` reports `FirmwareRevision1: 1, FirmwareRevision2: 20`. 20
+decimal is `0x14` hex — i.e. **BCD**-encoded, not a plain decimal minor
+version — which is how this board arrives at reporting itself as firmware
+"1.14": `FirmwareRevision1` (`1`) joined with `FirmwareRevision2` read as two
+BCD digits (`0x14` → `"14"`), not as the decimal number twenty. This is a
+fact about **this specific field's own
+encoding**, observed on this one record, not a general rule that every
+integer field in this response format needs decoding — every other field in
+this same record (`DeviceID`, `DevRevision`, `IPMIVersion`, `CompletionCode`,
+…) is a plain decimal integer, and `webvar.py`'s parser deliberately stays
+generic and does not special-case this field: presenting the "1.14" a human
+expects is a job for whatever future module reads `FirmwareRevision2`, not
+for the shared parser. Do not "simplify" a future consumer of this field by
+printing `20` as if it already were the minor version — it is not.
 
 ## Practical note for contributors
 

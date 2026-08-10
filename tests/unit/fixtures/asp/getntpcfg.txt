@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETNTPCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETNTPCFG : 
+ [ 
+ { 'SERVER_NAME1' : 'pool.ntp.org','SERVER_NAME2' : ' 192.0.2.10','NTP_STATUS' : 1 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

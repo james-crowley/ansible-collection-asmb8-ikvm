@@ -1,0 +1,9 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_WEB_SESSION = 
+ { 
+ WEBVAR_STRUCTNAME_WEB_SESSION : 
+ [ 
+ { SESSION_COOKIE'<REDACTED>','BMC_IP_ADDR' : '192.0.2.10','CSRFTOKEN' : '<REDACTED>' },  {} ],
+ HAPI_STATUS:0 }; 
+//Dynamic data end

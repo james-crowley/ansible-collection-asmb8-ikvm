@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETSERVICECFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETSERVICECFG : 
+ [ 
+ { 'SERVICEID' : 2,'STATE' : 1,'IFCNAME' : 'both','NSPORT' : 7578,'SECPORT' : 7582,'SERVICE_TIMEOUT' : 1800,'MAXSESS' : 132,'CURSESS' : 128 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

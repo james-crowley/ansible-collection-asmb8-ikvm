@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETFWINFO = 
+ { 
+ WEBVAR_STRUCTNAME_GETFWINFO : 
+ [ 
+ { 'CompletionCode' : 0,'DeviceID' : 32,'DevRevision' : 1,'FirmwareRevision1' : 1,'FirmwareRevision2' : 20,'IPMIVersion' : 2,'DevSupport' : 191,'MfgID_0' : 63,'MfgID_1' : 10,'MfgID_2' : 0,'ProdID' : 3699,'AuxFirmwareRevision' : 2,'FirmwareBuildDate' : 'Jan 25 2018','FirmwareBuildTime' : '17:49:02 CST' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_GETRADIUSCFG = 
+ { 
+ WEBVAR_STRUCTNAME_HL_GETRADIUSCFG : 
+ [ 
+ { 'ENABLE' : 0,'PORTNUM' : 1812,'IP' : '','KVMPRIV' : 0,'VMEDIAPRIV' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

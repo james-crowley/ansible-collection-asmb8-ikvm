@@ -1,0 +1,11 @@
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_BUTTON_STATE = 
+ { 
+ WEBVAR_STRUCTNAME_HL_BUTTON_STATE : 
+ [ 
+ { 'PB_STATE' : 1 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+
+
+	

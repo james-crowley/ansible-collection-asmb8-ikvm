@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETFWALLPORTCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETFWALLPORTCFG : 
+ [ 
+ {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

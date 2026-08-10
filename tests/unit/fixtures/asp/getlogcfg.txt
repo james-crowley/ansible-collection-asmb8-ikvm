@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_GETLOGCFG = 
+ { 
+ WEBVAR_STRUCTNAME_HL_GETLOGCFG : 
+ [ 
+ { 'AUDITENABLE' : 1,'SYSLOGENABLE' : 1,'FILESIZE' : 50000,'ROTATECNT' : 0,'SERVERADDR' : '' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

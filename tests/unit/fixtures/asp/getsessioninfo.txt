@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETSESSIONCFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETSESSIONCFG : 
+ [ 
+ { 'SID' : 1,'STYPE' : 1,'IPADDRESS' : '192.0.2.10','UID' : 2,'UNAME' : 'admin','UPRIV' : 4 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

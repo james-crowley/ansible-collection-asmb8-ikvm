@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETPRESERVECFG = 
+ { 
+ WEBVAR_STRUCTNAME_GETPRESERVECFG : 
+ [ 
+ { 'SELECTOR' : 0,'STATUS' : 0 },  { 'SELECTOR' : 1,'STATUS' : 0 },  { 'SELECTOR' : 2,'STATUS' : 0 },  { 'SELECTOR' : 3,'STATUS' : 0 },  { 'SELECTOR' : 4,'STATUS' : 0 },  { 'SELECTOR' : 5,'STATUS' : 0 },  { 'SELECTOR' : 6,'STATUS' : 0 },  { 'SELECTOR' : 7,'STATUS' : 0 },  { 'SELECTOR' : 8,'STATUS' : 0 },  { 'SELECTOR' : 9,'STATUS' : 0 },  { 'SELECTOR' : 10,'STATUS' : 0 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_GETADCONFIG = 
+ { 
+ WEBVAR_STRUCTNAME_GETADCONFIG : 
+ [ 
+ { 'AD_ENABLE' : 0,'AD_SECRETUSER' : '','AD_DOMAINNAME' : '','AD_DOMAINSRVR1' : '','AD_DOMAINSRVR2' : '','AD_DOMAINSRVR3' : '' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

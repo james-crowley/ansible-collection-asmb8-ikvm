@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_HL_GETRADIUSPRIVCFG = 
+ { 
+ WEBVAR_STRUCTNAME_HL_GETRADIUSPRIVCFG : 
+ [ 
+ { 'ACCESSLEVEL' : 4,'VENDORDATA' : 'H=4' },  { 'ACCESSLEVEL' : 3,'VENDORDATA' : 'H=3' },  { 'ACCESSLEVEL' : 2,'VENDORDATA' : 'H=2' },  { 'ACCESSLEVEL' : 5,'VENDORDATA' : 'H=1' },  { 'ACCESSLEVEL' : 0,'VENDORDATA' : 'H=0' },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+

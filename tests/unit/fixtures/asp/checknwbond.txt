@@ -1,0 +1,10 @@
+
+//Dynamic Data Begin
+ WEBVAR_JSONVAR_CHKNWBONDSUPPORT = 
+ { 
+ WEBVAR_STRUCTNAME_CHKNWBONDSUPPORT : 
+ [ 
+ { 'NIC_COUNT' : 2 },  {} ],  
+ HAPI_STATUS:0 }; 
+//Dynamic data end
+
