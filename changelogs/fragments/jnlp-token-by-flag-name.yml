@@ -1,0 +1,12 @@
+minor_changes:
+  - >-
+    ``asmb8_media`` - add a regression test pinning that the KVM/media token is
+    resolved from the JNLP by flag name rather than by argument position. The
+    shipped parser was already correct; the test exists because a diagnostic
+    harness read the token positionally as the fourth ``<argument>``, which on
+    this firmware is ``-hostname``'s value -- the BMC's own IP address.
+    Authenticating with that made the BMC refuse redirection with an
+    otherwise-undocumented status ``3``, a failure whose only visible symptom
+    was an established-but-idle socket. Status ``3`` means "bad token". The test
+    uses this firmware's real argument order so a future refactor back to index
+    arithmetic fails in CI rather than on hardware.

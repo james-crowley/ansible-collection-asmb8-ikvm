@@ -15,6 +15,7 @@ through a real connection attempt.
 
 from __future__ import annotations
 
+import re
 import ssl
 from unittest.mock import Mock
 
@@ -401,6 +402,44 @@ class TestParseJnlpArguments:
     def test_entity_escaped_values_are_decoded(self):
         arguments = parse_jnlp_arguments("<argument>-note</argument><argument>a &amp; b &lt;tag&gt;</argument>")
         assert arguments == {"note": "a & b <tag>"}
+
+    def test_the_token_is_found_by_flag_name_not_by_position(self):
+        """Regression test for a real failure, 2026-08-09.
+
+        A diagnostic harness read the token positionally as the 4th
+        ``<argument>``. In this board's actual JNLP layout that slot holds
+        ``-hostname``'s value -- the BMC's own IP address. Authenticating with
+        an IP address as the token made the BMC refuse redirection with an
+        otherwise-undocumented ``status 3``, which cost hours and two wasted
+        boot cycles to track down. ``status 3`` means "bad token".
+
+        The argument order below is the order this firmware really emits. The
+        point of the test is that ``kvmtoken`` resolves correctly *even though*
+        a positional read of index 3 would return the hostname instead, so any
+        future refactor back to index arithmetic fails here rather than on
+        hardware.
+        """
+        document = (
+            "<argument>-apptype</argument><argument>JViewer</argument>"
+            "<argument>-hostname</argument><argument>198.51.100.7</argument>"
+            "<argument>-kvmtoken</argument><argument>h4DdmNddY6mlazY1</argument>"
+            "<argument>-kvmsecure</argument><argument>0</argument>"
+            "<argument>-vmsecure</argument><argument>0</argument>"
+            "<argument>-cdstate</argument><argument>1</argument>"
+            "<argument>-cdport</argument><argument>5120</argument>"
+            "<argument>-singleportenabled</argument><argument>0</argument>"
+        )
+        arguments = parse_jnlp_arguments(document)
+
+        assert arguments["kvmtoken"] == "h4DdmNddY6mlazY1"
+        # The trap, stated explicitly: index 3 is the hostname, not the token.
+        raw = re.findall(r"<argument>\s*(.*?)\s*</argument>", document, re.DOTALL)
+        assert raw[3] == "198.51.100.7"
+        assert arguments["kvmtoken"] != raw[3]
+        # The other fields the media path depends on must survive too.
+        assert arguments["cdport"] == "5120"
+        assert arguments["vmsecure"] == "0"
+        assert arguments["cdstate"] == "1"
 
 
 class TestAllocateMediaSession:
