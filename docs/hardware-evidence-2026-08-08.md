@@ -456,6 +456,66 @@ not been taken yet: a timestamp immediately before and after the client's own
 and the next inbound request arriving (BMC-side turnaround). Whichever side
 that gap lands on is the next real lead — not another socket option.
 
+## A sub-megabyte iPXE bootstrap boots over iUSB — confirmed
+
+Observed 2026-08-09. This is the finding the "small bootstrap, bulk over HTTP"
+approach depends on, and it holds.
+
+A custom iPXE image built with an embedded script — **933,888 bytes, 0.89 MiB**
+— was served as a virtual CD-ROM and booted by this board, twice in a row, from
+a cold `reset`. Read trace of one boot:
+
+| elapsed | reads | MiB | max LBA |
+|---|---|---|---|
+| 1.3 min | 22 | 0.04 | 34 |
+| 2.0 min | 42 | 0.58 | 304 |
+| 3.0 min | 42 | 0.58 | 304 |
+
+Then reads **stop permanently**. That is the distinguishing signature: iPXE is
+loaded wholly into RAM by the bootloader, so once it is running it never touches
+the media again — unlike an OS installer, which reads throughout its run. Only
+~0.58 MiB of the image is ever read (the El Torito boot image, not the whole
+ISO), and the elapsed time is dominated by POST, not transfer.
+
+Opcode profile across two boots, all handled, none unknown:
+
+```
+TEST_UNIT_READY=49, READ_CAPACITY10=2, READ10=104, READ_TOC=3,
+AMI_ACK=1, AMI_CTRL_F3=4
+```
+
+**Why this matters.** Against a 1,628 MiB installer ISO at ~790 KB/s (~35
+minutes, and a real attempt failed partway), a 0.89 MiB bootstrap is ~1.2
+seconds of transfer. The BMC's throughput ceiling stops being a problem to
+solve and becomes a constraint to route around.
+
+**What is NOT yet proven: the HTTP hand-off.** With an ephemeral HTTP origin
+confirmed listening on the controller and reachable from the controller's own
+LAN address, **no request from the booted iPXE ever arrived.** So iPXE runs but
+does not reach the origin. Unresolved, and worth noting the topology: the BMC,
+the host NIC, and the controller are each on different VLANs routed through a
+common gateway, and a sibling design elsewhere sets a static network tuple in
+its bootstrap precisely because an earlier attempt failed to obtain a DHCP
+lease. Whether this is a missing lease, a routing/filtering boundary, or a
+script fault is undetermined; the console holds the answer and has not been read.
+
+### An instrumentation failure worth recording
+
+Three earlier runs of this same test reported `reads=0` and were read as "the
+host never touched the disc." **That conclusion was false and the cause was the
+measuring instrument.** The harness's frame hook is called as
+`hook(direction, data)` — `direction` being the string `"rx"`/`"tx"`, with the
+SCSI opcode at `data[32:][9]`. The test's hook assumed
+`hook(opcode, payload)`, so its counters were keyed by `"rx"`/`"tx"` and the
+`op == 0x28` comparison could never be true. The counter was **structurally
+incapable of registering a read**, and its zero carried no information at all.
+
+Two boot cycles and a wrong diagnosis (a "wedged" media slot, plus an
+unnecessary BMC cold reset) were spent on that zero. The rule it earns:
+**before concluding that hardware did nothing, confirm the instrument can
+register a positive.** A single known-good comparison — here, the working
+harness in the same directory — would have exposed it immediately.
+
 ## Redirection rejection status `3` means "bad token"
 
 Observed and then **resolved** 2026-08-09. Recorded in full because the
@@ -546,11 +606,13 @@ keyed on ping therefore reports success while the web stack is still down.
   only CD-ROM has been exercised.
 - **Any board other than this one.** One machine, one firmware version. This is
   repeatability at best, not a compatibility guarantee.
-- **Whether this board boots a small iPXE image over iUSB.** A custom iPXE build
-  with an embedded chain script was produced at **0.89 MiB** — against a 1,628
-  MiB installer ISO, that is what the bootstrap approach rests on. It has **not**
-  been booted on hardware: both attempts were blocked by the status `3` refusal
-  above, so nothing is yet known about whether the board accepts it.
+- **The HTTP hand-off from a booted iPXE bootstrap.** iPXE itself boots over
+  iUSB (confirmed above, twice), but no request from it has ever reached an
+  HTTP origin on the controller. Cause undetermined — missing DHCP lease,
+  routing/filtering between VLANs, or a fault in the embedded script. Until
+  this works, the bootstrap approach is half-proven: the hard part (does the
+  board boot a tiny image over a slow channel?) is answered yes; the easy-
+  sounding part is not.
 - **The cause of the residual ~30 ms per read** (network RTT to the BMC is
   ~5 ms). `TCP_NODELAY` was tried and produced no measurable change in a
   controlled A/B test, which rules it out as the dominant cause but does not
