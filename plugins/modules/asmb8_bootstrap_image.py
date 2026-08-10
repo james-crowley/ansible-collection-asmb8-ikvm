@@ -253,6 +253,39 @@ def argument_spec() -> dict[str, dict]:
     }
 
 
+class _CommandResult:
+    """The shape ``bootstrap_image.build_bootstrap_image`` expects from its runner.
+
+    ``AnsibleModule.run_command`` returns a ``(rc, stdout, stderr)`` tuple, while the
+    builder is written against an object with ``returncode``/``stdout``/``stderr``.
+    This adapts one to the other rather than bending either: the builder stays
+    testable with a plain fake, and the module still shells out through Ansible's
+    own runner, which handles argument quoting, environment and error reporting --
+    and which ``ansible-test``'s ``ansible-bad-function`` check requires instead of
+    a bare ``subprocess`` call.
+    """
+
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _ansible_runner(module):
+    """Return a runner backed by ``module.run_command``.
+
+    ``check_rc=False`` on purpose: the builder inspects ``returncode`` itself so it
+    can raise a ``ProtocolError`` carrying a redacted, length-bounded excerpt of the
+    tool output. Letting Ansible fail the task here instead would lose that.
+    """
+
+    def run(argv, **_kwargs):
+        rc, stdout, stderr = module.run_command(argv, check_rc=False)
+        return _CommandResult(rc, stdout or "", stderr or "")
+
+    return run
+
+
 def build_network_config(params: dict) -> bootstrap_image.NetworkConfig:
     return bootstrap_image.NetworkConfig(
         mode=params["network_mode"],
@@ -316,6 +349,7 @@ def main() -> None:
             size_budget_bytes=params["size_budget_bytes"],
             grub_mkrescue_path=grub_mkrescue_path,
             work_dir=params.get("work_dir"),
+            run_command=_ansible_runner(module),
         )
     except IkvmError as err:
         module.fail_json(**err.to_result(), script=script_text)

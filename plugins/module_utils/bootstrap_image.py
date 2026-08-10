@@ -79,11 +79,11 @@ opt-out, not the default.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import ProtocolError, UnsupportedCapabilityError, redact
 
@@ -236,14 +236,27 @@ def build_bootstrap_image(
     size_budget_bytes: int,
     grub_mkrescue_path: str,
     work_dir: str | None = None,
-    run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    run_command: Callable[..., Any],
 ) -> dict:
     """Build the bootstrap ISO at ``output_path`` and enforce ``size_budget_bytes``.
 
-    ``run_command`` defaults to :func:`subprocess.run` but is always
-    overridable -- this is the seam every unit test in this collection's own
-    suite uses to avoid ever invoking a real ``grub-mkrescue``, per this
-    module's own DOCUMENTATION on why that boundary must stay mockable.
+    ``run_command`` is REQUIRED and has deliberately no default. It must be a
+    callable taking an argv list and returning an object with ``returncode``,
+    ``stdout`` and ``stderr`` attributes.
+
+    There is no default on purpose, and the reason is worth recording because a
+    future tidy-up would otherwise reinstate one. Defaulting it to
+    :func:`subprocess.run` reads as a convenience, but ``ansible-test``'s
+    ``ansible-bad-function`` check rejects it: pylint infers the parameter's
+    default at the call site and reports a raw ``subprocess.run`` call, because
+    an Ansible module is expected to shell out through
+    ``AnsibleModule.run_command`` -- which handles argument quoting, environment
+    and error reporting consistently. That failure only appears on newer
+    ansible-core (it was caught by CI on 2.21, having passed locally), so it is
+    easy to reintroduce and slow to notice.
+
+    Requiring the parameter also keeps the seam every unit test in this
+    collection uses to avoid ever invoking a real ``grub-mkrescue``.
 
     Raises :class:`ProtocolError` for a missing/invalid ``ipxe_lkrn_path``, a
     non-zero ``grub-mkrescue`` exit, a missing output file despite a

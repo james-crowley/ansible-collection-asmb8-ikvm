@@ -27,6 +27,10 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> subpr
     return subprocess.CompletedProcess(args=["grub-mkrescue"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _never_called(argv, **kwargs):
+    raise AssertionError(f"run_command must not be invoked; got {argv!r}")
+
+
 class TestRenderIpxeScript:
     def test_static_renders_set_commands_and_never_a_bare_dhcp(self):
         network = bootstrap_image.NetworkConfig(mode="static", address="192.0.2.50", netmask="255.255.255.0", gateway="192.0.2.1")
@@ -112,6 +116,10 @@ class TestBuildBootstrapImage:
                 output_path=str(tmp_path / "out.iso"),
                 size_budget_bytes=bootstrap_image.DEFAULT_SIZE_BUDGET_BYTES,
                 grub_mkrescue_path="grub-mkrescue",
+                # run_command is required now (no subprocess.run default -- see the
+                # builder's docstring). This test raises before any command runs, so
+                # the runner asserts it is never called rather than simulating one.
+                run_command=_never_called,
             )
 
     def test_successful_build_reports_size_and_writes_output(self, tmp_path):

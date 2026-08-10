@@ -1,0 +1,10 @@
+bugfixes:
+  - >-
+    ``asmb8_bootstrap_image`` now shells out through ``AnsibleModule.run_command``
+    rather than a ``subprocess.run`` default, which ``ansible-test``'s
+    ``ansible-bad-function`` check rejects. The builder's injectable runner
+    parameter is now required and has no default, so nothing can silently
+    reintroduce a raw subprocess call, and the module supplies an adapter over
+    Ansible's own runner -- which handles argument quoting, environment and error
+    reporting consistently. Caught by CI on ansible-core 2.21 after passing on
+    2.19 locally.
