@@ -30,9 +30,21 @@ what was actually tested from what was merely believed.
   2016-06-01 to **2026-05-30**. CA-chain validation therefore cannot succeed on
   this board, ever. Fingerprint pinning or an explicit insecure acknowledgement
   are the only workable trust policies.
-- **The BMC's clock is wrong.** It reported `Thu Jan 25 17:40:30 2018`. Never
-  rely on a BMC-supplied timestamp, and note that from the BMC's own point of
-  view its expired certificate is still valid.
+- **The BMC's clock cannot be relied on, but it is not permanently wrong.** On
+  2026-08-08 it reported `Thu Jan 25 17:40:30 2018`. On 2026-08-10
+  `getdatetime.asp` reported the correct current date, with `TIMEZONE 'GMT+8'`.
+  So the 2018 reading was a state it was in, not a fixed defect, and **what
+  caused it is unexplained.** Do not rely on a BMC-supplied timestamp without
+  checking it, and note that while the clock reads 2018 the BMC considers its
+  own expired certificate still valid.
+
+  One tempting explanation is recorded here only to warn against it: the
+  firmware's own build stamp is `Jan 25 2018` at `17:49:02 CST`
+  (`getfwinfo.asp`), nine minutes *after* that 2018 reading, which invites the
+  theory that the clock resets to build time on power loss. That is **not
+  established** — the timing is suggestive and nothing more, and the clock
+  reading correctly two days later fits it poorly. Sourcing it would need the
+  clock observed immediately after a deliberate power loss.
 - **The web server is HTTP/1.0 with no keep-alive**, caps at 20 sessions, and
   keeps **separate worker pools per listener**. Concurrent requests exhausted the
   port-80 pool: the BMC continued completing TCP handshakes while never serving a
@@ -580,6 +592,47 @@ unnecessary BMC cold reset) were spent on that zero. The rule it earns:
 register a positive.** A single known-good comparison — here, the working
 harness in the same directory — would have exposed it immediately.
 
+## Per-read latency is a tail, not a fixed penalty
+
+Measured 2026-08-10, and it **replaces the earlier model**. Previous entries
+described "~30 ms per read" as though every read paid a fixed cost. That figure
+came from dividing reads by elapsed time, so it was a mean, and a mean is the
+wrong summary for this distribution.
+
+Timestamping every inbound `READ10` and taking gaps between consecutive reads,
+excluding gaps over 500 ms as genuine inter-phase idle (n=39, bootloader phase,
+0.89 MiB image):
+
+| statistic | value |
+|---|---|
+| minimum | **7.8 ms** |
+| p10 | 8.8 ms |
+| median | **15.7 ms** |
+| mean | 30.6 ms |
+| p90 | 79.2 ms |
+| maximum | 148.0 ms |
+
+**The floor is ~8 ms, against a network RTT of ~5 ms.** So when the BMC is warm
+it turns a read around in close to network time, and there is no fixed
+per-read penalty to remove. The mean is dragged up by a long tail: the p90 is
+five times the floor. Whatever the cause is, it is **intermittent** — variable
+BMC-side work, scheduling, or contention — not a constant.
+
+That reframes the problem. Hunting for a setting that removes a fixed delay is
+looking for something that does not exist; the question is what produces the
+tail.
+
+**Power Save Mode: inconclusive, leaning negative.** The BMC's virtual-media
+"Power Save Mode" was disabled before this measurement, on the theory that a
+sleeping USB relay would explain both the latency and the read timeouts that
+killed an install. The mean afterwards (30.6 ms) is indistinguishable from the
+~30 ms measured before it, which argues it is not the cause — **but this is not
+a clean A/B and must not be recorded as one.** The two figures come from
+different phases (bootloader single-sector probes here, versus OS bulk
+multi-block reads before), different sample sizes, and different measurement
+methods. A clean test is available and cheap: re-enable the setting and re-run
+the identical probe against the identical image.
+
 ## Redirection rejection status `3` means "bad token"
 
 Observed and then **resolved** 2026-08-09. Recorded in full because the
@@ -677,10 +730,8 @@ keyed on ping therefore reports success while the web stack is still down.
   this works, the bootstrap approach is half-proven: the hard part (does the
   board boot a tiny image over a slow channel?) is answered yes; the easy-
   sounding part is not.
-- **The cause of the residual ~30 ms per read** (network RTT to the BMC is
-  ~5 ms). `TCP_NODELAY` was tried and produced no measurable change in a
-  controlled A/B test, which rules it out as the dominant cause but does not
-  identify the real one. The BMC's own USB-to-TCP relay turnaround on this
-  2014-era AST2400 is the leading candidate, unmeasured directly — see
-  "`TCP_NODELAY` on the media socket" above for the measurement that would
-  settle it.
+- **The cause of the read-latency tail.** `TCP_NODELAY` was tried and produced
+  no measurable change in a controlled A/B, which rules it out. The BMC's own
+  USB-to-TCP relay turnaround remains the leading candidate. See "Per-read
+  latency is a tail, not a fixed penalty" below for what is now measured and
+  what is still open.
