@@ -583,3 +583,111 @@ releases:
       name: asmb8_ntp
       namespace: ''
     release_date: '2026-08-10'
+  0.5.1:
+    changes:
+      bugfixes:
+      - C(AmiLegacyTlsAdapter) - preserve the resolved fingerprint, CA, or explicit
+        insecure trust mode when Requests runs its per-request certificate hook, instead
+        of allowing that hook to replace the adapter's TLS policy.
+      - 'C(AspClient) - detect this BMC''s session-expired HTML page structurally
+        (an HTML document with login/session markers and no C(WEBVAR_JSONVAR_<NAME>))
+        in C(get_host_status())/C(get_webvar())/C(post_webvar())/C(set_webvar()),
+        and raise C(errors.ProtocolError) naming that shape instead of either a generic
+        parse complaint or -- the false positive GitHub issue #5 reported -- returning
+        it as though it were a legitimate response. C(asmb8_info(include_web_session=true))
+        previously could report C(logged_in: true) alongside a C(host_status_raw)
+        that was really this HTML page; C(get_host_status()) now raises on it instead,
+        and that module lets the failure propagate, matching how a rejected login
+        already fails the module outright.'
+      - C(AspClient) - replay the login-issued C(CSRFTOKEN) on every post-login non-C(WEBSES)
+        request, matching the vendor client's URL-based rule and the virtual-media
+        session path observed on hardware.
+      - C(asmb8_http_origin) - bound the background session's own C(shutdown()) call
+        (used both when the startup self-test fails and on a normal C(SIGTERM)/lifetime-cap
+        stop) to a fixed timeout instead of waiting on it indefinitely. C(socketserver.BaseServer.shutdown())
+        blocks on an internal event that only a running C(serve_forever()) loop's
+        own teardown ever sets; waiting on it unconditionally could turn a server
+        thread that never got around to running into a second, unbounded hang at teardown,
+        on top of the one the startup self-test above exists to catch at the start.
+      - 'C(asmb8_http_origin) - stop reporting O(state=serving) on the strength of
+        a bound, listening socket alone (issue #2). A background session now issues
+        one real HTTP request against the address and port it just bound -- fetching
+        a real file under O(path) when one exists, otherwise accepting a well-formed
+        C(404) as the best available proof when there is none -- and only reports
+        O(state=serving) once that request actually returns the expected bytes within
+        a bounded timeout. A session whose socket is listening but that is not actually
+        servicing it for any reason now fails this self-test and reports RV(session_state=error)
+        instead of a receipt nothing downstream can trust; a failed self-test tears
+        the background process down rather than leaving it holding the port. This
+        startup self-test''s own request is never counted in RV(request_count)/RV(bytes_served),
+        which continue to describe real client traffic only.'
+      - '``asmb8_bootstrap_image`` now shells out through ``AnsibleModule.run_command``
+        rather than a ``subprocess.run`` default, which ``ansible-test``''s ``ansible-bad-function``
+        check rejects. The builder''s injectable runner parameter is now required
+        and has no default, so nothing can silently reintroduce a raw subprocess call,
+        and the module supplies an adapter over Ansible''s own runner -- which handles
+        argument quoting, environment and error reporting consistently. Caught by
+        CI on ansible-core 2.21 after passing on 2.19 locally.'
+      minor_changes:
+      - C(asmb8_media) - retain a two-ended trace of SCSI C(READ(10))/C(READ(12))
+        LBA and block-count requests (opcode/LBA/block-count only, never media contents),
+        surfaced via C(operation.observed.read_trace_head) (the earliest 128 requests,
+        for a boot that stalls early) and C(operation.observed.read_trace_tail) (the
+        most recent 128, for a stall deep into an install -- the only real install
+        failure this project has recorded stopped roughly 22,000 reads in, far past
+        what a first-N-only trace could show). C(operation.observed.read_trace_dropped)
+        counts exactly how many requests fall in the discarded gap between the two,
+        so the boundary is never mistakable for contiguous history. The trace lives
+        in an append-only sidecar log next to the session's state file, flushed on
+        every request, so a session that issues tens of thousands of reads costs a
+        small, constant per-request write instead of repeatedly rewriting a growing
+        trace -- and so the trace survives the background session dying unexpectedly
+        (a C(SIGKILL), an OOM kill, a host power event), losing at most the single
+        request that was physically mid-write at the moment of death. Supersedes this
+        same PR's earlier, since-amended 256-entry head-only trace, which could not
+        show where a late-stalling install actually stopped.
+      release_summary: "A bug-fix release, entirely driven by live-hardware reports
+        against 0.5.0. Four\nissues, all of which corrected something this project
+        had inferred rather than\nobserved.\n\n**Fingerprint-pinned TLS did not work
+        at all** \u2014 the documented recommended\ntrust mode could not log in. The
+        pinned ``SSLContext`` was built correctly, but\nRequests' per-request certificate
+        hook then replaced it with chain validation\nagainst the board's self-signed,
+        expired certificate. The adapter now preserves\nthe trust mode it already
+        resolved. A real self-signed TLS 1.2 handshake fixture\nusing this board's
+        cipher set now covers all four trust modes; there was\npreviously no test
+        that completed a handshake at all.\n\n**Authenticated reads need the CSRF
+        token.** This collection had recorded that\n``GET`` reads \"are independently
+        confirmed working without\" it and that\nenforcement was \"unverified\". That
+        was a partial sample generalised into a rule:\nthe endpoints tested by hand
+        happen not to enforce it, while several network\nendpoints reject the request
+        with session-expired HTML. Enforcement is\nper-endpoint, and the token is
+        now replayed on every non-login request, matching\nthe vendor client's own
+        rule. That same wrong inference had been hiding the\nanswer to a behaviour
+        recorded as unexplained \u2014 ``getremotesession.asp``\nanswering a programmatic
+        client with a session-expired page.\n\n**``asmb8_http_origin`` could report
+        success while every request to it hung.**\nIt persisted a serving state on
+        the strength of a bound listening socket alone,\nand a bound socket lets the
+        kernel queue connections with nobody accepting them.\nA real, bounded request
+        now runs against the exact bound address before success\nis reported, and
+        a failure tears the daemon down instead of returning a green\nreceipt. Fixing
+        it surfaced a second defect: the shutdown path blocked forever\nwhen the accept
+        loop had never run, which is precisely the case being guarded.\n\n**Nothing
+        detected session-expired responses**, so a read could return\n``logged_in:
+        true`` beside a session-expired body \u2014 a confident wrong answer,\nwhich
+        is worse than a failure. There is now a structural detector, deliberately\nnot
+        keyed on byte length or digest, with a test that it does not misfire on any\nof
+        the legitimate captured responses.\n\nAlso: the virtual-media read trace added
+        in 0.5.0 kept only the earliest\nentries, which cannot show where a late failure
+        stopped. It now retains both\nends, and moved out of the per-request atomic
+        state rewrite into an appended\nsidecar \u2014 an unclean death loses at most
+        one entry.\n\nUnchanged: this release is still **not hardware-qualified**,
+        and a completed\nunattended operating-system install remains unproven.\n"
+    fragments:
+    - 0.5.1-release-summary.yml
+    - bootstrap-run-command.yml
+    - http-origin-startup-self-test.yml
+    - live-tls-csrf.yml
+    - media-read-trace.yml
+    - session-expired-detection.yml
+    - tls-pin-handshake-fixture.yml
+    release_date: '2026-08-11'

@@ -2,33 +2,102 @@
 
 **Topics**
 
-- <a href="#v0-5-0">v0\.5\.0</a>
+- <a href="#v0-5-1">v0\.5\.1</a>
     - <a href="#release-summary">Release Summary</a>
     - <a href="#minor-changes">Minor Changes</a>
-    - <a href="#new-modules">New Modules</a>
-- <a href="#v0-4-0">v0\.4\.0</a>
+    - <a href="#bugfixes">Bugfixes</a>
+- <a href="#v0-5-0">v0\.5\.0</a>
     - <a href="#release-summary-1">Release Summary</a>
     - <a href="#minor-changes-1">Minor Changes</a>
-    - <a href="#bugfixes">Bugfixes</a>
-    - <a href="#new-modules-1">New Modules</a>
-- <a href="#v0-3-0">v0\.3\.0</a>
+    - <a href="#new-modules">New Modules</a>
+- <a href="#v0-4-0">v0\.4\.0</a>
     - <a href="#release-summary-2">Release Summary</a>
     - <a href="#minor-changes-2">Minor Changes</a>
     - <a href="#bugfixes-1">Bugfixes</a>
-    - <a href="#new-modules-2">New Modules</a>
-- <a href="#v0-2-0">v0\.2\.0</a>
+    - <a href="#new-modules-1">New Modules</a>
+- <a href="#v0-3-0">v0\.3\.0</a>
     - <a href="#release-summary-3">Release Summary</a>
-    - <a href="#major-changes">Major Changes</a>
     - <a href="#minor-changes-3">Minor Changes</a>
     - <a href="#bugfixes-2">Bugfixes</a>
-- <a href="#v0-1-0">v0\.1\.0</a>
+    - <a href="#new-modules-2">New Modules</a>
+- <a href="#v0-2-0">v0\.2\.0</a>
     - <a href="#release-summary-4">Release Summary</a>
+    - <a href="#major-changes">Major Changes</a>
+    - <a href="#minor-changes-4">Minor Changes</a>
+    - <a href="#bugfixes-3">Bugfixes</a>
+- <a href="#v0-1-0">v0\.1\.0</a>
+    - <a href="#release-summary-5">Release Summary</a>
     - <a href="#new-modules-3">New Modules</a>
+
+<a id="v0-5-1"></a>
+## v0\.5\.1
+
+<a id="release-summary"></a>
+### Release Summary
+
+A bug\-fix release\, entirely driven by live\-hardware reports against 0\.5\.0\. Four
+issues\, all of which corrected something this project had inferred rather than
+observed\.
+
+<strong>Fingerprint\-pinned TLS did not work at all</strong> — the documented recommended
+trust mode could not log in\. The pinned <code>SSLContext</code> was built correctly\, but
+Requests\' per\-request certificate hook then replaced it with chain validation
+against the board\'s self\-signed\, expired certificate\. The adapter now preserves
+the trust mode it already resolved\. A real self\-signed TLS 1\.2 handshake fixture
+using this board\'s cipher set now covers all four trust modes\; there was
+previously no test that completed a handshake at all\.
+
+<strong>Authenticated reads need the CSRF token\.</strong> This collection had recorded that
+<code>GET</code> reads \"are independently confirmed working without\" it and that
+enforcement was \"unverified\"\. That was a partial sample generalised into a rule\:
+the endpoints tested by hand happen not to enforce it\, while several network
+endpoints reject the request with session\-expired HTML\. Enforcement is
+per\-endpoint\, and the token is now replayed on every non\-login request\, matching
+the vendor client\'s own rule\. That same wrong inference had been hiding the
+answer to a behaviour recorded as unexplained — <code>getremotesession\.asp</code>
+answering a programmatic client with a session\-expired page\.
+
+<strong>\`\`asmb8\_http\_origin\`\` could report success while every request to it hung\.</strong>
+It persisted a serving state on the strength of a bound listening socket alone\,
+and a bound socket lets the kernel queue connections with nobody accepting them\.
+A real\, bounded request now runs against the exact bound address before success
+is reported\, and a failure tears the daemon down instead of returning a green
+receipt\. Fixing it surfaced a second defect\: the shutdown path blocked forever
+when the accept loop had never run\, which is precisely the case being guarded\.
+
+<strong>Nothing detected session\-expired responses</strong>\, so a read could return
+<code>logged\_in\: true</code> beside a session\-expired body — a confident wrong answer\,
+which is worse than a failure\. There is now a structural detector\, deliberately
+not keyed on byte length or digest\, with a test that it does not misfire on any
+of the legitimate captured responses\.
+
+Also\: the virtual\-media read trace added in 0\.5\.0 kept only the earliest
+entries\, which cannot show where a late failure stopped\. It now retains both
+ends\, and moved out of the per\-request atomic state rewrite into an appended
+sidecar — an unclean death loses at most one entry\.
+
+Unchanged\: this release is still <strong>not hardware\-qualified</strong>\, and a completed
+unattended operating\-system install remains unproven\.
+
+<a id="minor-changes"></a>
+### Minor Changes
+
+* C\(asmb8\_media\) \- retain a two\-ended trace of SCSI C\(READ\(10\)\)/C\(READ\(12\)\) LBA and block\-count requests \(opcode/LBA/block\-count only\, never media contents\)\, surfaced via C\(operation\.observed\.read\_trace\_head\) \(the earliest 128 requests\, for a boot that stalls early\) and C\(operation\.observed\.read\_trace\_tail\) \(the most recent 128\, for a stall deep into an install \-\- the only real install failure this project has recorded stopped roughly 22\,000 reads in\, far past what a first\-N\-only trace could show\)\. C\(operation\.observed\.read\_trace\_dropped\) counts exactly how many requests fall in the discarded gap between the two\, so the boundary is never mistakable for contiguous history\. The trace lives in an append\-only sidecar log next to the session\'s state file\, flushed on every request\, so a session that issues tens of thousands of reads costs a small\, constant per\-request write instead of repeatedly rewriting a growing trace \-\- and so the trace survives the background session dying unexpectedly \(a C\(SIGKILL\)\, an OOM kill\, a host power event\)\, losing at most the single request that was physically mid\-write at the moment of death\. Supersedes this same PR\'s earlier\, since\-amended 256\-entry head\-only trace\, which could not show where a late\-stalling install actually stopped\.
+
+<a id="bugfixes"></a>
+### Bugfixes
+
+* C\(AmiLegacyTlsAdapter\) \- preserve the resolved fingerprint\, CA\, or explicit insecure trust mode when Requests runs its per\-request certificate hook\, instead of allowing that hook to replace the adapter\'s TLS policy\.
+* C\(AspClient\) \- detect this BMC\'s session\-expired HTML page structurally \(an HTML document with login/session markers and no C\(WEBVAR\_JSONVAR\_\<NAME\>\)\) in C\(get\_host\_status\(\)\)/C\(get\_webvar\(\)\)/C\(post\_webvar\(\)\)/C\(set\_webvar\(\)\)\, and raise C\(errors\.ProtocolError\) naming that shape instead of either a generic parse complaint or \-\- the false positive GitHub issue \#5 reported \-\- returning it as though it were a legitimate response\. C\(asmb8\_info\(include\_web\_session\=true\)\) previously could report C\(logged\_in\: true\) alongside a C\(host\_status\_raw\) that was really this HTML page\; C\(get\_host\_status\(\)\) now raises on it instead\, and that module lets the failure propagate\, matching how a rejected login already fails the module outright\.
+* C\(AspClient\) \- replay the login\-issued C\(CSRFTOKEN\) on every post\-login non\-C\(WEBSES\) request\, matching the vendor client\'s URL\-based rule and the virtual\-media session path observed on hardware\.
+* C\(asmb8\_http\_origin\) \- bound the background session\'s own C\(shutdown\(\)\) call \(used both when the startup self\-test fails and on a normal C\(SIGTERM\)/lifetime\-cap stop\) to a fixed timeout instead of waiting on it indefinitely\. C\(socketserver\.BaseServer\.shutdown\(\)\) blocks on an internal event that only a running C\(serve\_forever\(\)\) loop\'s own teardown ever sets\; waiting on it unconditionally could turn a server thread that never got around to running into a second\, unbounded hang at teardown\, on top of the one the startup self\-test above exists to catch at the start\.
+* C\(asmb8\_http\_origin\) \- stop reporting O\(state\=serving\) on the strength of a bound\, listening socket alone \(issue \#2\)\. A background session now issues one real HTTP request against the address and port it just bound \-\- fetching a real file under O\(path\) when one exists\, otherwise accepting a well\-formed C\(404\) as the best available proof when there is none \-\- and only reports O\(state\=serving\) once that request actually returns the expected bytes within a bounded timeout\. A session whose socket is listening but that is not actually servicing it for any reason now fails this self\-test and reports RV\(session\_state\=error\) instead of a receipt nothing downstream can trust\; a failed self\-test tears the background process down rather than leaving it holding the port\. This startup self\-test\'s own request is never counted in RV\(request\_count\)/RV\(bytes\_served\)\, which continue to describe real client traffic only\.
+* <code>asmb8\_bootstrap\_image</code> now shells out through <code>AnsibleModule\.run\_command</code> rather than a <code>subprocess\.run</code> default\, which <code>ansible\-test</code>\'s <code>ansible\-bad\-function</code> check rejects\. The builder\'s injectable runner parameter is now required and has no default\, so nothing can silently reintroduce a raw subprocess call\, and the module supplies an adapter over Ansible\'s own runner \-\- which handles argument quoting\, environment and error reporting consistently\. Caught by CI on ansible\-core 2\.21 after passing on 2\.19 locally\.
 
 <a id="v0-5-0"></a>
 ## v0\.5\.0
 
-<a id="release-summary"></a>
+<a id="release-summary-1"></a>
 ### Release Summary
 
 Twenty modules\, and the first one that writes BMC configuration\.
@@ -75,7 +144,7 @@ have not been verified against a genuine build\. <code>docs/capability\-matrix\.
 tiers every claim and <code>docs/netboot\-design\.md</code> section 10 states precisely
 which parts of that design are implemented versus verified\.
 
-<a id="minor-changes"></a>
+<a id="minor-changes-1"></a>
 ### Minor Changes
 
 * <code>asmb8\_ntp</code> \- new module\, this collection\'s first that actually writes BMC configuration\: manages NTP server configuration \(<code>server1</code>/<code>server2</code>/<code>enabled</code>\) via <code>getntpcfg\.asp</code>/<code>setntpcfg\.asp</code>\. Genuinely idempotent \-\- it reads current state first and only writes when something actually differs\, comparing <code>server2</code> byte\-for\-byte \(including a leading space observed in the real capture\) rather than after a friendlier but wrong trimmed comparison\. Returns the prior state alongside the new one so a play can restore it\. <code>check\_mode</code> reads \(login is a real\, unavoidable prerequisite for predicting a write here\) but never writes\. Follows the sourced write convention exactly\: <code>OLD\_NTPSERVER\_NAME1</code> is always sent\, no <code>OLD\_NTPSERVER\_NAME2</code> is ever invented\, and every write resubmits all three fields\, not just the one that changed\. Deliberately does not implement timezone/UTC\-offset options or ever call <code>setdatetime\.asp</code> \-\- see its DOCUMENTATION and <code>docs/asmb8\_ntp\.md</code> for why\, including the explicitly\-flagged\, unsourced inference this module makes to map <code>getntpcfg\.asp</code>\'s <code>NTP\_STATUS</code> \(read\) onto <code>setntpcfg\.asp</code>\'s <code>ISNTPENABLE</code> \(write\)\.
@@ -99,7 +168,7 @@ which parts of that design are implemented versus verified\.
 <a id="v0-4-0"></a>
 ## v0\.4\.0
 
-<a id="release-summary-1"></a>
+<a id="release-summary-2"></a>
 ### Release Summary
 
 Takes the collection from 8 modules to 18\. The new surface is read\-only\: ten
@@ -140,7 +209,7 @@ mocked transport\, which is not the same thing\. <code>docs/capability\-matrix\.
 tiers every claim\, and <code>docs/hardware\-evidence\-2026\-08\-08\.md</code> records the
 dated observations behind them\, including the negative results\.
 
-<a id="minor-changes-1"></a>
+<a id="minor-changes-2"></a>
 ### Minor Changes
 
 * Add <code>asmb8\_identify</code>\, a module that controls the ASMB8\-iKVM chassis identify LED over standard IPMI \(netfn <code>0x00</code>\, cmd <code>0x04</code>\)\, via <code>pyghmi</code>\'s <code>Command\.set\_identify\(\)</code>\. Verified directly against <code>pyghmi</code> 1\.6\.19\'s installed source that this always resolves to the standard command on this board \(American Megatrends has no entry in <code>pyghmi</code>\'s OEM <code>oemmap</code>\, so the lookup falls through to its generic handler\, which is caught internally and never reaches this collection\'s caller\)\. Supports turning the LED on for a bounded duration\, on indefinitely\, or off\; refuses the two combinations that would silently contradict the requested state \(<code>duration</code> set alongside <code>state\=off</code>\, and <code>duration\=0</code> alongside <code>state\=on</code>\) before opening any IPMI session\. Standard IPMI Chassis Identify has no read\-back command\, so this module does not claim idempotence it cannot back up \-\- <code>changed</code> is always <code>true</code> on a real run\, matching <code>asmb8\_reset</code>\'s own honesty about the same kind of gap\, and check mode never opens a connection at all\. Carries no lockout risk \-\- it can only ever change whether a light is lit\.
@@ -158,7 +227,7 @@ dated observations behind them\, including the negative results\.
 * asmb8\_sensors \- new read\-only module for <code>getallsensors\.asp</code> \(48 real sensor records on the target board\)\. Scales <code>SensorReading</code> by the empirically\-derived factor of 1000 into <code>reading\.value</code> \(cross\-checked against nominal rail voltages\, a plausible CPU temperature\, and a plausible fan speed in the fixture\) rather than presenting <code>RawReading</code> directly \-\- the voltage sensors in particular prove <code>RawReading</code> alone is not a usable value\. Splits sensors into <code>threshold</code> \(a real analog reading\) versus <code>discrete</code> \(event/state\-only\, where <code>SensorReading</code> has been observed to carry a placeholder rather than a real value\) using each record\'s own <code>SettableReadableFlags</code> field\. Decodes <code>sensor\_type</code>/reading unit from the standard IPMI specification\'s Sensor Type/Unit Type Codes tables\, leaving the vendor\-OEM sensor type range unmapped rather than inventing a name for it\. Supports filtering by sensor name/type and always groups the result by decoded type name\. Documents how this differs from reading sensors generically over IPMI via <code>pyghmi</code> \(already a dependency of this collection\) and when to prefer each\. Added to <code>meta/runtime\.yml</code>\'s <code>asmb8\_ikvm</code> action group\.
 * roles/asmb8\_baremetal\_install \- document that interrupting a play \(not only a hard C\(kill \-9\)\) can strand the BMC\'s virtual\-media slot on firmware that predates this release\'s <code>SIGTERM</code> fix\, what the symptom looks like \(an C\(ESTABLISHED\) TCP connection to port 5120 with unread bytes and zero SCSI commands serviced\, and no C\(vmedia\: redirection accepted\) log line\)\, and that O\(james\_crowley\.asmb8\_ikvm\.asmb8\_reset\) is the recovery path when software reclamation cannot see the session holding it\.
 
-<a id="bugfixes"></a>
+<a id="bugfixes-1"></a>
 ### Bugfixes
 
 * asmb8\_media \- fix a defect where an uncleanly\-terminated background media\-session daemon \(a <code>SIGTERM</code>\, e\.g\. from an interrupted play or a stray <code>pkill</code>\, previously arriving with no guaranteed effect\) could leave the BMC\'s single\, board\-wide C\(cd\-media\) slot held forever \-\- C\(getallservicescfg\.asp\) confirms this BMC applies no server\-side timeout at all \(C\(SERVICE\_TIMEOUT\: 4294967295\)\) to reclaim it\. The background daemon\'s existing <code>SIGTERM</code> handler is now proven\, by a test that forks a real daemon process and sends it a real <code>SIGTERM</code>\, to route through the exact same normal\-exit teardown a local O\(state\=detached\) call already used \-\- closing the iUSB session \(which sends the TCP C\(FIN\) the BMC needs to free the slot\) before the process exits \-\- rather than merely having a handler registered\. Deliberately not <code>SIGINT</code>\: a backgrounded process inherits C\(SIG\_IGN\) for that signal from its launching shell\'s own job control\, so C\(kill \-INT\) on one is silently swallowed\. The signal handler itself only ever sets a flag \(never touches the network\, a lock\, or any other non\-signal\-safe state\)\, which also makes it naturally idempotent \-\- a second <code>SIGTERM</code> arriving mid\-shutdown is a no\-op\, not a hang or an exception\.
@@ -176,7 +245,7 @@ dated observations behind them\, including the negative results\.
 <a id="v0-3-0"></a>
 ## v0\.3\.0
 
-<a id="release-summary-2"></a>
+<a id="release-summary-3"></a>
 ### Release Summary
 
 Adds the two modules that 0\.2\.0 documented but did not ship\, plus a
@@ -209,7 +278,7 @@ mock coverage of its handshake state machine\. <code>README\.md</code> and
 <code>docs/hardware\-evidence\-2026\-08\-08\.md</code> records the dated observations behind
 every claim\, including the negative results\.
 
-<a id="minor-changes-2"></a>
+<a id="minor-changes-3"></a>
 ### Minor Changes
 
 * <code>asmb8\_media</code> \- add a regression test pinning that the KVM/media token is resolved from the JNLP by flag name rather than by argument position\. The shipped parser was already correct\; the test exists because a diagnostic harness read the token positionally as the fourth <code>\<argument\></code>\, which on this firmware is <code>\-hostname</code>\'s value \-\- the BMC\'s own IP address\. Authenticating with that made the BMC refuse redirection with an otherwise\-undocumented status <code>3</code>\, a failure whose only visible symptom was an established\-but\-idle socket\. Status <code>3</code> means \"bad token\"\. The test uses this firmware\'s real argument order so a future refactor back to index arithmetic fails in CI rather than on hardware\.
@@ -217,7 +286,7 @@ every claim\, including the negative results\.
 * asmb8\_media \- the background media session\'s state file now records idle\-streak bookkeeping \(<code>idle\_polls</code>\, <code>current\_idle\_streak</code>\, <code>last\_idle\_streak</code>\, <code>idle\_poll\_interval\_seconds</code>\) so a post\-mortem can separate a healthy\, expected idle period from a connection that actually broke\, instead of relying on a single point\-in\-time read of <code>updated\_at</code>\. Surfaced under <code>operation\.observed</code> on every <code>asmb8\_media</code> call\.
 * asmb8\_reset \- new module for BMC cold/warm self\-reset over IPMI \(netfn <code>0x06</code> cmd <code>0x02</code>/<code>0x03</code>\)\, promoting the documented manual <code>ipmitool mc reset cold</code> recovery step to a first\-class\, testable module\. Destructive\-adjacent\: drops every active BMC session\, including any in\-flight virtual\-media session\, though the host itself is unaffected \(verified live\: the host stayed powered on and never rebooted across a real cold reset\)\. Supports full <code>check\_mode</code>\, which never opens an IPMI connection at all \-\- a self\-reset has no idempotent \"previous state\" to read\. Added to <code>meta/runtime\.yml</code>\'s <code>asmb8\_ikvm</code> action group\.
 
-<a id="bugfixes-1"></a>
+<a id="bugfixes-2"></a>
 ### Bugfixes
 
 * asmb8\_baremetal\_install \- raise the default <code>asmb8\_baremetal\_install\_handoff\_timeout</code> from <code>3600</code> to <code>7200</code> seconds\. A real\, unattended Proxmox install against the target hardware was killed by the old one\-hour default at 70\% complete\; see the role\'s README \(\"Expected duration\"\) for the sizing arithmetic and how to compute a value for your own ISO\.
@@ -231,7 +300,7 @@ every claim\, including the negative results\.
 <a id="v0-2-0"></a>
 ## v0\.2\.0
 
-<a id="release-summary-3"></a>
+<a id="release-summary-4"></a>
 ### Release Summary
 
 First release intended for Ansible Galaxy\. <code>0\.1\.0</code> was tagged but never
@@ -266,12 +335,12 @@ deliberately so they are not re\-investigated without new evidence\.
 
 * asmb8\_redirection \- rewritten before the first Galaxy release to actually match its name\. It previously opened an IVTP console/KVM session \(closer to what amt\_media does in the sibling james\_crowley\.intel\_amt collection than to what amt\_redirection does\)\; that implementation has moved\, essentially unchanged\, to the new asmb8\_console module\. The name asmb8\_redirection now does what the sibling collection\'s amt\_redirection does\: report\, and \(once a real RPC is confirmed\) toggle\, whether this BMC\'s own listed services \(web\, kvm\, cd\-media\, fd\-media\, hd\-media\, ssh\, telnet\) are enabled\, separately from whether each one\'s TCP port is actually reachable right now\. Without a <code>state</code> option it is read\-only\, exactly like the sibling module\; any <code>state</code> request currently fails with <code>error\_class\=unsupported\_capability</code>\, since no sourced RPC exists yet for toggling a service\'s enablement on this BMC \(see the module\'s own DOCUMENTATION and docs/asmb8\_redirection\.md\)\.
 
-<a id="minor-changes-3"></a>
+<a id="minor-changes-4"></a>
 ### Minor Changes
 
 * asmb8\_console \- new module\, carrying asmb8\_redirection\'s former IVTP console/KVM\-session implementation \(handshake\, <code>capture\=handshake\_only\|raw\_frame\|decoded\_frame</code>\) unchanged in behaviour\. Added to <code>meta/runtime\.yml</code>\'s <code>asmb8\_ikvm</code> action group alongside the other five modules\.
 
-<a id="bugfixes-2"></a>
+<a id="bugfixes-3"></a>
 ### Bugfixes
 
 * <code>asmb8\_media</code> \- disable Nagle\'s algorithm \(<code>TCP\_NODELAY</code>\) on the iUSB media socket\, which Python\'s <code>socket\.create\_connection</code> leaves enabled by default\. iUSB is strictly synchronous request/response\, the traffic shape Nagle handles worst\: each reply is written in a single <code>sendall</code>\, but its final partial segment was previously withheld pending an ACK the peer delays\. This is the theoretically\-correct default for this traffic shape regardless of measured impact\. A controlled A/B test on real hardware \(same install\, same ISO\, same machine\, with and without the option\) found no measurable throughput difference \- the two runs matched within about 2\% throughout and were byte\-identical from roughly the 3\.5\-minute mark onward\. Recorded as a negative result\: this option was not the install\'s latency bottleneck on this hardware\, and should not be re\-investigated for that reason without new evidence\. See <code>docs/hardware\-evidence\-2026\-08\-08\.md</code>\.
@@ -280,7 +349,7 @@ deliberately so they are not re\-investigated without new evidence\.
 <a id="v0-1-0"></a>
 ## v0\.1\.0
 
-<a id="release-summary-4"></a>
+<a id="release-summary-5"></a>
 ### Release Summary
 
 Initial pre\-release\. Out\-of\-band management of ASUS ASMB8\-iKVM baseboard

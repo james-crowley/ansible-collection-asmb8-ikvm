@@ -4,6 +4,71 @@ james\_crowley.asmb8\_ikvm Release Notes
 
 .. contents:: Topics
 
+v0.5.1
+======
+
+Release Summary
+---------------
+
+A bug-fix release, entirely driven by live-hardware reports against 0.5.0. Four
+issues, all of which corrected something this project had inferred rather than
+observed.
+
+**Fingerprint-pinned TLS did not work at all** — the documented recommended
+trust mode could not log in. The pinned ``SSLContext`` was built correctly, but
+Requests' per-request certificate hook then replaced it with chain validation
+against the board's self-signed, expired certificate. The adapter now preserves
+the trust mode it already resolved. A real self-signed TLS 1.2 handshake fixture
+using this board's cipher set now covers all four trust modes; there was
+previously no test that completed a handshake at all.
+
+**Authenticated reads need the CSRF token.** This collection had recorded that
+``GET`` reads "are independently confirmed working without" it and that
+enforcement was "unverified". That was a partial sample generalised into a rule:
+the endpoints tested by hand happen not to enforce it, while several network
+endpoints reject the request with session-expired HTML. Enforcement is
+per-endpoint, and the token is now replayed on every non-login request, matching
+the vendor client's own rule. That same wrong inference had been hiding the
+answer to a behaviour recorded as unexplained — ``getremotesession.asp``
+answering a programmatic client with a session-expired page.
+
+**``asmb8_http_origin`` could report success while every request to it hung.**
+It persisted a serving state on the strength of a bound listening socket alone,
+and a bound socket lets the kernel queue connections with nobody accepting them.
+A real, bounded request now runs against the exact bound address before success
+is reported, and a failure tears the daemon down instead of returning a green
+receipt. Fixing it surfaced a second defect: the shutdown path blocked forever
+when the accept loop had never run, which is precisely the case being guarded.
+
+**Nothing detected session-expired responses**, so a read could return
+``logged_in: true`` beside a session-expired body — a confident wrong answer,
+which is worse than a failure. There is now a structural detector, deliberately
+not keyed on byte length or digest, with a test that it does not misfire on any
+of the legitimate captured responses.
+
+Also: the virtual-media read trace added in 0.5.0 kept only the earliest
+entries, which cannot show where a late failure stopped. It now retains both
+ends, and moved out of the per-request atomic state rewrite into an appended
+sidecar — an unclean death loses at most one entry.
+
+Unchanged: this release is still **not hardware-qualified**, and a completed
+unattended operating-system install remains unproven.
+
+Minor Changes
+-------------
+
+- C(asmb8_media) - retain a two-ended trace of SCSI C(READ(10))/C(READ(12)) LBA and block-count requests (opcode/LBA/block-count only, never media contents), surfaced via C(operation.observed.read_trace_head) (the earliest 128 requests, for a boot that stalls early) and C(operation.observed.read_trace_tail) (the most recent 128, for a stall deep into an install -- the only real install failure this project has recorded stopped roughly 22,000 reads in, far past what a first-N-only trace could show). C(operation.observed.read_trace_dropped) counts exactly how many requests fall in the discarded gap between the two, so the boundary is never mistakable for contiguous history. The trace lives in an append-only sidecar log next to the session's state file, flushed on every request, so a session that issues tens of thousands of reads costs a small, constant per-request write instead of repeatedly rewriting a growing trace -- and so the trace survives the background session dying unexpectedly (a C(SIGKILL), an OOM kill, a host power event), losing at most the single request that was physically mid-write at the moment of death. Supersedes this same PR's earlier, since-amended 256-entry head-only trace, which could not show where a late-stalling install actually stopped.
+
+Bugfixes
+--------
+
+- C(AmiLegacyTlsAdapter) - preserve the resolved fingerprint, CA, or explicit insecure trust mode when Requests runs its per-request certificate hook, instead of allowing that hook to replace the adapter's TLS policy.
+- C(AspClient) - detect this BMC's session-expired HTML page structurally (an HTML document with login/session markers and no C(WEBVAR_JSONVAR_<NAME>)) in C(get_host_status())/C(get_webvar())/C(post_webvar())/C(set_webvar()), and raise C(errors.ProtocolError) naming that shape instead of either a generic parse complaint or -- the false positive GitHub issue #5 reported -- returning it as though it were a legitimate response. C(asmb8_info(include_web_session=true)) previously could report C(logged_in: true) alongside a C(host_status_raw) that was really this HTML page; C(get_host_status()) now raises on it instead, and that module lets the failure propagate, matching how a rejected login already fails the module outright.
+- C(AspClient) - replay the login-issued C(CSRFTOKEN) on every post-login non-C(WEBSES) request, matching the vendor client's URL-based rule and the virtual-media session path observed on hardware.
+- C(asmb8_http_origin) - bound the background session's own C(shutdown()) call (used both when the startup self-test fails and on a normal C(SIGTERM)/lifetime-cap stop) to a fixed timeout instead of waiting on it indefinitely. C(socketserver.BaseServer.shutdown()) blocks on an internal event that only a running C(serve_forever()) loop's own teardown ever sets; waiting on it unconditionally could turn a server thread that never got around to running into a second, unbounded hang at teardown, on top of the one the startup self-test above exists to catch at the start.
+- C(asmb8_http_origin) - stop reporting O(state=serving) on the strength of a bound, listening socket alone (issue #2). A background session now issues one real HTTP request against the address and port it just bound -- fetching a real file under O(path) when one exists, otherwise accepting a well-formed C(404) as the best available proof when there is none -- and only reports O(state=serving) once that request actually returns the expected bytes within a bounded timeout. A session whose socket is listening but that is not actually servicing it for any reason now fails this self-test and reports RV(session_state=error) instead of a receipt nothing downstream can trust; a failed self-test tears the background process down rather than leaving it holding the port. This startup self-test's own request is never counted in RV(request_count)/RV(bytes_served), which continue to describe real client traffic only.
+- ``asmb8_bootstrap_image`` now shells out through ``AnsibleModule.run_command`` rather than a ``subprocess.run`` default, which ``ansible-test``'s ``ansible-bad-function`` check rejects. The builder's injectable runner parameter is now required and has no default, so nothing can silently reintroduce a raw subprocess call, and the module supplies an adapter over Ansible's own runner -- which handles argument quoting, environment and error reporting consistently. Caught by CI on ansible-core 2.21 after passing on 2.19 locally.
+
 v0.5.0
 ======
 

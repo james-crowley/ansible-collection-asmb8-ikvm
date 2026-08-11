@@ -356,7 +356,7 @@ body never lands in a task result verbatim.
 
 ## Project status
 
-**0.5.0 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
+**0.5.1 on Galaxy — pre-1.0, and not yet hardware-qualified.** That is not a
 hedge; it is an accurate description of where this collection is today.
 
 On one ASUS Z10PE-D16 WS / ASMB8-iKVM board (firmware 1.14, aux 1.14.2), this
