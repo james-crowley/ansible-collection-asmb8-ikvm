@@ -70,6 +70,55 @@ port refuses connections outright. This module's own attach flow always
 fetches the JNLP first, so this is transparent to a normal `state=attached`
 call.
 
+**The READ(10)/READ(12) trace: `operation.observed.read_trace_head` /
+`read_trace_tail` / `read_trace_dropped`.** Every SCSI READ(10)/READ(12) the
+background session actually serves is recorded — opcode (`0x28` or `0xa8`),
+LBA, and block count only. **Never media contents, and never credentials.**
+This is a diagnostic aid for exactly one question: *where, in terms of media
+access, did this session get to?*
+
+Two failure shapes motivate keeping BOTH ends rather than only the earliest
+requests:
+
+- A boot that stops **early** — between the firmware catalogue/El Torito
+  boot-image reads and OS handoff (the shape this trace was originally added
+  to answer). The documented boot chain
+  ([hardware-evidence-2026-08-08.md](hardware-evidence-2026-08-08.md), "Boot
+  chain, proven") is under a dozen distinct LBAs, so `read_trace_head`'s first
+  128 entries comfortably cover it.
+- The only real install failure this project has recorded
+  ([hardware-evidence-2026-08-08.md](hardware-evidence-2026-08-08.md), "A real
+  installer reached 70% and then failed on media read timeouts") stopped
+  roughly 22,000 reads into a 32,741-read session, deep in package extraction
+  — far past anything a first-N-only trace could ever show.
+  `read_trace_tail`'s most recent 128 entries answer that shape instead.
+
+`read_trace_head` and `read_trace_tail` are always two **separate** lists,
+never spliced into one — an operator reading a single combined list could
+mistake the seam between "early boot" and "most recent" for two
+adjacent-in-time requests. `read_trace_dropped` is the exact count of
+requests discarded from the middle: `0` means the two lists together are the
+**complete** record with no gap at all; a nonzero value means the boundary
+between the tail's earliest entry and the head's latest entry is that many
+requests apart, not one, so the gap is never mistakable for contiguous
+history.
+
+The trace itself lives in a separate, append-only log next to the session's
+state file (never inside the state file, and never rewritten — only ever
+appended to), specifically so a 32,741-request session costs one small
+`write()` per request instead of rewriting an ever-growing trace on every
+single one. `read_trace_head`/`read_trace_tail`/`read_trace_dropped` are
+reconstructed from that log only when something asks for status — an
+`asmb8_media` call, not the background session's own hot loop — which is at
+most a handful of times over an hour-long install, not 30+ times a second.
+That log is also this trace's crash-durability mechanism: each entry is
+flushed to the OS immediately after being written, so it survives the
+background process dying unexpectedly (a `SIGKILL`, an OOM kill, a host power
+event) with, at worst, the loss of the single entry that was physically
+mid-write at the instant of death — every entry written before it is already
+durable. It is deleted, along with the state and log files, once the session
+is detached or reclaimed.
+
 ## Options
 
 | Option | Type | Default | Required | Choices |
@@ -159,7 +208,7 @@ single-occupancy.
 | `operation.changed` | `bool` | always | Mirrors the top-level `changed`. |
 | `operation.previous` | `dict` | always | The session state as read before this call, or `null` when none existed. |
 | `operation.desired` | `str` | always | `attached` or `detached`, whichever this call requested. |
-| `operation.observed` | `dict` | always | The session state as read after this call, including `bytes_read`, `sectors_served`, `last_request_at`, `updated_at`. `null` in check mode. |
+| `operation.observed` | `dict` | always | The session state as read after this call, including `bytes_read`, `sectors_served`, `last_request_at`, `updated_at`, `read_trace_head`, `read_trace_tail`, `read_trace_dropped` (see the READ(10)/READ(12) trace note above). `null` in check mode. |
 | `operation.error_class` | `str` | always | `null` on success. |
 
 Verified against the `RETURN` block in `plugins/modules/asmb8_media.py`.

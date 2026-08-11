@@ -21,6 +21,25 @@ responsibility" integration target:
   because that is the one thing an in-process server cannot exercise at all.
   Every test in this tier binds and connects on 127.0.0.1 only and always
   cleans up the forked pid, including on failure.
+
+Historical note, because it explains why ``TestSpawnSessionRealFork`` looks
+the way it does: an earlier version of this suite drove request handling
+only against the in-process ``ThreadingHTTPServer`` (tier one above) and
+process lifecycle only through bare ``spawn_session()`` calls that never
+issued a real HTTP request at all (tier two above) -- which meant "a request
+served by a real forked daemon, through its real accept loop" was never
+exercised by *either* tier, only their union, which nothing actually tested.
+That gap is exactly where a real, reported defect (issue #2) lived: the
+daemon persisted V(serving) before its own serving thread was ever confirmed
+to be answering anything, so a caller could see a green receipt while every
+real request against it hung forever. ``TestSpawnSessionRealFork`` now
+always issues a real request against the real forked daemon
+(``test_forked_daemon_actually_serves_a_real_http_request``), and
+``test_daemon_whose_serve_loop_never_actually_runs_reports_error_not_serving``
+below reproduces the defect's exact outward shape (a bound, listening socket
+with nothing on the other end ever calling ``accept()``) through that same
+real fork, to prove the startup self-test in ``_run_daemon`` actually catches
+it rather than merely being present.
 """
 
 from __future__ import annotations
@@ -30,6 +49,7 @@ import http.client
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -42,6 +62,13 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import ht
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import ErrorClass, ProtocolError, UnsupportedCapabilityError
 
 LOOPBACK = "127.0.0.1"
+
+#: Generous margin over ho._SELF_TEST_TIMEOUT_SECONDS for tests that force the
+#: startup self-test to actually hit its own bounded timeout (see
+#: test_daemon_whose_serve_loop_never_actually_runs_reports_error_not_serving) --
+#: covers fork/bind overhead on a loaded box without making a hung self-test
+#: (a bug in the self-test itself, not this suite) wait forever either.
+_SELF_TEST_WAIT_TIMEOUT = ho._SELF_TEST_TIMEOUT_SECONDS + 10.0
 
 
 def _dead_pid() -> int:
@@ -675,6 +702,147 @@ class TestFormatBoundUrl:
 
 
 # ===========================================================================
+# The startup self-test -- see the module docstring's point 4. Exercised here
+# in-process (no fork, reusing the same real ThreadingHTTPServer fixture as
+# TestRealServerRequestHandling above) so the pure success/failure logic of
+# _run_self_test/_find_probe_file/_self_test_connect_host is covered fast and
+# in isolation; TestSpawnSessionRealFork below covers the real forked daemon
+# actually calling this at startup.
+# ===========================================================================
+
+
+class TestFindProbeFile:
+    def test_returns_the_only_file(self, tmp_path):
+        (tmp_path / "file.txt").write_bytes(b"x")
+        assert ho._find_probe_file(tmp_path) == tmp_path / "file.txt"
+
+    def test_sorted_order_is_stable_across_multiple_files(self, tmp_path):
+        (tmp_path / "b.txt").write_bytes(b"b")
+        (tmp_path / "a.txt").write_bytes(b"a")
+        assert ho._find_probe_file(tmp_path) == tmp_path / "a.txt"
+
+    def test_descends_into_nested_directories(self, tmp_path):
+        nested = tmp_path / "nested" / "deeper"
+        nested.mkdir(parents=True)
+        (nested / "deep.txt").write_bytes(b"deep")
+        assert ho._find_probe_file(tmp_path) == nested / "deep.txt"
+
+    def test_empty_directory_returns_none(self, tmp_path):
+        assert ho._find_probe_file(tmp_path) is None
+
+    def test_directory_containing_only_a_subdirectory_with_no_files_returns_none(self, tmp_path):
+        (tmp_path / "empty-subdir").mkdir()
+        assert ho._find_probe_file(tmp_path) is None
+
+    def test_a_symlinked_file_is_skipped_even_when_it_sorts_first(self, tmp_path):
+        outside = tmp_path.parent / "outside-probe-target"
+        outside.mkdir(exist_ok=True)
+        (outside / "real.txt").write_bytes(b"OUTSIDE ROOT")
+        served = tmp_path / "served"
+        served.mkdir()
+        (served / "a-alias.txt").symlink_to(outside / "real.txt")
+        (served / "z-real.txt").write_bytes(b"inside root")
+        assert ho._find_probe_file(served) == served / "z-real.txt"
+
+
+class TestSelfTestConnectHost:
+    def test_wildcard_ipv4_maps_to_loopback(self):
+        assert ho._self_test_connect_host("0.0.0.0") == "127.0.0.1"  # noqa: S104 -- recognising the wildcard, not binding it.
+
+    def test_wildcard_ipv6_maps_to_loopback(self):
+        assert ho._self_test_connect_host("::") == "::1"
+
+    def test_a_real_address_passes_through_unchanged(self):
+        assert ho._self_test_connect_host("127.0.0.1") == "127.0.0.1"
+        assert ho._self_test_connect_host("192.0.2.5") == "192.0.2.5"
+
+
+class TestRunSelfTest:
+    def test_succeeds_against_a_real_file_and_the_request_is_excluded_from_counters(self, running_server):
+        server, root = running_server
+        resolved_root = root.resolve(strict=True)
+        assert server.state["request_count"] == 0
+
+        ok, detail = ho._run_self_test(bind_address=LOOPBACK, port=server.port, root=resolved_root)
+        assert ok is True
+        assert "byte" in detail
+
+        # The self-test's own request must never be mistaken for real client traffic.
+        assert _wait_until(lambda: len(server.access_log_records()) == 1)
+        assert server.state["request_count"] == 0
+        assert server.state["bytes_served"] == 0
+        record = server.access_log_records()[0]
+        assert record["self_test"] is True
+
+        # A real request afterward is counted exactly as before -- the exclusion is
+        # per-request (tagged by the self-test's own header), not a blanket "first
+        # request is free" rule that could also swallow a real one.
+        conn = server.connection()
+        conn.request("GET", "/file.txt")
+        conn.getresponse().read()
+        conn.close()
+        # Wait on the access log itself, not just request_count -- the handler's finally
+        # block updates the counter *then* appends the access-log record, so polling only
+        # the counter is a real, if narrow, race on the second assertion (see _wait_until's
+        # own docstring above for the identical lesson learned elsewhere in this file).
+        assert _wait_until(lambda: len(server.access_log_records()) == 2)
+        assert server.state["request_count"] == 1
+        records = server.access_log_records()
+        assert len(records) == 2
+        assert records[1]["self_test"] is False
+
+    def test_fails_when_nothing_is_listening_on_the_port(self, tmp_path):
+        served = tmp_path / "served"
+        served.mkdir()
+        (served / "file.txt").write_bytes(b"x")
+
+        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe_sock.bind((LOOPBACK, 0))
+        free_port = probe_sock.getsockname()[1]
+        probe_sock.close()  # nothing listens on this port once closed
+
+        ok, detail = ho._run_self_test(bind_address=LOOPBACK, port=free_port, root=served)
+        assert ok is False
+        assert "failed" in detail
+
+    def test_a_wrong_response_body_is_a_failure_not_a_false_positive(self, running_server, monkeypatch):
+        # If the handler ever served the wrong bytes for the probe path (a
+        # confinement or Range regression, say), the self-test must not wave it
+        # through just because *some* 200 came back.
+        server, root = running_server
+        resolved_root = root.resolve(strict=True)
+
+        real_perform = ho._perform_self_test_request
+
+        def _lying_perform(**kwargs):
+            status, _body = real_perform(**kwargs)
+            return status, b"not the real file contents"
+
+        monkeypatch.setattr(ho, "_perform_self_test_request", _lying_perform)
+        ok, detail = ho._run_self_test(bind_address=LOOPBACK, port=server.port, root=resolved_root)
+        assert ok is False
+        assert "expected" in detail
+
+    def test_empty_root_falls_back_to_expecting_a_well_formed_404(self, running_server):
+        server, root = running_server
+        empty_root = root.parent / "genuinely-empty"
+        empty_root.mkdir()
+        ok, detail = ho._run_self_test(bind_address=LOOPBACK, port=server.port, root=empty_root)
+        assert ok is True
+        assert "no file to verify" in detail
+
+    def test_empty_root_self_test_request_is_also_excluded_from_counters(self, running_server):
+        server, root = running_server
+        empty_root = root.parent / "genuinely-empty-2"
+        empty_root.mkdir()
+        assert server.state["request_count"] == 0
+        ok, _detail = ho._run_self_test(bind_address=LOOPBACK, port=server.port, root=empty_root)
+        assert ok is True
+        assert _wait_until(lambda: len(server.access_log_records()) == 1)
+        assert server.state["request_count"] == 0
+
+
+# ===========================================================================
 # spawn_session platform guard
 # ===========================================================================
 
@@ -725,11 +893,11 @@ class _DaemonHandle:
 def spawn(runtime_dir, served_root):
     spawned: list[_DaemonHandle] = []
 
-    def _spawn(*, session_id: str = "test-session", lifetime_seconds: int = 60, port: int = 0, root=None) -> _DaemonHandle:
+    def _spawn(*, session_id: str = "test-session", lifetime_seconds: int = 60, port: int = 0, root=None, bind_address: str = LOOPBACK) -> _DaemonHandle:
         config = ho.SessionConfig(
             session_id=session_id,
             root=str(root or served_root),
-            bind_address=LOOPBACK,
+            bind_address=bind_address,
             port=port,
             lifetime_seconds=lifetime_seconds,
             runtime_dir=str(runtime_dir),
@@ -768,6 +936,98 @@ class TestSpawnSessionRealFork:
         conn.close()
         assert resp.status == 200
         assert body == b"hello world"
+
+    def test_the_daemons_own_startup_self_test_is_never_visible_in_request_count(self, spawn):
+        # Guards the exact confusion the fix's own docs call out: an operator
+        # who checks request_count/bytes_served the instant they see a fresh
+        # 'serving' receipt must see zeros, not 1, even though the daemon has
+        # already issued (and this test does not repeat) one real GET against
+        # itself to earn that receipt in the first place.
+        handle = spawn()
+        state = handle.wait_for_serving()
+        assert state["state"] == ho.STATE_SERVING
+        assert state["request_count"] == 0
+        assert state["bytes_served"] == 0
+        assert state["last_request_at"] is None
+
+        conn = http.client.HTTPConnection(LOOPBACK, state["port"], timeout=5)
+        conn.request("GET", "/file.txt")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        assert resp.status == 200
+
+        # The handler's finally block (state update, access-log append) runs after the
+        # response bytes are already on the wire -- see _wait_until's own docstring above
+        # for why polling here, not a bare read, is what avoids a real timing race.
+        assert _wait_until(lambda: (handle.state() or {}).get("request_count") == 1)
+        final = handle.state()
+        assert final["bytes_served"] == len(body)
+        assert final["last_request_at"] is not None
+
+    def test_binding_the_wildcard_address_is_confirmed_and_reachable_via_loopback(self, spawn):
+        # A real, routable, non-loopback address cannot be exercised safely from
+        # this suite -- see the module docstring's constraints on what these tests
+        # may bind/connect to. 0.0.0.0 (bind to every interface) is nonetheless a
+        # real, legitimate bind_address distinct from the loopback default, and
+        # is exactly the case _self_test_connect_host exists to handle: the
+        # daemon's own startup self-test cannot connect to "0.0.0.0" as a
+        # destination, so it must reach itself via loopback for the session to
+        # ever report serving at all. A real client reaching a wildcard-bound
+        # server via 127.0.0.1 exercises that same path.
+        handle = spawn(bind_address="0.0.0.0")  # noqa: S104 -- the wildcard bind this test exists to cover.
+        state = handle.wait_for_serving()
+        assert state["state"] == ho.STATE_SERVING
+        assert state["bind_address"] == "0.0.0.0"  # noqa: S104 -- asserting on it, not binding it.
+
+        conn = http.client.HTTPConnection(LOOPBACK, state["port"], timeout=5)
+        conn.request("GET", "/file.txt")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        assert resp.status == 200
+        assert body == b"hello world"
+
+    def test_daemon_whose_serve_loop_never_actually_runs_reports_error_not_serving(self, spawn, monkeypatch):
+        # This is the test that would have caught issue #2. It reproduces the
+        # defect's exact outward shape through the real double-forked daemon,
+        # not an in-process stand-in: a socket that is genuinely bound and
+        # listening (so a TCP connect succeeds and the kernel queues it) with
+        # nothing on the other end ever calling accept() on it -- "TCP connect
+        # succeeded repeatedly ... 0 bytes received" from the original report.
+        #
+        # Patching serve_forever() to a no-op *before* spawn_session() forks is
+        # what makes this reachable without depending on the exact, possibly
+        # platform- or load-dependent trigger that produced the defect in the
+        # wild (a diagnostic experiment run alongside this fix could not
+        # reproduce a permanent hang via fork()+threading alone on this host --
+        # see the investigation notes for what was and was not reproducible):
+        # fork() duplicates the whole process, including this monkeypatch, at
+        # the instant of the fork, so the daemon's listening socket is real and
+        # open but its accept loop never runs, regardless of why that might
+        # happen for real.
+        #
+        # Before the fix in _run_daemon, this would have hung the assertions
+        # below on an ever-'starting'/'serving' state and a request that never
+        # returns; see the mutation check for that shown directly against a
+        # throwaway copy of the pre-fix code.
+        monkeypatch.setattr(ho.http.server.ThreadingHTTPServer, "serve_forever", lambda self, **kwargs: None)
+        handle = spawn(lifetime_seconds=30)
+
+        state = ho.wait_for_state(
+            handle.runtime_dir,
+            handle.session_id,
+            until=lambda s: s.get("state") in (ho.STATE_SERVING, ho.STATE_ERROR),
+            timeout=_SELF_TEST_WAIT_TIMEOUT,
+        )
+        assert state is not None, "daemon never wrote a state file at all"
+        assert state["state"] == ho.STATE_ERROR, f"a daemon whose accept loop never runs must report error, not serving -- got {state!r}"
+        assert state["error_class"] == ErrorClass.CONNECTION
+        assert "self-test" in (state["error"] or "")
+
+        # And the process must not be left behind holding the port -- a failed
+        # self-test has to tear the daemon down, not leave an unusable one alive.
+        assert ho.wait_for_exit(handle.pid, timeout=5.0) is True
 
     def test_create_only_write_leaves_the_daemons_own_first_report_alone(self, spawn):
         # spawn_session()'s own fallback write is create-only (see

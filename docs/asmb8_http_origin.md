@@ -105,6 +105,29 @@ Directory listings are never generated — a request that resolves to a
 directory rather than a file is refused (`404`) rather than served as an
 index.
 
+**A `serving` receipt means a real HTTP request was already proven to
+work — not merely that a socket is bound and listening.** A bound, listening
+socket only proves the kernel will accept a TCP connection and queue it; it
+says nothing about whether anything on the other end will ever `accept()`
+it, read the request, and write a response. A real, reported defect (issue
+#2) showed exactly that gap: `state=started` returned `changed=true`,
+`session_state=serving`, and a URL, while a real client's TCP connect
+succeeded repeatedly against it and zero response bytes were ever sent for
+the session's entire lifetime — the state file kept showing
+`request_count=0` and no error, because nothing had actually gone wrong from
+the daemon's own (mistaken) point of view. Before the background process
+ever reports `serving`, it now issues one real GET against the exact address
+and port it just bound — for a real file under `path` when one exists,
+otherwise for a path guaranteed not to exist, accepting a well-formed `404`
+as the best available proof when there is nothing to fetch — and demands the
+expected bytes back within a few seconds. Failing that self-test tears the
+daemon down and reports `error` (`error_class=connection`) instead of a
+receipt nothing downstream could trust. This self-test's own one request is
+never counted in `request_count`/`bytes_served`, which exist to describe
+real client traffic — a caller checking those immediately after a fresh
+`serving` receipt correctly sees `0`, not `1`, before anything downstream has
+connected.
+
 **This module has never been exercised against a real provisioning
 target.** It has real forked-process unit and integration tests (a real
 socket, a real filesystem, real `Range`/traversal handling), which is
@@ -183,12 +206,12 @@ Exceeding this is reported as a warning, not a failure.
 |---|---|---|---|
 | `changed` | `bool` | always | For `state=started`: `true` only when a new background process was actually forked (or, in check mode, would be); `false` when an already-live session for `session_id` was found and confirmed instead. For `state=stopped`: `true` only when a live process was actually asked to stop (or, in check mode, would be); `false` when there was nothing live to stop. |
 | `session_id` | `str` | always | The session id in effect — generated for `state=started` when not supplied. |
-| `session_state` | `str` | always | The last state the background process reported: `starting`, `serving`, `stopped`, or `error`. `unknown` if `state=stopped` found no state file at all. |
+| `session_state` | `str` | always | The last state the background process reported: `starting`, `serving`, `stopped`, or `error`. `unknown` if `state=stopped` found no state file at all. **`serving` means a real HTTP request was already proven to work** — see the Synopsis's dedicated paragraph. |
 | `pid` | `int` | when available | Process id of the background session. `null` if none is recorded. |
 | `url` | `str` | when available | The base URL files under `path` are reachable at, e.g. `http://192.0.2.5:8080/`, built from `bind_address` and the actually-bound `port`. `null` until the background process reports `serving`. |
 | `port` | `int` | when available | The TCP port actually bound — the real value even when `port` was `0`. |
 | `root` | `str` | when available | Resolved, absolute form of `path` as the background process is actually serving it. |
-| `request_count` | `int` | always | Total HTTP requests served (or refused) so far. |
+| `request_count` | `int` | always | Total HTTP requests served (or refused) so far. Never includes the startup self-test's own request — see the Synopsis. |
 | `bytes_served` | `int` | always | Total response body bytes sent so far. |
 | `recovered_stale_session` | `bool` | when a stale session was recovered | `true` when a stale state file (recorded pid no longer running) for `session_id` was found and discarded by this call. |
 | `access_log` | `str` | when available | Path to the per-request JSON-lines log described in the Synopsis. |
@@ -216,7 +239,9 @@ Verified against the `RETURN` block in `plugins/modules/asmb8_http_origin.py`.
 - Any `error_class` the background session itself recorded when its
   `session_state` reached `error` (surfaced via `operation.observed.error_class`
   / the top-level `error_class` on failure) — most commonly `protocol` for a
-  bind failure such as the requested `port` already being in use.
+  bind failure such as the requested `port` already being in use, or
+  `connection` when the startup self-test described in the Synopsis could not
+  get a real response back from the socket the daemon had just bound.
 
 ## Check-mode behaviour
 

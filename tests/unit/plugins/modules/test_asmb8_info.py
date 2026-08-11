@@ -17,9 +17,11 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import requests
 from ansible.module_utils import basic
 from ansible.module_utils.common.text.converters import to_bytes
 
+from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp import AspClient
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.errors import AuthenticationError, ProtocolError, RemoteOperationError
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.webvar import parse_webvar
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.modules import asmb8_info
@@ -105,6 +107,32 @@ def _fake_asp_client_with_fixtures(**fixture_overrides: str) -> Mock:
     client.login.return_value = "session-cookie-not-real"
     client.get_host_status.return_value = "raw hoststatus.asp body"
     client.get_webvar = Mock(side_effect=lambda endpoint, **_kwargs: parse_webvar(fixtures[endpoint], endpoint=endpoint))
+    return client
+
+
+def _mock_response(text: str) -> Mock:
+    response = Mock(spec=requests.Response)
+    response.text = text
+    return response
+
+
+def _real_asp_client_for_host_status(host_status_body: str) -> AspClient:
+    """A real `AspClient`, mocked only at `requests.Session.request`, so `get_host_status()`'s own
+    session-expired detection (see `module_utils/asp.py`) actually runs -- unlike every other test
+    in this file, which replaces the whole client with a `Mock()` and therefore never exercises that
+    check. Used to prove GitHub issue #5's false positive (`logged_in: true` beside a
+    session-expired `host_status_raw`) cannot happen end to end, not just that a stubbed client
+    could be made to report it correctly."""
+
+    def _request(method, url, **_kwargs):
+        if url.endswith("/rpc/WEBSES/create.asp"):
+            return _mock_response("{'SESSION_COOKIE':'test-session-cookie'}")
+        if url.endswith("/rpc/hoststatus.asp"):
+            return _mock_response(host_status_body)
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    client = AspClient(host="10.0.0.5", password="unused-in-tests", use_tls=False, allow_insecure_transport=True)
+    client._http_session.request = Mock(side_effect=_request)
     return client
 
 
@@ -294,6 +322,36 @@ class TestWebSession:
 
         result = _run_fail(dict(BASE_ARGS, include_web_session=True))
         assert result["error_class"] == "authentication"
+
+    def test_a_session_expired_host_status_never_reports_logged_in_true(self, monkeypatch):
+        # GitHub issue #5's false positive, end to end: a REAL AspClient (mocked only at the HTTP
+        # boundary, not stubbed method-by-method) whose hoststatus.asp reply is the session-expired
+        # HTML shape must fail the module outright, never report {"logged_in": True, ...} beside it.
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        real_asp = _real_asp_client_for_host_status(_read_fixture("session_expired.html"))
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: real_asp)
+
+        result = _run_fail(dict(BASE_ARGS, include_web_session=True))
+
+        assert result["error_class"] == "protocol"
+        assert "web_management" not in result
+        assert "logged_in" not in json.dumps(result)
+
+    def test_a_normal_host_status_still_succeeds_end_to_end_with_the_same_real_client(self, monkeypatch):
+        # The companion, positive case for the test above: the same real-client wiring, with an
+        # ordinary hoststatus.asp body, must still report logged_in: true normally -- this new
+        # check must not have made every read fail.
+        fake_ipmi = _fake_ipmi_client()
+        _wire_fake_ipmi_client(monkeypatch, fake_ipmi)
+        real_asp = _real_asp_client_for_host_status(_read_fixture("hoststatus.txt"))
+        monkeypatch.setattr(asmb8_info, "build_asp_client", lambda params: real_asp)
+
+        result = _run_ok(dict(BASE_ARGS, include_web_session=True))
+
+        web_management = result["asmb8"]["web_management"]
+        assert web_management["logged_in"] is True
+        assert web_management["host_status_raw"] == _read_fixture("hoststatus.txt")
 
 
 class TestErrorHandling:

@@ -75,12 +75,33 @@ corpus's fixture for it parses cleanly, so this module's parsing of that
 shape is exercised and correct — but fetching it live, from a programmatic
 client, has been observed to return a session-expired HTML page even with a
 session that had just been freshly authenticated (the same flow works from a
-browser). Why is not yet understood — something beyond the plain session
-cookie appears to be required and has not been identified. This module
-therefore treats a parse failure on this one endpoint as an expected,
-non-fatal outcome (see `remote_session_read`) rather than failing the whole
-run over it. **`remote_session` working at all, on any given run, is
-unverified rather than guaranteed.**
+browser).
+
+**Correction (2026-08-11):** this section previously said the reason "is not
+yet understood" and "has not been identified". [GitHub issue
+#5](https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues/5)
+identified a general mechanism for exactly that symptom on five *other*
+endpoints (`getalllancfg.asp`, `getlanchannelinfo.asp`, `getdnscfg.asp`,
+`getnwbondcfg.asp`, `checknwbond.asp`): a missing `CSRFTOKEN` header, which
+`AspClient` now attaches to every non-`WEBSES` request (see
+`module_utils/asp.py`'s `AspClient._headers()`). Whether `getremotesession.asp`
+itself is one of the endpoints that enforces `CSRFTOKEN` is **not** itself
+confirmed either way — it was not one of the five issue #5 tested — so this
+remains a documented, unverified gap for this specific endpoint, not
+something the general fix is known to have closed; see
+[`asmb8_info`](asmb8_info.md) for the same, independently observed gap.
+`module_utils/asp.py`'s `looks_like_session_expired_html()` now recognises
+this HTML shape structurally — an HTML document with login/session markers
+and no `WEBVAR_JSONVAR_`, matched by shape rather than by the byte length or
+digest issue #5 measured, since either would be brittle across firmware
+revisions — which gives the parse failure below a specific, accurate message
+instead of a generic complaint that gave no hint the response was ever this
+identifiable shape.
+
+This module therefore treats a parse failure on this one endpoint as an
+expected, non-fatal outcome (see `remote_session_read`) rather than failing
+the whole run over it. **`remote_session` working at all, on any given run,
+is unverified rather than guaranteed.**
 
 **This module logs in unconditionally**, for the same reason `asmb8_users`
 does: every endpoint it can actually read requires an authenticated `.asp`

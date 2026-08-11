@@ -72,10 +72,19 @@ description:
     it parses cleanly, so this module's parsing of that shape is exercised and correct -- but
     fetching it live, from a programmatic client, has been observed to return a session-expired
     HTML page even with a session that had just been freshly authenticated (the same flow works
-    from a browser). Why is not yet understood -- something beyond the plain session cookie appears
-    to be required and has not been identified. This module therefore treats a parse failure on
-    this one endpoint as an expected, non-fatal outcome (see RV(remote_session_read)) rather than
-    failing the whole run over it, and this description is the honest statement that RV(remote_session)
+    from a browser). B(Correction:) an earlier version of this description said the reason "is not
+    yet understood" and "has not been identified" -- GitHub issue #5 (2026-08-11, live hardware)
+    identified a general mechanism for exactly this symptom on five B(other) endpoints: a missing
+    C(CSRFTOKEN) header, which C(module_utils/asp.py)'s C(AspClient) now attaches to every
+    non-C(WEBSES) request (see C(AspClient._headers())). Whether C(getremotesession.asp) itself
+    enforces C(CSRFTOKEN) is B(not) itself confirmed either way -- it was not one of the five
+    endpoints issue #5 tested -- so this remains a documented, unverified gap for this specific
+    endpoint, not something the general fix is known to have closed. C(module_utils/asp.py)'s
+    C(looks_like_session_expired_html) now recognises this HTML shape structurally and gives the
+    C(errors.ProtocolError) this module already catches (see below) a specific, accurate message
+    instead of a generic parse complaint. This module therefore treats a parse failure on this one
+    endpoint as an expected, non-fatal outcome (see RV(remote_session_read)) rather than failing
+    the whole run over it, and this description is the honest statement that RV(remote_session)
     working at all, on any given run, is unverified rather than guaranteed.
   - >-
     B(This module logs in), for the same reason M(james_crowley.asmb8_ikvm.asmb8_users) does: every
@@ -595,10 +604,13 @@ def fetch_remote_session_config(asp_client: AspClient) -> tuple[dict[str, Any] |
     """Read ``getremotesession.asp``, degrading an unparseable response to ``None`` rather than failing the module.
 
     See the module description: a session-expired-looking response from this specific endpoint has
-    been observed even immediately after a fresh login, for reasons not yet identified. Only
-    :class:`errors.ProtocolError` is degraded here -- a connection/authentication/timeout failure
-    at this point is a real problem with the run and is allowed to propagate and fail the module,
-    the same as a failure reading any other endpoint.
+    been observed even immediately after a fresh login. GitHub issue #5 identified a missing
+    ``CSRFTOKEN`` header as the general mechanism behind that symptom on five *other* endpoints --
+    whether it also explains this endpoint is not itself confirmed, so this remains a documented,
+    unverified gap here rather than something assumed fixed. Only :class:`errors.ProtocolError` is
+    degraded here -- a connection/authentication/timeout failure at this point is a real problem
+    with the run and is allowed to propagate and fail the module, the same as a failure reading any
+    other endpoint.
     """
     try:
         response = asp_client.get_webvar("getremotesession")

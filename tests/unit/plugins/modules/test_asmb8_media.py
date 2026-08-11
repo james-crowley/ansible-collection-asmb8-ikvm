@@ -275,6 +275,100 @@ class TestIdleStreakReporting:
         assert observed["last_idle_streak"]["seconds"] == 24.0
 
 
+def _write_trace_entries(runtime_dir, session_id: str, entries: list[dict]) -> None:
+    """Write ``entries`` straight to the sidecar log, the same shape the real
+    daemon's ``_on_request`` appends -- see ``media_session.read_trace_log_path``.
+    """
+    path = media_session.read_trace_log_path(runtime_dir, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+
+
+class TestReadTraceReporting:
+    """The READ(10)/READ(12) trace (media_session.py's module docstring point 3;
+    issue #6 item 3) must reach `operation.observed` -- never media contents or
+    credentials, just opcode/LBA/block-count, split into `read_trace_head` (the
+    earliest requests) and `read_trace_tail` (the most recent), with
+    `read_trace_dropped` counting exactly what falls in the gap between them.
+    """
+
+    def test_status_fields_surfaces_a_given_trace_summary(self):
+        trace = {
+            "read_trace_head": [{"opcode": "0x28", "lba": 0, "blocks": 1}],
+            "read_trace_tail": [{"opcode": "0xa8", "lba": 415602, "blocks": 16}],
+            "read_trace_dropped": 44,
+        }
+        fields = asmb8_media._status_fields({"state": "attached"}, trace=trace)
+        assert fields["read_trace_head"] == trace["read_trace_head"]
+        assert fields["read_trace_tail"] == trace["read_trace_tail"]
+        assert fields["read_trace_dropped"] == 44
+
+    def test_status_fields_defaults_read_trace_to_empty_when_no_trace_given(self):
+        fields = asmb8_media._status_fields(None)
+        assert fields["read_trace_head"] == []
+        assert fields["read_trace_tail"] == []
+        assert fields["read_trace_dropped"] == 0
+
+    def test_with_trace_returns_none_unchanged_for_a_none_state(self):
+        # A check-mode attach observes nothing yet -- see _attach's own check_mode
+        # branch, which passes observed=None through untouched.
+        assert asmb8_media._with_trace(None, {"read_trace_head": [], "read_trace_tail": [], "read_trace_dropped": 0}) is None
+
+    def test_with_trace_merges_without_losing_existing_state_fields(self):
+        state = {"state": "attached", "bytes_read": 512}
+        trace = {"read_trace_head": [{"lba": 1}], "read_trace_tail": [], "read_trace_dropped": 0}
+        merged = asmb8_media._with_trace(state, trace)
+        assert merged["state"] == "attached"
+        assert merged["bytes_read"] == 512
+        assert merged["read_trace_head"] == [{"lba": 1}]
+
+    def test_polling_an_existing_session_surfaces_the_trace_via_operation_observed(self, runtime_dir, image):
+        session_id = "trace-reporting-session"
+        media_session._write_state_atomic(
+            runtime_dir, session_id, {"session_id": session_id, "pid": os.getpid(), "state": "attached", "error": None, "bytes_read": 0}
+        )
+        _write_trace_entries(
+            runtime_dir,
+            session_id,
+            [{"opcode": "0x28", "lba": 0, "blocks": 1}, {"opcode": "0x28", "lba": 16, "blocks": 1}],
+        )
+        _set_module_args(_attach_args(runtime_dir=runtime_dir, image=image, session_id=session_id))
+        with patch("ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.media_session.spawn_session") as spawn:
+            with pytest.raises(AnsibleExitJson) as excinfo:
+                asmb8_media.main()
+        result = excinfo.value.kwargs
+        spawn.assert_not_called()  # idempotent: the trace comes from the EXISTING session, nothing new was spawned.
+        observed = result["operation"]["observed"]
+        assert observed["read_trace_head"] == [{"opcode": "0x28", "lba": 0, "blocks": 1}, {"opcode": "0x28", "lba": 16, "blocks": 1}]
+        assert observed["read_trace_tail"] == []
+        assert observed["read_trace_dropped"] == 0
+        assert result["operation"]["observed"] is not None
+
+    def test_detach_surfaces_the_trace_before_the_sidecar_log_is_removed(self, runtime_dir, image):
+        # remove_state() deletes the sidecar log (media_session.remove_state's own
+        # docstring) -- this pins that _detach() reads the trace BEFORE that
+        # happens, so a detach's own receipt is not silently empty.
+        session_id = "detach-trace-session"
+        media_session._write_state_atomic(
+            runtime_dir, session_id, {"session_id": session_id, "pid": os.getpid(), "state": "attached", "error": None, "bytes_read": 0}
+        )
+        _write_trace_entries(runtime_dir, session_id, [{"opcode": "0xa8", "lba": 415602, "blocks": 16}])
+        _set_module_args({**BASE_ARGS, "state": "detached", "runtime_dir": runtime_dir, "session_id": session_id})
+        with (
+            patch("ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.media_session.request_stop"),
+            patch("ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.media_session.wait_for_exit", return_value=True),
+        ):
+            with pytest.raises(AnsibleExitJson) as excinfo:
+                asmb8_media.main()
+        result = excinfo.value.kwargs
+        observed = result["operation"]["observed"]
+        assert observed["read_trace_head"] == [{"opcode": "0xa8", "lba": 415602, "blocks": 16}]
+        # And the sidecar itself really is gone afterward -- this call cleaned up.
+        assert not media_session.read_trace_log_path(runtime_dir, session_id).exists()
+
+
 class TestSingleSessionReclamation:
     """The "eject/reset before insert" step: always run, never a fallback."""
 

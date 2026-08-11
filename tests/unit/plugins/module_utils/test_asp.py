@@ -16,15 +16,25 @@ through a real connection attempt.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import ipaddress
 import re
 import ssl
+import threading
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
 
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils import asp
 from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp import (
@@ -34,6 +44,7 @@ from ansible_collections.james_crowley.asmb8_ikvm.plugins.module_utils.asp impor
     TlsTrustPolicy,
     _connection_error_is_post_connect,
     enforce_transport_policy,
+    looks_like_session_expired_html,
     normalize_fingerprint,
     parse_jnlp_arguments,
 )
@@ -64,6 +75,17 @@ PLUGINS_DIR = Path(__file__).resolve().parents[4] / "plugins"
 
 def _read_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+#: Every real, legitimate WEBVAR/JSONVAR (or, for create.txt, WEBSES/create.asp login) fixture in
+#: the corpus -- every `*.txt` file under FIXTURES_DIR. `session_expired.html` (the one file in
+#: this directory that is deliberately NOT a legitimate response -- see that file's own README
+#: section) is excluded by construction, not by name: it is the one fixture in this directory that
+#: is not a `.txt` file, precisely so it never gets swept into corpus-wide checks -- either this
+#: one or `test_webvar.py`'s own -- that assume every `*.txt` file here is a real capture. Read
+#: once, at import time, rather than per-test: this is the set looks_like_session_expired_html()
+#: must never fire on -- see TestSessionExpiredDetection below.
+REAL_FIXTURE_NAMES = sorted(path.name for path in FIXTURES_DIR.glob("*.txt"))
 
 
 # Two obviously-fake JNLP fragments, one for each live port-wiring mode this
@@ -152,6 +174,89 @@ def _synthetic_webvar_failure_body(name: str, hapi_status: int) -> str:
         f" HAPI_STATUS:{hapi_status} }}; \n"
         f"//Dynamic data end\n"
     )
+
+
+class _TlsFixtureHandler(BaseHTTPRequestHandler):
+    """Credential-free response used only to exercise the real TLS adapter."""
+
+    def do_GET(self) -> None:
+        payload = b"asmb8-tls-fixture\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format: str, *args: object) -> None:
+        # Keep test output deterministic and free of ephemeral port numbers.
+        return
+
+
+@pytest.fixture
+def self_signed_tls_endpoint(tmp_path):
+    """Serve a self-signed leaf through TLS 1.2 and the legacy BMC cipher set.
+
+    Everything -- key, certificate, and the server that presents them -- is
+    generated fresh in this fixture and torn down at the end of the test that
+    uses it. Binds ``127.0.0.1`` only, on an OS-assigned port (``:0``): this is
+    the loopback stand-in CONTRIBUTING.md and SECURITY.md require in place of
+    the real board, never something that could reach 172.20.x.x or any other
+    lab address. The key is written to ``tmp_path`` (pytest's own per-test
+    scratch directory, not this repository) purely because
+    ``ssl.SSLContext.load_cert_chain`` needs file paths; it is never committed
+    and never leaves this process's temp directory.
+    """
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .sign(private_key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "self-signed-localhost-cert.pem"
+    key_path = tmp_path / "self-signed-localhost-key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    # TLS 1.2 only, restricted to this board's own cipher set (BMC_CIPHERS) --
+    # mirroring the real listener, which offers TLS 1.2 only and exactly one
+    # non-forward-secret ciphersuite (see asp.py's BMC_CIPHERS comment).
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.set_ciphers(BMC_CIPHERS)
+    context.load_cert_chain(cert_path, key_path)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TlsFixtureHandler)
+    server.daemon_threads = True
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    fingerprint = hashlib.sha256(certificate.public_bytes(serialization.Encoding.DER)).hexdigest()
+    try:
+        yield server.server_address[1], fingerprint
+    finally:
+        # Always torn down, including when the test body raises: this is a
+        # `finally` around the `yield`, not code that only runs on a clean
+        # exit, so the server thread and its listening socket never outlive
+        # the test even on failure.
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 class TestTransportPolicy:
@@ -263,6 +368,65 @@ class TestAmiLegacyTlsAdapter:
         adapter.cert_verify("pool", "https://bmc.invalid/", request_verify, None)
 
         assert captured["verify"] == expected_verify
+
+    # --- real-handshake coverage --------------------------------------------
+    #
+    # Everything above this point inspects the ssl.SSLContext/adapter wiring
+    # without ever opening a socket. These four exercise all four trust modes
+    # against an actual TLS 1.2 handshake (self_signed_tls_endpoint, above) so
+    # the adapter is proven end to end, not just "passes the right kwargs" --
+    # see GitHub issue #3, where fingerprint-pinned TLS fell through to normal
+    # chain verification and failed against the board's self-signed, expired
+    # certificate despite every mocked-boundary assertion already passing.
+
+    def test_matching_pin_accepts_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, tls_fingerprint=fingerprint, max_retries=0)
+
+        try:
+            response = client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+        assert response.status_code == 200
+        assert response.text == "asmb8-tls-fixture\n"
+
+    def test_wrong_pin_refuses_the_same_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, fingerprint = self_signed_tls_endpoint
+        wrong_fingerprint = ("0" if fingerprint[0] != "0" else "1") + fingerprint[1:]
+        client = AspClient(host="localhost", port=port, password=PASSWORD, tls_fingerprint=wrong_fingerprint, max_retries=0)
+
+        try:
+            # Must surface as this collection's own TlsValidationError, not a
+            # bare ssl/urllib3 exception -- _send_once() maps
+            # requests.exceptions.SSLError to TlsValidationError, and a wrong
+            # pin's assert_fingerprint mismatch is exactly that shape.
+            with pytest.raises(TlsValidationError, match=r"[Ff]ingerprint"):
+                client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+    def test_validate_certs_false_accepts_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, _fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, validate_certs=False, max_retries=0)
+
+        try:
+            with pytest.warns(InsecureRequestWarning):
+                response = client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
+
+        assert response.status_code == 200
+
+    def test_normal_ca_mode_still_refuses_a_self_signed_leaf(self, self_signed_tls_endpoint):
+        port, _fingerprint = self_signed_tls_endpoint
+        client = AspClient(host="localhost", port=port, password=PASSWORD, validate_certs=True, max_retries=0)
+
+        try:
+            with pytest.raises(TlsValidationError, match="certificate verify failed"):
+                client._send_once("GET", f"https://localhost:{port}/", operation="tls_fixture")
+        finally:
+            client._http_session.close()
 
     def test_adapter_is_the_slimmer_equivalent_the_task_allowed_for(self):
         # Confirms this module does not import the sibling intel_amt
@@ -618,6 +782,97 @@ class TestNoCredentialLeakage:
         assert CSRF_TOKEN in client._known_secrets()
 
 
+class TestSessionExpiredDetection:
+    """`looks_like_session_expired_html()` -- GitHub issue #5's structural detector for the
+    session-expired HTML page this BMC has been observed returning to an authenticated read that
+    is missing something the endpoint enforces (a missing `CSRFTOKEN` was the confirmed cause for
+    five endpoints). Matched by shape -- HTML with a login/session marker, no `WEBVAR_JSONVAR_` --
+    never by byte length or digest; see that function's own docstring and the module-level comment
+    above `_SESSION_EXPIRED_HTML_TAG_RE` in asp.py for why."""
+
+    def test_recognises_the_reconstructed_session_expired_fixture(self):
+        # session_expired.html is this repository's own reconstruction of the documented shape (see
+        # tests/unit/fixtures/asp/README.md's "Session-expired HTML" section for exactly what is
+        # and is not sourced about it) -- not verbatim captured bytes, but the same HTML-with-
+        # login/session-markers-and-no-WEBVAR_JSONVAR_ shape the detector is built to recognise.
+        assert looks_like_session_expired_html(_read_fixture("session_expired.html")) is True
+
+    @pytest.mark.parametrize("fixture_name", REAL_FIXTURE_NAMES)
+    def test_never_misfires_on_any_real_webvar_fixture(self, fixture_name):
+        # The other half of the guarantee: a detector with false positives here would break every
+        # working .asp read in this collection, since get_webvar()/post_webvar()/set_webvar() all
+        # run every response through this check before ever handing it to parse_webvar(). Every
+        # one of these ~58 real, redacted captures is a legitimate WEBVAR/JSONVAR (or, for
+        # create.txt, WEBSES/create.asp login) response and must never be mistaken for this shape.
+        assert looks_like_session_expired_html(_read_fixture(fixture_name)) is False
+
+    def test_a_body_with_html_but_no_login_or_session_marker_does_not_match(self):
+        # Structural, not just "any HTML" -- an HTML body that happens to carry neither word is not
+        # asserted to be this specific failure shape, even though it is also not a WEBVAR response.
+        assert looks_like_session_expired_html("<html><body>404 not found</body></html>") is False
+
+    def test_a_login_or_session_marker_with_no_html_tag_does_not_match(self):
+        # The corpus itself proves this matters: getauditlog.txt's AUDIT_LOG value contains the
+        # literal text "login successfully" with no HTML tag anywhere near it (see webvar.py's own
+        # docstring) -- that must not be mistaken for a session-expired page, and the WEBVAR_JSONVAR_
+        # exclusion is not the only thing standing between this check and a false positive there.
+        assert looks_like_session_expired_html("plain text mentioning a login and a session, no markup") is False
+
+    def test_a_webvar_jsonvar_marker_always_wins_even_alongside_html_and_login_text(self):
+        # The one property that stays true no matter what else is going on: if this format's own
+        # marker is present, this is never treated as the session-expired shape.
+        body = "<html><body>login/session</body></html> WEBVAR_JSONVAR_X"
+        assert looks_like_session_expired_html(body) is False
+
+    @pytest.mark.parametrize("body", [None, "", 12345, b"<html>login session</html>"])
+    def test_non_string_or_empty_input_is_false_not_a_raise(self, body):
+        assert looks_like_session_expired_html(body) is False
+
+
+class TestGetHostStatus:
+    """`AspClient.get_host_status()` -- unparsed by design (see its own docstring), but no longer
+    unchecked: a session-expired-looking body is raised on here rather than returned as if it were
+    legitimate `hoststatus.asp` text, which is what let `asmb8_info(include_web_session=true)`
+    report `logged_in: true` alongside that HTML in the false positive GitHub issue #5 reported."""
+
+    def test_a_real_fixture_is_returned_verbatim(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("hoststatus.txt")))
+
+        assert client.get_host_status() == _read_fixture("hoststatus.txt")
+
+    def test_a_session_expired_body_raises_protocol_error_instead_of_being_returned(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("session_expired.html")))
+
+        with pytest.raises(ProtocolError) as exc_info:
+            client.get_host_status()
+
+        # The message must be specific and actionable, not a generic parse complaint -- this
+        # method has no parser of its own to raise that complaint, so without this check the body
+        # would simply have been returned as though it were legitimate diagnostic text.
+        assert "session-expired" in str(exc_info.value)
+        assert exc_info.value.operation == "get_host_status"
+
+    def test_no_secret_leaks_into_the_session_expired_diagnostic_even_if_the_body_echoed_one(self):
+        # The real fixture carries no secret at all, so this constructs a worst-case body -- one
+        # that happens to echo this client's own session cookie inside otherwise-ordinary
+        # session-expired HTML -- to prove the diagnostic still goes through redact() rather than
+        # relying on the fixture never containing anything sensitive to begin with.
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        body = f"<html><body>login session expired for cookie {SESSION_COOKIE}</body></html>"
+        client._http_session.request = Mock(return_value=mock_response(body))
+
+        with pytest.raises(ProtocolError) as exc_info:
+            client.get_host_status()
+
+        assert SESSION_COOKIE not in str(exc_info.value)
+        assert SESSION_COOKIE not in str(exc_info.value.diagnostic)
+
+
 class TestGetWebvarIsReadOnly:
     """The structural half of this collection's read-only guarantee: every informational module
     can claim "get_webvar only ever issues GET" as a fact about the code, not a promise about
@@ -646,6 +901,20 @@ class TestGetWebvarIsReadOnly:
         source = inspect.getsource(AspClient.get_webvar)
         assert '"POST"' not in source
         assert "'POST'" not in source
+
+    def test_a_session_expired_body_raises_a_specific_protocol_error_before_parse_webvar_ever_sees_it(self):
+        # GitHub issue #5: get_webvar() must not hand this shape to parse_webvar() and get back the
+        # same generic "no WEBVAR_JSONVAR_<NAME> assignment found" complaint that any other
+        # malformed body produces -- the point of looks_like_session_expired_html() is a message
+        # that actually names what happened.
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("session_expired.html")))
+
+        with pytest.raises(ProtocolError) as exc_info:
+            client.get_webvar("getdnscfg")
+
+        assert "session-expired" in str(exc_info.value)
 
 
 class TestPostWebvar:
@@ -707,6 +976,16 @@ class TestPostWebvar:
 
         with pytest.raises(ProtocolError):
             client.post_webvar("getselentries", data={"WEBVAR_LASTEVENTID": "24"})
+
+    def test_a_session_expired_body_raises_the_same_specific_protocol_error_as_get_webvar(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("session_expired.html")))
+
+        with pytest.raises(ProtocolError) as exc_info:
+            client.post_webvar("getsessioninfo", data={"SERVICEBIT": "4"})
+
+        assert "session-expired" in str(exc_info.value)
 
 
 class TestSetWebvar:
@@ -785,6 +1064,16 @@ class TestSetWebvar:
 
         with pytest.raises(ProtocolError):
             client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+    def test_a_session_expired_body_raises_the_same_specific_protocol_error_as_get_and_post_webvar(self):
+        client = make_client()
+        client._session_cookie = SESSION_COOKIE
+        client._http_session.request = Mock(return_value=mock_response(_read_fixture("session_expired.html")))
+
+        with pytest.raises(ProtocolError) as exc_info:
+            client.set_webvar("setntpcfg", {"ISNTPENABLE": "0"})
+
+        assert "session-expired" in str(exc_info.value)
 
     def test_set_webvar_is_a_distinct_method_from_get_and_post_webvar(self):
         # Different name, different method object from both read paths -- see set_webvar's own

@@ -1,8 +1,22 @@
 ---
 minor_changes:
   - >-
-    C(asmb8_media) - retain a bounded 256-entry trace of recent SCSI
-    C(READ(10))/C(READ(12)) LBA and block-count requests in the session state,
-    so operators can distinguish catalogue, bootloader, and filesystem access
-    without recording media contents or allowing the state file to grow without
-    bound.
+    C(asmb8_media) - retain a two-ended trace of SCSI C(READ(10))/C(READ(12))
+    LBA and block-count requests (opcode/LBA/block-count only, never media
+    contents), surfaced via C(operation.observed.read_trace_head) (the
+    earliest 128 requests, for a boot that stalls early) and
+    C(operation.observed.read_trace_tail) (the most recent 128, for a stall
+    deep into an install -- the only real install failure this project has
+    recorded stopped roughly 22,000 reads in, far past what a first-N-only
+    trace could show). C(operation.observed.read_trace_dropped) counts
+    exactly how many requests fall in the discarded gap between the two, so
+    the boundary is never mistakable for contiguous history. The trace lives
+    in an append-only sidecar log next to the session's state file, flushed
+    on every request, so a session that issues tens of thousands of reads
+    costs a small, constant per-request write instead of repeatedly
+    rewriting a growing trace -- and so the trace survives the background
+    session dying unexpectedly (a C(SIGKILL), an OOM kill, a host power
+    event), losing at most the single request that was physically mid-write
+    at the moment of death. Supersedes this same PR's earlier, since-amended
+    256-entry head-only trace, which could not show where a late-stalling
+    install actually stopped.

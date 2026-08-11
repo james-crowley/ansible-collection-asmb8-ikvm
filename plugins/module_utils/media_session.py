@@ -61,6 +61,48 @@ about this module, are the two facts the task brief calls out explicitly:
    cold reset (``ipmitool mc reset cold`` / the pyghmi equivalent), which does
    not affect host power. See ``iusb.interpret_ack`` for where that message
    is produced.
+3. **The READ(10)/READ(12) trace's write cost and its crash-durability
+   requirement pull in opposite directions, and both have to be honoured at
+   once.** ``_on_request`` (below) runs on every single SCSI request a real
+   install issues -- a real session recorded 32,741 reads at roughly
+   30-33/second during bulk transfer (docs/hardware-evidence-2026-08-08.md).
+   The state file's own ``_persist`` is an ATOMIC write (temp file plus
+   ``os.replace()``) on every one of those calls; a trace that grew as part
+   of that dict would make every one of those 32,741 writes rewrite the
+   whole trace, for a value nothing reads more than a handful of times per
+   install. The tempting fix -- persist the trace on a lower cadence, or
+   buffer it in memory and flush on a timer or on clean exit -- trades that
+   cost away by losing exactly the data this trace exists to answer for: the
+   whole point of a post-mortem trace is to survive the case where the
+   daemon does NOT exit cleanly (SIGKILL, an OOM kill, a host power event),
+   and a scheme that only flushes on a timer or at exit loses precisely the
+   most recent, most diagnostically valuable window -- the reads immediately
+   before a stall -- to any death that lands between flushes.
+
+   The resolution kept here is a separate, append-only sidecar log (see
+   :func:`read_trace_log_path`), never rewritten, one line per request,
+   ``flush()``ed immediately after each ``write()`` -- so by the time
+   ``_on_request`` returns, that line has already been handed to the OS and
+   will still be there after this process dies, however abruptly, exactly
+   the same durability level ``_write_state_atomic`` itself already relies
+   on for the rest of the state file (neither calls ``os.fsync()``; both
+   rely on the write already having reached the kernel, which is enough to
+   survive THIS process dying, though not a full OS crash or power loss).
+   The per-request cost this incurs is one small ``write()`` plus one
+   ``flush()`` -- no temp file, no ``os.replace()`` -- independent of how
+   large the trace has grown, which is the actual fix for the 32,741-write
+   session. The retention split described above
+   ``_READ_TRACE_HEAD_LIMIT``/``_READ_TRACE_TAIL_LIMIT`` (head plus tail,
+   with an exact dropped count) is then computed on READ, by
+   :func:`read_trace_summary`, from that flat log -- paid only when
+   something (an operator, ``asmb8_media.py`` building
+   ``operation.observed``) actually asks for status, which happens at most
+   a handful of times over the life of an hour-long install, not 33 times a
+   second. Worst-case loss under an unclean death is exactly one entry: the
+   single request that was physically in the middle of its ``write()`` call
+   at the instant of death, if any -- every entry before it was already
+   flushed and is intact; :func:`read_trace_summary` tolerates that one torn
+   line by skipping it rather than raising.
 
 As in the sibling collection: this module owns exactly the process lifecycle,
 state-file bookkeeping, and the single-session reclamation policy. It knows
@@ -69,7 +111,9 @@ nothing about Ansible; ``plugins/modules/asmb8_media.py`` is the only caller.
 
 from __future__ import annotations
 
+import collections
 import contextlib
+import json
 import os
 import signal
 from dataclasses import dataclass
@@ -146,11 +190,46 @@ _RECV_POLL_TIMEOUT = 2.0
 #: ``ErrorClass.BMC_BUSY`` on its own if the slot is in fact still held.
 _RECLAIM_STOP_TIMEOUT = 10.0
 
-# Keep enough recent READ(10)/READ(12) requests to distinguish ISO catalogue,
-# boot-image, and filesystem access without allowing a long install to grow the
-# state file without bound.  This is diagnostic metadata only; it contains no
-# media contents or credentials.
-_READ_TRACE_LIMIT = 256
+# --------------------------------------------------------------------------
+# The READ(10)/READ(12) trace: retention shape and where it actually lives.
+#
+# Two failure shapes this project has actually needed to distinguish:
+#
+# 1. Issue #6's stated case -- a boot that stops EARLY, between the firmware
+#    catalogue/El Torito reads and OS handoff. The documented boot chain
+#    (docs/hardware-evidence-2026-08-08.md, "Boot chain, proven") is under a
+#    dozen distinct LBAs (0, 1, 16, 17, 4660, 18, 6025, 156) before the
+#    bootloader shifts to bulk multi-block filesystem reads -- a trace that
+#    keeps only the FIRST N requests answers this shape well.
+# 2. The only real install failure this project has recorded
+#    (docs/hardware-evidence-2026-08-08.md, "A real installer reached 70%
+#    and then failed on media read timeouts") stopped ~22,000 reads into a
+#    32,741-read, ~60-minute session, deep in package extraction. A
+#    first-N-only trace shows a perfectly healthy early boot and says
+#    nothing about where a LATE failure like this one actually stopped.
+#
+# So this keeps BOTH ends -- the earliest _READ_TRACE_HEAD_LIMIT requests
+# (early-boot phase) and the most recent _READ_TRACE_TAIL_LIMIT requests
+# (wherever the session currently is, including "where it just stopped") --
+# in two separate lists, never concatenated into one. That is deliberate: an
+# operator reading a single spliced list could easily mistake the boundary
+# between "early boot" and "most recent" for two adjacent-in-time requests;
+# two distinct lists plus an exact dropped count (see read_trace_summary())
+# make that gap impossible to miss.
+#
+# Sizes: 128 head + 128 tail = 256, the same combined budget the previous
+# head-only design used -- this fixes WHICH ends are kept, not how much
+# state grows. 128 is generous for the head (the documented boot chain is
+# under a dozen distinct LBAs, so 128 comfortably covers early boot plus the
+# first stretch of real filesystem access after it). 128 for the tail is
+# roughly 4 seconds of the ~30-33 reads/sec sustained bulk-transfer rate this
+# project has actually measured (see hardware-evidence's "Measured
+# performance" section: ~800-900 KB/s at 16-block/32 KiB reads) -- enough to
+# see the READ pattern (LBA progression, retries, repeated same-LBA reads)
+# immediately before a stall, not merely the single last request.
+_READ_TRACE_HEAD_LIMIT = 128
+_READ_TRACE_TAIL_LIMIT = 128
+# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +297,15 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
     ``STATE_ERROR``: a crash is already fully identified by ``state`` +
     ``error_class``, and this field exists to distinguish kinds of *clean*
     stop from each other, not to duplicate that.
+
+    There is deliberately NO ``read_trace``/``read_trace_dropped`` key here.
+    The READ(10)/READ(12) trace lives entirely in the sidecar log at
+    :func:`read_trace_log_path`, reconstructed on demand by
+    :func:`read_trace_summary` -- never inside this dict. See the module
+    docstring's point 3: keeping it out of this dict is what keeps THIS
+    dict's own atomic rewrite (via ``_persist``, called on every single SCSI
+    request) a constant, small cost regardless of how many reads a session
+    has served.
     """
     now = _now_iso()
     return {
@@ -230,8 +318,6 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
         "image": image,
         "bytes_read": 0,
         "sectors_served": 0,
-        "read_trace": [],
-        "read_trace_dropped": 0,
         "last_request_at": None,
         "started_at": now,
         "updated_at": now,
@@ -263,14 +349,113 @@ def _close_idle_streak(state: dict[str, Any], *, now: str) -> None:
     state["current_idle_streak"] = None
 
 
+def read_trace_log_path(runtime_dir: str | os.PathLike[str], session_id: str) -> Path:
+    """Where the append-only READ(10)/READ(12) trace log lives for ``session_id``.
+
+    Deliberately NOT a field inside the atomically-rewritten state file --
+    see :func:`read_trace_summary` and the module docstring's persistence
+    reasoning (point 3) for why. One JSON object per line, one line per
+    READ(10)/READ(12) request actually served --
+    ``{"opcode": "0x28", "lba": ..., "blocks": ...}`` -- appended and
+    ``flush()``ed as it happens, never rewritten. Same three fields the
+    original in-state trace carried: no media contents, no credentials.
+    """
+    return Path(runtime_dir) / f"{session_id}.reads.jsonl"
+
+
+def read_trace_summary(
+    runtime_dir: str | os.PathLike[str],
+    session_id: str,
+    *,
+    head_limit: int = _READ_TRACE_HEAD_LIMIT,
+    tail_limit: int = _READ_TRACE_TAIL_LIMIT,
+) -> dict[str, Any]:
+    """Rebuild the two-ended READ(10)/READ(12) trace from the sidecar log.
+
+    This is where the retention policy described above the
+    ``_READ_TRACE_HEAD_LIMIT``/``_READ_TRACE_TAIL_LIMIT`` constants actually
+    gets applied -- the sidecar log itself is just a flat, append-only
+    record of every request ever served; splitting it into "earliest
+    ``head_limit``" plus "most recent ``tail_limit``" happens here, on read,
+    not on write (see the module docstring's point 3 for why that split is
+    deliberately on the read path rather than the write path).
+
+    Returns a dict with three keys, always present:
+
+    * ``read_trace_head`` -- the earliest ``head_limit`` requests, in order.
+    * ``read_trace_tail`` -- the most recent ``tail_limit`` requests THAT ARE
+      NOT ALREADY IN ``read_trace_head``, in order. Deliberately excludes
+      any overlap with the head: while the total request count is at or
+      below ``head_limit``, this is empty (everything is already visible via
+      the head); it only starts filling once requests beyond ``head_limit``
+      exist, and only becomes a genuinely bounded rolling window once the
+      total exceeds ``head_limit + tail_limit``. This means a reader can
+      never see the same request twice across the two lists, and an empty
+      gap between them (``read_trace_dropped == 0``) is visible structurally,
+      not just numerically.
+    * ``read_trace_dropped`` -- exactly how many requests fall in the
+      discarded middle: ``max(0, total_requests - head_limit - tail_limit)``.
+      Zero means the two lists above are the COMPLETE record with no gap at
+      all, however small or large the session; nonzero means exactly that
+      many requests, contiguous in time, are gone for good, and boundary
+      between "the tail's earliest entry" and "the head's latest entry" is
+      NOT one request apart -- it is ``read_trace_dropped + 1`` requests
+      apart. That arithmetic is what makes the gap impossible to mistake for
+      contiguous history.
+
+    A missing sidecar file (no READ(10)/READ(12) ever served, or the session
+    predates this file existing at all) is not an error: every field comes
+    back empty/zero, the same shape a real-but-quiet session would produce.
+
+    Tolerates a torn final line -- the one entry that can be lost if the
+    daemon dies (SIGKILL, a host power event) mid ``write()`` of its very
+    last, in-flight trace entry (see the module docstring's point 3 for why
+    that is the full extent of what an unclean death can cost here: every
+    EARLIER line was already flushed to the OS by the time this one started,
+    and only the single line in flight at the instant of death can end up
+    truncated). A line that fails to parse as JSON is skipped rather than
+    raising, exactly like ``daemon_runtime.read_state``'s tolerance for a
+    torn state file.
+    """
+    head: list[dict[str, Any]] = []
+    tail: collections.deque = collections.deque(maxlen=tail_limit)
+    total = 0
+    try:
+        handle = read_trace_log_path(runtime_dir, session_id).open("r", encoding="utf-8")
+    except FileNotFoundError:
+        return {"read_trace_head": [], "read_trace_tail": [], "read_trace_dropped": 0}
+    with handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # a torn final line -- see this function's own docstring.
+            if not isinstance(entry, dict):
+                continue
+            total += 1
+            if total <= head_limit:
+                head.append(entry)
+            else:
+                tail.append(entry)
+    dropped = max(0, total - head_limit - tail_limit)
+    return {"read_trace_head": head, "read_trace_tail": list(tail), "read_trace_dropped": dropped}
+
+
 def remove_state(runtime_dir: str | os.PathLike[str], session_id: str) -> None:
-    """Delete the state and log files for ``session_id``, if present.
+    """Delete the state, log, and read-trace sidecar files for ``session_id``, if present.
 
     Frees the session_id for reuse. Built on ``daemon_runtime.remove_paths``,
     which is silent about files that are already gone -- callers call this
     defensively without checking existence first.
     """
-    remove_paths(state_file_path(runtime_dir, session_id), log_file_path(runtime_dir, session_id))
+    remove_paths(
+        state_file_path(runtime_dir, session_id),
+        log_file_path(runtime_dir, session_id),
+        read_trace_log_path(runtime_dir, session_id),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -591,10 +776,32 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
 
     reader: iusb.FileReader | None = None
     session: iusb.Session | None = None
+    trace_log: Any = None
     try:
         reader = iusb.FileReader.open(config.image)
         cache = iusb.Cache(reader, writer=None)
         device = iusb.CDROMDevice(cache)
+
+        # The READ(10)/READ(12) trace's append-only sidecar (module docstring
+        # point 3) -- opened once, up front, alongside the image, and kept
+        # open for the daemon's whole lifetime rather than reopened per
+        # request: an open, already-buffered file object is what makes each
+        # trace entry a single write()+flush() rather than an open()+write()+
+        # close() every time. Created 0600, same as the state file, via
+        # os.open() rather than left to the umask -- this sidecar can carry
+        # LBA/opcode/block-count detail an operator would not want
+        # world-readable either. O_APPEND (not O_TRUNC) so a restart against
+        # a pre-existing sidecar (should one ever exist, e.g. a session_id
+        # reused after remove_state() somehow did not run) can never
+        # overwrite already-flushed history -- though in the normal flow
+        # remove_state() has already deleted it before a session_id is ever
+        # reused. Closed unconditionally in the finally block below,
+        # alongside session/reader -- but every line already written is
+        # durable well before that close() ever runs (see module docstring
+        # point 3): this close() is cleanliness, not the mechanism the
+        # crash-durability guarantee depends on.
+        trace_log_fd = os.open(str(read_trace_log_path(config.runtime_dir, config.session_id)), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        trace_log = os.fdopen(trace_log_fd, "a", encoding="utf-8")
 
         state["state"] = STATE_CONNECTING
         _persist()
@@ -666,17 +873,30 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
             state["sectors_served"] = device.blocks_served()
             cdb = _req.cdb()
             if cdb and cdb[0] in (iusb.SCSI_READ10, iusb.SCSI_READ12):
+                # READ(10) (0x28): 2-byte transfer length at CDB offset 7.
+                # READ(12) (0xA8): 4-byte transfer length at CDB offset 6.
+                # Both: 4-byte LBA at CDB offset 2. Matches CDROMDevice.handle's
+                # own SCSI_READ10/SCSI_READ12 branches above in this file
+                # (iusb.py) byte-for-byte, and docs/protocol-notes.md's
+                # documented CDB layout ("Big-endian CDB fields inside a
+                # little-endian wrapper") -- this project has already been
+                # bitten once by a CDB field read at the wrong offset, so this
+                # is deliberately the same slicing, not a re-derivation of it.
                 blocks_slice = cdb[7:9] if cdb[0] == iusb.SCSI_READ10 else cdb[6:10]
                 entry = {
                     "opcode": f"0x{cdb[0]:02x}",
                     "lba": int.from_bytes(cdb[2:6], "big"),
                     "blocks": int.from_bytes(blocks_slice, "big"),
                 }
-                trace = state["read_trace"]
-                if len(trace) < _READ_TRACE_LIMIT:
-                    trace.append(entry)
-                else:
-                    state["read_trace_dropped"] += 1
+                # One write() + one flush() -- see module docstring point 3 for
+                # why this, and not a trace field inside `state`, is what keeps
+                # a 32,741-request session's per-request cost constant instead
+                # of growing with the trace. flush() (not close()) is what
+                # gives the crash-durability guarantee: it hands these bytes to
+                # the OS before this function returns, without paying for a
+                # reopen every request.
+                trace_log.write(json.dumps(entry) + "\n")
+                trace_log.flush()
             state["last_request_at"] = now
             _persist(now)
 
@@ -741,3 +961,6 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
         if reader is not None:
             with contextlib.suppress(Exception):
                 reader.close()
+        if trace_log is not None:
+            with contextlib.suppress(Exception):
+                trace_log.close()

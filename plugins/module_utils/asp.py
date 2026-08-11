@@ -321,6 +321,69 @@ def _looks_like_failed_login(session_cookie: str) -> bool:
     return session_cookie.startswith(_FAILURE_LOGIN_PREFIX)
 
 
+# --- session-expired HTML detection ----------------------------------------
+#
+# A second, distinct failure shape from the one _looks_like_failed_login()
+# guards above. That check is about a REJECTED login (HTTP 200,
+# SESSION_COOKIE == Failure_Login_*, caught once, at login time). This one is
+# about a request made *after* a genuinely successful login that the BMC
+# nonetheless answers as though no session existed at all -- confirmed live
+# hardware evidence, GitHub issue #5 (2026-08-11, ASMB8-iKVM firmware 1.14 /
+# aux 1.14.2): five endpoints (`getalllancfg.asp`, `getlanchannelinfo.asp`,
+# `getdnscfg.asp`, `getnwbondcfg.asp`, `checknwbond.asp`) answered an
+# authenticated `GET` that carried a valid SESSION_COOKIE but no `CSRFTOKEN`
+# header with byte-identical, 2,223-byte HTML containing HTML/login markers
+# and no `WEBVAR_JSONVAR_*` -- while the identical request plus `CSRFTOKEN`
+# got back an ordinary WEBVAR response every time. `AspClient._headers` now
+# attaches that header to every non-`WEBSES` request (see its own docstring),
+# which is what actually fixes those five endpoints. This detector exists for
+# what that fix does not cover: a caller reading a body from before the fix
+# landed, or hitting some other endpoint this collection has not individually
+# tested, still deserves a named, structural finding here rather than either
+# a generic "the parser did not recognise this" failure, or -- the failure
+# mode issue #5 actually reported, and the more dangerous of the two -- no
+# finding at all, because nothing checked and the caller's code went on to
+# treat HTTP 200 as success.
+#
+# Matched **by shape**, not by the exact 2,223 bytes or the SHA-256 the issue
+# reporter measured (`7129528f34a2b230534e705ad8cb230cd1f5d4ae0362a9f9694c99
+# b61f4c3427`): a byte count or digest is a property of one firmware build's
+# rendering of this one page, not of what makes it a session-expired page,
+# and either check would silently stop matching the moment a firmware
+# revision changes so much as a whitespace character in a page this project
+# does not control. The two structural properties checked instead -- an HTML
+# document, carrying a login/session marker, with none of this format's own
+# `WEBVAR_JSONVAR_` marker -- are exactly what the issue's own side-by-side
+# comparison showed distinguishing a rejected read from an accepted one, and
+# every one of this collection's ~58 real WEBVAR/JSONVAR fixtures (see
+# tests/unit/fixtures/asp/) carries `WEBVAR_JSONVAR_` and no HTML tag at all,
+# so this rule cannot mistake a legitimate read for this failure shape.
+_SESSION_EXPIRED_HTML_TAG_RE = re.compile(r"(?i)<html\b|<!doctype\s+html")
+_SESSION_EXPIRED_LOGIN_MARKER_RE = re.compile(r"(?i)\blogin\b|\bsession\b")
+_WEBVAR_JSONVAR_MARKER = "WEBVAR_JSONVAR_"
+
+
+def looks_like_session_expired_html(body: object) -> bool:
+    """Return whether ``body`` is this BMC's session-expired HTML page rather than a WEBVAR response.
+
+    See the module-level comment above :data:`_SESSION_EXPIRED_HTML_TAG_RE` for the hardware
+    evidence (GitHub issue #5) and for why this matches structurally rather than by byte length or
+    digest. Used by :class:`AspClient`'s own :meth:`~AspClient.get_host_status`,
+    :meth:`~AspClient.get_webvar`, :meth:`~AspClient.post_webvar`, and :meth:`~AspClient.set_webvar`
+    to raise a specific, named :class:`errors.ProtocolError` for this shape rather than either a
+    generic parse failure or -- the actual failure issue #5 reported -- silent, confident success.
+
+    Public (unlike :func:`_looks_like_failed_login`) so this collection's test suite can pin it
+    directly against both the real, redacted fixture corpus (must never fire) and a reconstructed
+    session-expired body (must fire) -- see ``tests/unit/plugins/module_utils/test_asp.py``.
+    """
+    if not isinstance(body, str) or not body:
+        return False
+    if _WEBVAR_JSONVAR_MARKER in body:
+        return False
+    return bool(_SESSION_EXPIRED_HTML_TAG_RE.search(body)) and bool(_SESSION_EXPIRED_LOGIN_MARKER_RE.search(body))
+
+
 def parse_jnlp_arguments(document: str) -> dict[str, str]:
     """Extract ``-flag``/value pairs from a JNLP document's ``<argument>`` elements.
 
@@ -465,6 +528,41 @@ class AspClient:
             secrets.append(self._csrf_token)
         return [s for s in secrets if s]
 
+    def _raise_if_session_expired(self, body: str, *, operation: str) -> None:
+        """Raise :class:`errors.ProtocolError` if ``body`` is this BMC's session-expired HTML page.
+
+        Shared by every method that reads a ``.asp`` response body (:meth:`get_host_status`,
+        :meth:`get_webvar`, :meth:`post_webvar`, :meth:`set_webvar`) so the check, and its wording,
+        live in exactly one place -- see :func:`looks_like_session_expired_html`'s own docstring and
+        the module-level comment above :data:`_SESSION_EXPIRED_HTML_TAG_RE` for the GitHub issue #5
+        hardware evidence this is sourced from.
+
+        Deliberately raises the *same* exception class (:class:`errors.ProtocolError`) that
+        :func:`~...webvar.parse_webvar` already raises for a body it cannot recognise at all, so
+        every existing caller that catches ``ProtocolError`` to degrade a read (for example
+        ``asmb8_sessions.fetch_remote_session_config`` and ``asmb8_info.fetch_remote_session_
+        preconditions``, both for ``getremotesession.asp``) keeps working unchanged -- this only
+        makes the message that failure carries specific and accurate instead of a generic parse
+        complaint that gives no hint the response was ever this identifiable shape.
+        """
+        if not looks_like_session_expired_html(body):
+            return
+        raise ProtocolError(
+            f"{operation} returned a session-expired-looking HTML page instead of a parseable .asp "
+            "response body (HTML with login/session markers, no WEBVAR_JSONVAR_ -- see GitHub issue "
+            "#5). This BMC has been observed answering an authenticated read with exactly this shape "
+            "when the read was missing something this endpoint enforces: a missing CSRFTOKEN header "
+            "was the confirmed cause for five other endpoints (getalllancfg, getlanchannelinfo, "
+            "getdnscfg, getnwbondcfg, checknwbond), which this client now attaches to every "
+            "non-WEBSES request (see AspClient._headers()); whether this specific endpoint enforces "
+            "it too is not itself confirmed either way. Reporting success on this body would be a "
+            "confident wrong answer, which is worse than failing here.",
+            endpoint=self.endpoint,
+            operation=operation,
+            diagnostic=body,
+            secrets=self._known_secrets(),
+        )
+
     # --- low-level request plumbing ----------------------------------------
 
     def _headers(self, method: str, url: str) -> dict[str, str]:
@@ -484,6 +582,18 @@ class AspClient:
         token continuity as the vendor client; restricting the token to POST produced an unusable
         session even though login itself succeeded. A missing token remains non-blocking and the
         login endpoint remains explicitly excluded.
+
+        Independently confirmed for informational ``GET`` reads by GitHub issue #5 (2026-08-11,
+        live hardware): before this method attached ``CSRFTOKEN`` to ``GET``, five endpoints
+        (``getalllancfg.asp``, ``getlanchannelinfo.asp``, ``getdnscfg.asp``, ``getnwbondcfg.asp``,
+        ``checknwbond.asp``) answered an otherwise-valid authenticated ``GET`` with a
+        session-expired HTML page (see :func:`looks_like_session_expired_html`), and answered
+        normally, every time, once this header was attached. **Enforcement is per-endpoint, not a
+        blanket rule** -- the endpoints this project happened to test by hand before that report
+        (``getvmediacfg``, ``getallservicescfg``, ``getdatetime``, ``getntpcfg``) do not enforce it,
+        which is exactly why an earlier version of this docstring wrongly generalised "GET reads
+        work without it" from that partial sample. Whether any given ``POST``/write enforces it
+        remains untested either way -- issue #5 exercised ``GET`` only.
         """
         headers = {}
         if self._session_cookie:
@@ -615,13 +725,24 @@ class AspClient:
         this BMC answers a bad password with HTTP 200 (PR #40).
 
         Also captures ``CSRFTOKEN`` from the same response body, when present
-        (see ``_CSRFTOKEN_RE``), for :meth:`post_webvar` to attach to later
-        `POST` requests -- matching the vendor JS's own behaviour of storing
-        this value at login and replaying it on every subsequent non-login
-        request. A response with no ``CSRFTOKEN`` field is **not** an error:
-        this method does not require one to succeed, since this collection's
-        `GET` reads already work without it and whether `POST` genuinely
-        needs it has not been tested either -- see :meth:`post_webvar`.
+        (see ``_CSRFTOKEN_RE``), for :meth:`_headers` to attach to every later
+        non-``WEBSES`` request, `GET` included -- matching the vendor JS's own
+        behaviour of storing this value at login and replaying it on every
+        subsequent request. **Correction:** an earlier version of this
+        docstring claimed "this collection's `GET` reads already work without
+        it", generalised from a partial sample -- the handful of endpoints
+        tested by hand (``getvmediacfg``, ``getallservicescfg``,
+        ``getdatetime``, ``getntpcfg``) happened not to enforce the header.
+        GitHub issue #5 (2026-08-11, live hardware) showed that was not a
+        general property of `GET`: five other endpoints (``getalllancfg``,
+        ``getlanchannelinfo``, ``getdnscfg``, ``getnwbondcfg``,
+        ``checknwbond``) rejected the identical `GET` with a session-expired
+        HTML page (see :func:`looks_like_session_expired_html`) until
+        ``CSRFTOKEN`` was attached. Enforcement is per-endpoint, not a
+        blanket GET-vs-POST rule. A response with no ``CSRFTOKEN`` field is
+        still **not** an error: this method does not require one to succeed
+        -- a BMC that genuinely never issues a token is a real, if untested,
+        possibility this client should not invent a failure for.
         """
         response = self._request(
             "POST",
@@ -783,10 +904,17 @@ class AspClient:
         See :meth:`post_webvar` for this method's sibling, for the handful of
         endpoints that need their query parameters submitted as a `POST` body
         to return anything at all.
+
+        Checks the response against :func:`looks_like_session_expired_html` before ever handing it
+        to `parse_webvar()`, and raises a specific `errors.ProtocolError` naming that shape if it
+        matches -- see GitHub issue #5: five endpoints answered exactly this way when this
+        collection's `GET` reads did not yet attach `CSRFTOKEN` (see :meth:`_headers`), and a
+        confident wrong answer built on that body is worse than a clearly-labelled failure here.
         """
         path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
         op = operation or f"get_webvar:{endpoint}"
         body = self._request("GET", path, operation=op).text
+        self._raise_if_session_expired(body, operation=op)
         return parse_webvar(body, endpoint=endpoint, operation=op)
 
     def post_webvar(self, endpoint: str, data: dict[str, str], *, operation: str | None = None) -> WebVarResponse:
@@ -826,10 +954,14 @@ class AspClient:
 
         Every endpoint used with this must be one observed in a real capture, per this collection's
         sourcing policy -- see :meth:`get_webvar`'s own docstring, which applies identically here.
+
+        Checks the response against :func:`looks_like_session_expired_html` before ever handing it
+        to `parse_webvar()`, same as :meth:`get_webvar` -- see that method's docstring for why.
         """
         path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
         op = operation or f"post_webvar:{endpoint}"
         body = self._request("POST", path, operation=op, data=data).text
+        self._raise_if_session_expired(body, operation=op)
         return parse_webvar(body, endpoint=endpoint, operation=op)
 
     def set_webvar(self, endpoint: str, data: dict[str, str], *, operation: str | None = None) -> WebVarResponse:
@@ -870,10 +1002,16 @@ class AspClient:
         `TestNoWriteEndpointIsReachable`-style unimplemented; see that same doc section and
         `tests/unit/plugins/module_utils/test_asp.py`'s structural tests, which this method must
         continue to pass for every endpoint it does not implement.
+
+        Checks the response against :func:`looks_like_session_expired_html` before ever handing it
+        to `parse_webvar()`, same as :meth:`get_webvar`/:meth:`post_webvar` -- see the former's
+        docstring for why. No write capture has ever shown this shape, but a write reply is parsed
+        by the same `parse_webvar()` call as every read, so it gets the same protection.
         """
         path = endpoint if endpoint.startswith("/") else f"/rpc/{endpoint}.asp"
         op = operation or f"set_webvar:{endpoint}"
         body = self._request("POST", path, operation=op, data=data).text
+        self._raise_if_session_expired(body, operation=op)
         response = parse_webvar(body, endpoint=endpoint, operation=op)
         if response.hapi_status != 0:
             raise RemoteOperationError(
@@ -893,8 +1031,22 @@ class AspClient:
         field names/values are not yet sourced from any capture. Treat the
         return value as opaque diagnostic text, not a stable API, until this
         is revisited with real evidence.
+
+        **Raises, rather than returning, a session-expired-looking body.** Unlike
+        :meth:`get_webvar`/:meth:`post_webvar`/:meth:`set_webvar`, this method never runs its
+        result through `parse_webvar()` -- there is no parser here to raise on a malformed body,
+        so without this check a session-expired HTML page (see
+        :func:`looks_like_session_expired_html` and GitHub issue #5) would sail straight through
+        as if it were legitimate `hoststatus.asp` text. That is exactly the false-positive issue #5
+        reported against `asmb8_info(include_web_session=true)`: `logged_in: true` reported
+        alongside a `host_status_raw` that was really this page. Raising `errors.ProtocolError`
+        here instead means that failure now propagates and fails the caller outright, matching how
+        `asmb8_info` already documents this one diagnostic read as hard-failing (never degrading)
+        when `include_web_session=true` -- see that module's DOCUMENTATION.
         """
-        return self._request("GET", "/rpc/hoststatus.asp", operation="get_host_status").text
+        body = self._request("GET", "/rpc/hoststatus.asp", operation="get_host_status").text
+        self._raise_if_session_expired(body, operation="get_host_status")
+        return body
 
     def set_power(self, command: str) -> str:
         """POST a power command to ``hostctl.asp``.

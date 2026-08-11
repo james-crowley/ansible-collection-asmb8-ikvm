@@ -153,8 +153,8 @@ options:
     description:
       - >-
         Bounded number of seconds O(state=started) waits for the background process to report
-        V(serving) or an early failure (most commonly the requested O(port) already being in use)
-        before returning.
+        V(serving) or an early failure (most commonly the requested O(port) already being in use,
+        or the startup self-test described under RV(session_state) failing) before returning.
       - >-
         Expiring without a V(serving) report is a failure, with RV(ignore:error_class) V(timeout).
         The background process is not torn down in that case, because it may simply be slow to
@@ -240,6 +240,16 @@ session_state:
       The last state the background process reported: V(starting) (forked, not yet listening),
       V(serving), V(stopped), or V(error). V(unknown) if O(state=stopped) found no state file at
       all.
+    - >-
+      B(V(serving) means a real HTTP request was already proven to work), not merely that a
+      socket is bound and listening. Before the background process ever reports V(serving), it
+      issues one real GET against the address and port it just bound -- for a real file under
+      O(path) when one exists, otherwise for a path guaranteed not to exist, accepting a
+      well-formed C(404) as the best available proof when there is nothing to fetch -- and demands
+      the expected bytes back within a few seconds. A daemon whose socket is listening but that is
+      not actually servicing it for any reason fails this check and reports V(error) instead, so a
+      V(serving) receipt is something a caller can act on rather than a promise the socket alone
+      cannot keep.
   type: str
   returned: always
 pid:
@@ -262,7 +272,11 @@ root:
   type: str
   returned: when available
 request_count:
-  description: Total HTTP requests served (or refused) so far, mirroring C(operation.observed.request_count).
+  description: >-
+    Total HTTP requests served (or refused) so far, mirroring C(operation.observed.request_count).
+    Never includes the one startup self-test request described under RV(session_state) -- this
+    counts real client traffic only, so it reads V(0) immediately after a fresh V(serving) receipt,
+    before anything downstream has actually connected.
   type: int
   returned: always
 bytes_served:

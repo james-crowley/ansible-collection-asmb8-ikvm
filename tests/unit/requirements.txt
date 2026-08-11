@@ -7,6 +7,15 @@
 requests>=2.25.0
 pytest>=7.0.0
 pytest-mock>=3.10.0
+# tests/unit/plugins/module_utils/test_asp.py's self_signed_tls_endpoint
+# fixture generates an ephemeral RSA key and self-signed leaf in-process to
+# drive a real TLS 1.2 handshake against this board's cipher set (BMC_CIPHERS)
+# -- proving the fingerprint-pin, validate_certs=false, and ordinary-CA trust
+# modes each behave correctly against an actual socket, not just a requests
+# mock. Generating in-process, rather than shelling out to openssl or
+# committing a fixture key/cert pair, keeps no private key in the repository
+# and avoids depending on an external openssl binary across the units matrix.
+cryptography>=3.4.0
 # module_utils/ipmi.py (asmb8_power/asmb8_boot/asmb8_info) wraps this directly
 # rather than shelling out to community.general.ipmi_power/ipmi_boot -- see
 # that module's docstring. tests/unit/plugins/module_utils/test_ipmi.py mocks

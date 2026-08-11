@@ -164,8 +164,6 @@ class TestInitialStateRecord:
             "image",
             "bytes_read",
             "sectors_served",
-            "read_trace",
-            "read_trace_dropped",
             "last_request_at",
             "started_at",
             "updated_at",
@@ -180,14 +178,24 @@ class TestInitialStateRecord:
         assert record["error_class"] is None
         assert record["bytes_read"] == 0
         assert record["sectors_served"] == 0
-        assert record["read_trace"] == []
-        assert record["read_trace_dropped"] == 0
         assert record["last_request_at"] is None
         assert record["idle_polls"] == 0
         assert record["idle_poll_interval_seconds"] == media_session._RECV_POLL_TIMEOUT
         assert record["current_idle_streak"] is None
         assert record["last_idle_streak"] is None
         assert record["stop_reason"] is None
+
+    def test_never_carries_a_read_trace_field_of_its_own(self):
+        # The READ(10)/READ(12) trace lives entirely in the append-only sidecar
+        # log (media_session.read_trace_log_path/read_trace_summary), never as a
+        # field on this dict -- see this module's own docstring point 3. This is
+        # what keeps _persist()'s atomic rewrite a constant cost per request
+        # regardless of how large a session's trace has grown.
+        record = media_session._initial_state(session_id="abc", endpoint=EXAMPLE_ENDPOINT, pid=4242, image="/srv/x.iso")
+        assert "read_trace" not in record
+        assert "read_trace_dropped" not in record
+        assert "read_trace_head" not in record
+        assert "read_trace_tail" not in record
 
     def test_never_contains_a_password_or_token_shaped_field(self):
         record = media_session._initial_state(session_id="abc", endpoint=EXAMPLE_ENDPOINT, pid=4242, image="/srv/x.iso")
@@ -255,6 +263,148 @@ class TestCloseIdleStreak:
         media_session._close_idle_streak(state, now="t3")
         assert state["last_idle_streak"]["started_at"] == "t2"
         assert state["last_idle_streak"]["ended_at"] == "t3"
+
+
+# ===========================================================================
+# read_trace_summary(): the two-ended retention policy, applied on read to a
+# hand-built sidecar log -- isolated from the real daemon loop (see
+# TestRunDaemonIdleHandling's own read-trace tests for that), the same way
+# TestCloseIdleStreak isolates _close_idle_streak above.
+# ===========================================================================
+
+
+def _write_trace_lines(runtime_dir, session_id: str, entries: list[dict]) -> None:
+    """Write ``entries`` straight to the sidecar log, bypassing the daemon
+    entirely -- these tests are about read_trace_summary()'s own retention
+    arithmetic, not about _run_daemon wiring it up (that is
+    TestRunDaemonIdleHandling's job, a few classes below).
+    """
+    path = media_session.read_trace_log_path(runtime_dir, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+
+
+def _synthetic_reads(count: int) -> list[dict]:
+    """``count`` distinct, trivially orderable trace entries: LBA i for the i-th one."""
+    return [{"opcode": "0x28", "lba": i, "blocks": 1} for i in range(1, count + 1)]
+
+
+class TestReadTraceSummaryRetention:
+    def test_missing_sidecar_reads_as_all_empty_not_an_exception(self, tmp_path):
+        summary = media_session.read_trace_summary(tmp_path, "never-existed")
+        assert summary == {"read_trace_head": [], "read_trace_tail": [], "read_trace_dropped": 0}
+
+    def test_a_trace_smaller_than_the_head_limit_is_entirely_in_the_head_with_an_empty_tail(self, tmp_path):
+        _write_trace_lines(tmp_path, "sess", _synthetic_reads(5))
+        summary = media_session.read_trace_summary(tmp_path, "sess", head_limit=128, tail_limit=128)
+        assert [e["lba"] for e in summary["read_trace_head"]] == [1, 2, 3, 4, 5]
+        assert summary["read_trace_tail"] == []
+        assert summary["read_trace_dropped"] == 0
+
+    def test_a_trace_exactly_at_the_head_limit_leaves_the_tail_empty(self, tmp_path):
+        _write_trace_lines(tmp_path, "sess", _synthetic_reads(128))
+        summary = media_session.read_trace_summary(tmp_path, "sess", head_limit=128, tail_limit=128)
+        assert len(summary["read_trace_head"]) == 128
+        assert summary["read_trace_tail"] == []
+        assert summary["read_trace_dropped"] == 0
+
+    def test_a_trace_between_the_two_limits_fills_the_tail_with_no_gap_and_no_overlap(self, tmp_path):
+        # 200 total: head keeps 1-128, tail keeps 129-200 (72 entries) -- every
+        # entry accounted for exactly once across the two lists, no drops.
+        _write_trace_lines(tmp_path, "sess", _synthetic_reads(200))
+        summary = media_session.read_trace_summary(tmp_path, "sess", head_limit=128, tail_limit=128)
+        assert len(summary["read_trace_head"]) == 128
+        assert summary["read_trace_head"][-1]["lba"] == 128
+        assert len(summary["read_trace_tail"]) == 72
+        assert summary["read_trace_tail"][0]["lba"] == 129
+        assert summary["read_trace_tail"][-1]["lba"] == 200
+        assert summary["read_trace_dropped"] == 0
+        # The boundary is contiguous (no real gap) precisely because dropped is 0 --
+        # confirmed arithmetically, not just by inspection.
+        assert summary["read_trace_tail"][0]["lba"] - summary["read_trace_head"][-1]["lba"] == 1
+
+    def test_a_trace_past_both_limits_keeps_both_ends_with_an_exact_dropped_count(self, tmp_path):
+        # This is the shape issue #6 item 3 exists for: a late failure, far past
+        # what a head-only trace could ever show (docs/hardware-evidence-2026-08-08.md's
+        # 32,741-read session that stopped ~22,000 reads in). 300 total, 128 head +
+        # 128 tail retained, 44 discarded from the middle.
+        _write_trace_lines(tmp_path, "sess", _synthetic_reads(300))
+        summary = media_session.read_trace_summary(tmp_path, "sess", head_limit=128, tail_limit=128)
+        assert [e["lba"] for e in summary["read_trace_head"][:3]] == [1, 2, 3]
+        assert summary["read_trace_head"][-1]["lba"] == 128
+        assert summary["read_trace_tail"][0]["lba"] == 173  # 300 - 128 + 1
+        assert summary["read_trace_tail"][-1]["lba"] == 300
+        assert summary["read_trace_dropped"] == 44
+        # The gap is exactly dropped + 1 requests wide, never 1 -- this is what
+        # makes it structurally impossible to mistake for adjacent-in-time
+        # history, per this function's own docstring.
+        gap = summary["read_trace_tail"][0]["lba"] - summary["read_trace_head"][-1]["lba"]
+        assert gap == summary["read_trace_dropped"] + 1
+
+    def test_a_late_failure_is_visible_in_the_tail_when_the_head_alone_would_miss_it(self, tmp_path):
+        # The concrete scenario from the task brief: the early boot chain (a
+        # handful of catalogue/El-Torito LBAs) succeeds, then ~22,000 ordinary
+        # reads happen, then the trace goes quiet right where a real install
+        # actually stalled. A head-only trace (the previous design) would show
+        # only the healthy boot chain and nothing about the stall.
+        boot_chain = [{"opcode": "0x28", "lba": lba, "blocks": 1} for lba in (0, 1, 16, 17, 18)]
+        bulk_reads = [{"opcode": "0x28", "lba": 1000 + i, "blocks": 16} for i in range(21995)]
+        stall_tail = [{"opcode": "0x28", "lba": 415602, "blocks": 16}] * 3  # repeated same-LBA reads: a stall signature.
+        _write_trace_lines(tmp_path, "sess", boot_chain + bulk_reads + stall_tail)
+        summary = media_session.read_trace_summary(tmp_path, "sess")  # default 128/128 limits.
+        assert [e["lba"] for e in summary["read_trace_head"][:5]] == [0, 1, 16, 17, 18]
+        assert summary["read_trace_tail"][-1]["lba"] == 415602
+        assert summary["read_trace_tail"][-1]["blocks"] == 16
+        assert summary["read_trace_dropped"] > 0  # the bulk of the 22,003 middle reads are gone, by design.
+
+    def test_a_torn_final_line_is_skipped_not_raised(self, tmp_path):
+        # Pins exactly how much an unclean death can cost (see this module's own
+        # docstring point 3): the ONE entry physically in flight when the
+        # process died, if any -- everything flushed before it is untouched.
+        path = media_session.read_trace_log_path(tmp_path, "sess")
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"opcode": "0x28", "lba": 1, "blocks": 1}) + "\n")
+            handle.write(json.dumps({"opcode": "0x28", "lba": 2, "blocks": 1}) + "\n")
+            handle.write('{"opcode": "0x28", "lba": 3, "bloc')  # torn mid-write, no trailing newline.
+        summary = media_session.read_trace_summary(tmp_path, "sess")
+        assert [e["lba"] for e in summary["read_trace_head"]] == [1, 2]  # only the torn, in-flight entry is lost.
+        assert summary["read_trace_dropped"] == 0
+
+    def test_blank_lines_are_tolerated(self, tmp_path):
+        path = media_session.read_trace_log_path(tmp_path, "sess")
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"opcode": "0x28", "lba": 1, "blocks": 1}) + "\n")
+            handle.write("\n")
+            handle.write(json.dumps({"opcode": "0x28", "lba": 2, "blocks": 1}) + "\n")
+        summary = media_session.read_trace_summary(tmp_path, "sess")
+        assert [e["lba"] for e in summary["read_trace_head"]] == [1, 2]
+
+    def test_flush_without_close_is_enough_for_another_reader_to_see_every_entry(self, tmp_path):
+        # This is the crash-durability guarantee this design actually depends
+        # on, pinned directly: a writer that flush()es after every write, but
+        # is then killed before ever calling close() (standing in for a real
+        # SIGKILL, which gives a process no chance to run its own finally
+        # block), must still leave every already-flushed entry visible to a
+        # SEPARATE reader -- exactly what read_trace_summary() is. See
+        # TestReadTraceSurvivesAnUncleanDeath below for the same property
+        # proven against a REAL forked process and a REAL SIGKILL.
+        path = media_session.read_trace_log_path(tmp_path, "sess")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        handle = os.fdopen(fd, "a", encoding="utf-8")
+        try:
+            for lba in (16, 17, 18):
+                handle.write(json.dumps({"opcode": "0x28", "lba": lba, "blocks": 1}) + "\n")
+                handle.flush()
+            # Deliberately no handle.close() here -- the writer's fd is simply
+            # abandoned, the way a SIGKILLed process's fds are, to prove close()
+            # was never what made this data durable.
+            summary = media_session.read_trace_summary(tmp_path, "sess")
+            assert [e["lba"] for e in summary["read_trace_head"]] == [16, 17, 18]
+            assert summary["read_trace_dropped"] == 0
+        finally:
+            handle.close()  # tidy up for the test process itself; irrelevant to the property just proven.
 
 
 # ===========================================================================
@@ -569,6 +719,20 @@ def _read10_frame(*, lba: int, blocks: int, sequence_number: int = 1) -> bytes:
     return iusb.Header(data_packet_len=len(payload), sequence_number=sequence_number).marshal() + bytes(payload)
 
 
+def _read12_frame(*, lba: int, blocks: int, sequence_number: int = 1) -> bytes:
+    # READ(12) (0xA8): 4-byte LBA at CDB offset 2 (same as READ(10)), but a
+    # 4-byte transfer length at CDB offset 6 -- NOT the 2-byte field READ(10)
+    # carries at offset 7. See docs/protocol-notes.md's "Big-endian CDB
+    # fields inside a little-endian wrapper" and iusb.py's own
+    # CDROMDevice.handle() SCSI_READ12 branch, which this frame is built to
+    # match exactly.
+    payload = bytearray(29)
+    payload[iusb.OPCODE_OFFSET] = iusb.SCSI_READ12
+    payload[iusb.OPCODE_OFFSET + 2 : iusb.OPCODE_OFFSET + 6] = lba.to_bytes(4, "big")
+    payload[iusb.OPCODE_OFFSET + 6 : iusb.OPCODE_OFFSET + 10] = blocks.to_bytes(4, "big")
+    return iusb.Header(data_packet_len=len(payload), sequence_number=sequence_number).marshal() + bytes(payload)
+
+
 class TestRunDaemonIdleHandling:
     """The highest-consequence behaviour in this whole daemon.
 
@@ -635,11 +799,47 @@ class TestRunDaemonIdleHandling:
         assert final["sectors_served"] == 0  # READ CAPACITY(10) reports capacity; it does not itself transfer sectors
         assert final["last_request_at"] is not None
 
-    def test_read_trace_records_lba_and_block_count(self, harness):
-        script = [*self._handshake(), _read10_frame(lba=4130, blocks=4, sequence_number=9), _kill_frame()]
-        final = harness(script)
-        assert final["read_trace"] == [{"opcode": "0x28", "lba": 4130, "blocks": 4}]
-        assert final["read_trace_dropped"] == 0
+    def test_read10_trace_records_lba_and_block_count(self, harness):
+        # READ(10) (0x28): 4-byte LBA at CDB offset 2, 2-byte transfer length
+        # at CDB offset 7 -- see _read10_frame's own construction and
+        # docs/protocol-notes.md's documented CDB layout.
+        final = harness([*self._handshake(), _read10_frame(lba=4130, blocks=4, sequence_number=9), _kill_frame()])
+        # The trace is never a field of the state dict itself -- see this
+        # module's own docstring point 3 -- it lives entirely in the sidecar
+        # log, reconstructed by read_trace_summary().
+        assert "read_trace" not in final
+        assert "read_trace_dropped" not in final
+        summary = media_session.read_trace_summary(harness.runtime_dir, "idle-session")
+        assert summary["read_trace_head"] == [{"opcode": "0x28", "lba": 4130, "blocks": 4}]
+        assert summary["read_trace_tail"] == []  # one request total, well under the head limit -- no overlap.
+        assert summary["read_trace_dropped"] == 0
+
+    def test_read12_trace_records_lba_and_block_count(self, harness):
+        # READ(12) (0xA8): the SAME 4-byte LBA at CDB offset 2 as READ(10), but a
+        # 4-byte (not 2-byte) transfer length at CDB offset 6 -- the exact
+        # distinction this project has already been bitten by once (a CDB field
+        # read at the wrong offset). LBA 415602 mirrors the real sector this
+        # project's own hardware evidence recorded a read timeout at (see
+        # docs/hardware-evidence-2026-08-08.md, "A real installer reached 70%...").
+        final = harness([*self._handshake(), _read12_frame(lba=415602, blocks=16, sequence_number=9), _kill_frame()])
+        assert "read_trace" not in final
+        summary = media_session.read_trace_summary(harness.runtime_dir, "idle-session")
+        assert summary["read_trace_head"] == [{"opcode": "0xa8", "lba": 415602, "blocks": 16}]
+        assert summary["read_trace_dropped"] == 0
+
+    def test_the_sidecar_log_is_removed_by_remove_state(self, harness):
+        harness([*self._handshake(), _read10_frame(lba=16, blocks=1, sequence_number=9), _kill_frame()])
+        log_path = media_session.read_trace_log_path(harness.runtime_dir, "idle-session")
+        assert log_path.exists()
+        media_session.remove_state(harness.runtime_dir, "idle-session")
+        assert not log_path.exists()
+        # A summary computed after removal degrades to empty, not an exception --
+        # the same tolerance read_state() itself has for a state file that is gone.
+        assert media_session.read_trace_summary(harness.runtime_dir, "idle-session") == {
+            "read_trace_head": [],
+            "read_trace_tail": [],
+            "read_trace_dropped": 0,
+        }
 
     def test_updated_at_advances_on_idle_while_last_request_at_does_not(self, harness, monkeypatch):
         # The operator-facing contract this test pins: updated_at is a heartbeat (moves
@@ -997,6 +1197,111 @@ class TestSpawnSessionRealFork:
         assert final["state"] == media_session.STATE_DETACHED
         assert final["stop_reason"] == "signal"
         assert final["error"] is None
+
+
+# ===========================================================================
+# The read-trace's crash-durability guarantee, proven against a REAL forked
+# process and a REAL, uncatchable SIGKILL -- not just the in-process
+# flush()-without-close() property TestReadTraceSummaryRetention already
+# pins above. SIGKILL gives a process no chance to run ANY of its own
+# teardown, including the `finally` block's trace_log.close() -- so this is
+# the strongest evidence available that the sidecar's durability comes from
+# flush() during normal operation, not from any clean-exit path.
+# ===========================================================================
+
+
+@pytest.fixture
+def real_fork_spawn_with_reads(tmp_path, monkeypatch):
+    """Same shape as ``real_fork_spawn`` above, except the scripted transport's
+    buffer already contains two READ(10) frames right after the auth ACK,
+    before it starts reporting idle-forever -- so the forked daemon serves
+    (and traces) two real reads during its own normal operation, before this
+    test ever sends it a signal.
+    """
+    image_path = tmp_path / "fork-boot-reads.iso"
+    image_path.write_bytes(b"\x00" * (4 * iusb.CD_BLOCK_SIZE))
+    runtime_dir = tmp_path / "fork-runtime-reads"
+
+    monkeypatch.setattr(media_session, "AspClient", _FakeAspClient)
+    monkeypatch.setattr(media_session, "resolve_local_ip", lambda _host: "203.0.113.1")
+    _FakeAspClient.instances = []
+
+    auth_header = iusb.Header(data_packet_len=iusb.AUTH_PAYLOAD_LEN)
+    # _ForkStopSignalTransport only knows "consume bytes off a buffer, then idle
+    # forever once it runs dry" -- it has no notion of frame boundaries, so
+    # concatenating the ACK and two READ(10) frames into one buffer is enough to
+    # make the real serve_forever() loop process all three in order, then fall
+    # through to idle-forever exactly as if nothing had been added.
+    handshake_and_reads = _ack_frame(auth_header) + _read10_frame(lba=16, blocks=1, sequence_number=2) + _read10_frame(lba=17, blocks=1, sequence_number=3)
+    monkeypatch.setattr(
+        iusb.Session,
+        "connect",
+        classmethod(lambda cls, *_a, **_k: cls.from_transport(_ForkStopSignalTransport(handshake_and_reads), "STOKEN-fake-not-real")),
+    )
+
+    spawned: list[_RealForkDaemonHandle] = []
+
+    def _spawn(*, session_id: str = "fork-sigkill-session") -> _RealForkDaemonHandle:
+        config = _config(session_id=session_id, runtime_dir=runtime_dir, image=str(image_path))
+        pid = media_session.spawn_session(config, username="admin", password="test-password-not-real")
+        handle = _RealForkDaemonHandle(pid, runtime_dir, session_id)
+        spawned.append(handle)
+        return handle
+
+    yield _spawn
+
+    for handle in spawned:
+        if media_session.is_pid_alive(handle.pid):
+            # SIGKILL, not request_stop()'s SIGTERM -- some tests below already
+            # kill their own handle, so this is only a backstop for one that
+            # raised before doing so.
+            os.kill(handle.pid, signal.SIGKILL)
+            media_session.wait_for_exit(handle.pid, timeout=5.0)
+
+
+class TestReadTraceSurvivesAnUncleanDeath:
+    def test_sigkill_leaves_every_already_served_read_durable_in_the_sidecar(self, real_fork_spawn_with_reads):
+        handle = real_fork_spawn_with_reads()
+        handle.wait_for_attached()
+
+        # Poll the SIDECAR LOG directly (a real cross-process read) for proof that
+        # both scripted reads have actually been traced -- not a fixed sleep, which
+        # would make this test's timing an assumption rather than an observation.
+        # Deliberately NOT state()'s own sectors_served: on_request() (which writes
+        # the trace) fires BEFORE handler.handle() runs for that same request (see
+        # iusb.Session.serve_forever), so sectors_served always lags the trace by
+        # exactly one request and would never reliably reach 2 here once the script
+        # runs dry and the daemon goes idle-forever right after the second read.
+        deadline = time.time() + 5.0
+        served = False
+        while time.time() < deadline:
+            summary = media_session.read_trace_summary(handle.runtime_dir, handle.session_id)
+            if len(summary["read_trace_head"]) + len(summary["read_trace_tail"]) >= 2:
+                served = True
+                break
+            time.sleep(0.05)
+        assert served, "the forked daemon never traced both scripted reads"
+
+        # A real, uncatchable SIGKILL -- deliberately NOT request_stop()'s SIGTERM,
+        # which TestSpawnSessionRealFork above already proves runs this daemon's
+        # normal teardown (session.close(), a final state write, and this
+        # function's own `finally` block closing trace_log). SIGKILL skips ALL of
+        # that: no signal handler runs, no `finally` block runs, nothing in this
+        # process ever gets a chance to flush or close anything again.
+        os.kill(handle.pid, signal.SIGKILL)
+        deadline = time.time() + 5.0
+        while media_session.is_pid_alive(handle.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        assert not media_session.is_pid_alive(handle.pid), "SIGKILL should have ended the process"
+
+        # And yet: both reads, served before the kill, are still on disk -- because
+        # each one was already flush()ed to the OS at the moment _on_request
+        # returned, well before this SIGKILL was ever sent. Nothing about this
+        # depends on the daemon's own clean-exit path, which it never got to run.
+        summary = media_session.read_trace_summary(handle.runtime_dir, handle.session_id)
+        served_lbas = {entry["lba"] for entry in summary["read_trace_head"] + summary["read_trace_tail"]}
+        assert served_lbas == {16, 17}
+        assert summary["read_trace_dropped"] == 0
 
 
 def _dead_pid() -> int:

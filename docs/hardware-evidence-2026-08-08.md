@@ -707,6 +707,65 @@ Also recorded from that cold reset, since it is directly useful: the host was
 IPMI (UDP 623) answered several minutes before TCP 443 did. A readiness check
 keyed on ping therefore reports success while the web stack is still down.
 
+## Authenticated `GET` reads require `CSRFTOKEN` on some endpoints — resolved 2026-08-11
+
+Reported as [GitHub issue
+#5](https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues/5), live-hardware
+evidence from the same target board (firmware 1.14, aux 1.14.2), reported by the maintainer who
+owns access to it. Recorded here in full because it retires a specific wrong inference this project
+made elsewhere in its own code and docs, and this log exists precisely so a wrong turn is recorded,
+not quietly deleted.
+
+**The finding.** An authenticated `GET` against five endpoints —
+`getalllancfg.asp`, `getlanchannelinfo.asp`, `getdnscfg.asp`, `getnwbondcfg.asp`, `checknwbond.asp`
+— returned HTTP 200 with a byte-identical, 2,223-byte HTML page (SHA-256
+`7129528f34a2b230534e705ad8cb230cd1f5d4ae0362a9f9694c99b61f4c3427`) containing HTML/login markers
+and no `WEBVAR_JSONVAR_*`, even with a session freshly authenticated moments before. The identical
+request, plus the `CSRFTOKEN` header harvested from the login response, got back an ordinary
+`WEBVAR_JSONVAR_*` response every time, on every one of the five endpoints.
+
+**The inference this project had drawn from an earlier, partial sample was wrong, and this is why
+that matters.** Before issue #5, this project's own code comments and docs (`module_utils/asp.py`,
+`docs/protocol-notes.md`) asserted that this collection's `GET` reads "already work without"
+`CSRFTOKEN`, and that whether this firmware enforces the header at all was "unverified" as a
+blanket statement about `GET`. That claim was built by testing a handful of endpoints by hand —
+`getvmediacfg`, `getallservicescfg`, `getdatetime`, `getntpcfg` — none of which happen to enforce
+the header, and generalising "works without it" from that sample to `GET` reads in general.
+**Enforcement turned out to be per-endpoint, not a property of the HTTP method.** Four endpoints
+tested by hand did not care about the header; five endpoints tested later did, every time. The
+lesson generalises beyond this one header: a handful of endpoints behaving consistently is evidence
+about those endpoints, not about the surface as a whole, and this project had already been burned
+by exactly this shape of over-generalisation once before (see "READ TOC must honour the CDB
+allocation length" above, on a different surface).
+
+**The fix.** `AspClient._headers()` now attaches `CSRFTOKEN` to every non-`WEBSES` request,
+`GET` included — matching the vendor JavaScript's own URL-based rule in `lib/xmit.js` exactly,
+rather than the narrower, GET-excluded rule this project had previously implemented on the
+assumption above.
+
+**A second thing this same report resolved: `getremotesession.asp`'s "for reasons not yet
+identified" session-expired quirk.** `asmb8_info.py` and `asmb8_sessions.py` both recorded that this
+one endpoint answers a programmatic client with a session-expired HTML page even immediately after
+a fresh, successful login, working fine from a browser, "for reasons not yet identified". The
+missing `CSRFTOKEN` header is that reason, as a general mechanism — but `getremotesession.asp`
+itself was **not** one of the five endpoints issue #5 tested, so whether it specifically enforces
+`CSRFTOKEN` is still not confirmed either way. Both modules continue to treat a parse failure on
+that one endpoint as an expected, degraded (not fatal) outcome; see each module's own documentation
+for the corrected framing.
+
+**A false-positive this collection produced, now closed.** Before this report, `AspClient` had no
+detector at all for the session-expired HTML shape: `AspClient.get_host_status()` returned it
+verbatim, so `asmb8_info(include_web_session=true)` could report `logged_in: true` alongside a
+`host_status_raw` that was really this page — a confident wrong answer, worse than a hard failure.
+`module_utils/asp.py`'s `looks_like_session_expired_html()` now recognises this shape *structurally*
+(an HTML document carrying a login/session marker, with none of this format's own
+`WEBVAR_JSONVAR_` marker) — deliberately not by the 2,223-byte length or the SHA-256 above, since
+either would be a property of one firmware build's rendering of this one page and would silently
+stop matching the moment a firmware revision changed so much as a whitespace character in a page
+this project does not control. `get_host_status()`, `get_webvar()`, `post_webvar()`, and
+`set_webvar()` all check for it now, and none of this collection's ~58 real, redacted WEBVAR/JSONVAR
+fixtures under `tests/unit/fixtures/asp/` trip it.
+
 ## Still unproven — do not claim these
 
 - **Whether the guest OS can obtain its own media session.** Once Linux boots it

@@ -102,8 +102,8 @@ avoid combining it with a concurrent play against the same BMC regardless.
 | `asmb8.ipmi.power_state` | `dict` | when available | `pyghmi`'s `get_power()` verbatim, or `null` if this particular read failed. |
 | `asmb8.ipmi.boot_device` | `dict` | when available | `pyghmi`'s `get_bootdev()` verbatim; `uefimode` may be absent on the branch where the BMC reports no standing override at all. |
 | `asmb8.ipmi.mc_info` | `str` | when available | `pyghmi`'s `get_mci()` — a bare string, **not** a dict, unlike the two facts above. |
-| `asmb8.web_management.logged_in` | `bool` | when `include_web_session=true` | Always `true` when present — a rejected login fails the whole module instead. |
-| `asmb8.web_management.host_status_raw` | `str` | when `include_web_session=true` | Raw `hoststatus.asp` text, truncated. **Unparsed and unverified shape** — see `plugins/module_utils/asp.py`'s own TODO on this endpoint. |
+| `asmb8.web_management.logged_in` | `bool` | when `include_web_session=true` | Always `true` when present — either a rejected login or `hoststatus.asp` returning a session-expired-looking body (see below) fails the whole module instead of appearing here. |
+| `asmb8.web_management.host_status_raw` | `str` | when `include_web_session=true` | Raw `hoststatus.asp` text, truncated. **Unparsed and unverified shape** — see `plugins/module_utils/asp.py`'s own TODO on this endpoint. Checked, before this module ever sees it, against `looks_like_session_expired_html()` — see "Diagnosing a failed virtual-media attach" below. |
 | `asmb8.capabilities.ipmi_power` / `.ipmi_boot_device` / `.ipmi_mc_info` | `dict` | always | `{supported: true, proven: true, note: ...}` — proven live against the target board. |
 | `asmb8.capabilities.web_management` | `dict` | always | `proven` is `true` only when `include_web_session=true` **and** the login succeeded on this run. |
 | `asmb8.capabilities.virtual_media` / `.remote_console` | `dict` | always | `{supported: null, proven: false, ...}` — not yet proven against this hardware. `null` (not `false`) means unknown, not unsupported. |
@@ -140,7 +140,12 @@ From `plugins/module_utils/errors.py`, via `IkvmError` subclasses:
   this module on the IPMI side; individual IPMI *reads* are caught and
   recorded in `operation.ipmi_reads` instead, per field).
 - `protocol` — the `.asp` login response did not contain a `SESSION_COOKIE`
-  value at all, when `include_web_session=true`.
+  value at all, when `include_web_session=true`. Also raised when
+  `hoststatus.asp` returns a session-expired-looking HTML body (see
+  `module_utils/asp.py`'s `looks_like_session_expired_html()`) — this module
+  never returns `logged_in: true` alongside that shape; see
+  `asmb8.web_management.logged_in` in the return-values table above and
+  "Diagnosing a failed virtual-media attach" below.
 - `authentication` — the `.asp` login itself was rejected (this board answers
   bad credentials with HTTP 200 and a `Failure_Login_*` marker, not a 4xx —
   see `plugins/module_utils/asp.py`), when `include_web_session=true`.
@@ -185,10 +190,30 @@ alongside it.
 **`getremotesession.asp` is unverified against a programmatic client, and this
 module degrades accordingly.** This project's own testing found that endpoint
 answers a fresh, otherwise-successful login with a session-expired-looking
-HTML page — the identical request sequence works from a browser, and what a
-programmatic client additionally needs has not been identified (see
+HTML page — the identical request sequence works from a browser.
+
+**Correction (2026-08-11):** this section previously said what a programmatic
+client additionally needs "has not been identified". [GitHub issue
+#5](https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues/5)
+identified a general mechanism for exactly that symptom, on five *other*
+endpoints (`getalllancfg.asp`, `getlanchannelinfo.asp`, `getdnscfg.asp`,
+`getnwbondcfg.asp`, `checknwbond.asp`): a missing `CSRFTOKEN` header, which
+`AspClient` now attaches to every non-`WEBSES` request (see
+`module_utils/asp.py`'s `AspClient._headers()`). Whether `getremotesession.asp`
+itself is one of the endpoints that enforces `CSRFTOKEN` is **not** itself
+confirmed either way — it was not one of the five issue #5 tested — so this
+remains a documented, unverified gap for this specific endpoint, not
+something the general fix is known to have closed; see
 [`asmb8_sessions`](asmb8_sessions.md) for the same, independently observed
-gap). `asmb8.media.preconditions.encryption.media_encryption_enabled` and
+gap. `module_utils/asp.py`'s `looks_like_session_expired_html()` now
+recognises this HTML shape structurally (an HTML document with login/session
+markers and no `WEBVAR_JSONVAR_`, matched by shape rather than by the byte
+length or digest issue #5 measured — see that function's docstring), which
+gives the parse failure below a specific, accurate message instead of a
+generic complaint that gave no hint the response was ever this identifiable
+shape.
+
+`asmb8.media.preconditions.encryption.media_encryption_enabled` and
 `.attach.attach_raw` are sourced from that endpoint, so on a parse failure
 both degrade to `null` and `asmb8.media.preconditions.remote_session_read`
 reports `{outcome: "failed", ...}` — this module does **not** fail outright
@@ -196,6 +221,23 @@ over it. `getvmediacfg.asp` has shown no equivalent failure mode in this
 project's testing, so a failure reading it **is not** degraded the same way:
 it fails this module, consistent with `include_web_session`'s own diagnostic
 read.
+
+**`hoststatus.asp`, under plain `include_web_session=true`, is treated
+differently again.** Unlike `getremotesession.asp`'s degrade-to-`null`
+treatment above, a session-expired body from `hoststatus.asp` is **not**
+degraded — `AspClient.get_host_status()` raises `errors.ProtocolError` on it,
+and this module lets that propagate and fail the whole run, exactly like a
+rejected login already does. This is deliberate, not an inconsistency: this
+module's own documented pattern degrades *individual optional field groups*
+(the media preconditions above) but hard-fails on its one unconditional
+diagnostic read under `include_web_session` — the same asymmetry
+`include_web_session`'s own option documentation already describes for a
+rejected login. Before this fix, `hoststatus.asp` returning this shape was
+returned verbatim and unchecked, so `logged_in: true` could be reported
+alongside a `host_status_raw` that was really this HTML page — the exact
+false positive GitHub issue #5 reported. See
+`asmb8.web_management.logged_in`/`.host_status_raw` in the return-values table
+above.
 
 **`asmb8.media.preconditions.status_raw` (`V_MEDIA_STATUS`) is reported raw,
 with an explicit meaning-unsourced caveat.** An earlier note in this project's

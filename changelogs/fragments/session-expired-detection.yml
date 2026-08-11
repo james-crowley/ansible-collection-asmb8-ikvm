@@ -1,0 +1,14 @@
+---
+bugfixes:
+  - >-
+    C(AspClient) - detect this BMC's session-expired HTML page structurally
+    (an HTML document with login/session markers and no C(WEBVAR_JSONVAR_<NAME>))
+    in C(get_host_status())/C(get_webvar())/C(post_webvar())/C(set_webvar()),
+    and raise C(errors.ProtocolError) naming that shape instead of either a
+    generic parse complaint or -- the false positive GitHub issue #5
+    reported -- returning it as though it were a legitimate response.
+    C(asmb8_info(include_web_session=true)) previously could report
+    C(logged_in: true) alongside a C(host_status_raw) that was really this
+    HTML page; C(get_host_status()) now raises on it instead, and that
+    module lets the failure propagate, matching how a rejected login already
+    fails the module outright.

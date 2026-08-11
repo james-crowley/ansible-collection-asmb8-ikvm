@@ -254,6 +254,19 @@ class TestFetchRemoteSessionConfig:
         with pytest.raises(AuthenticationError):
             asmb8_sessions.fetch_remote_session_config(client)
 
+    def test_the_real_reconstructed_session_expired_fixture_degrades_the_same_way(self):
+        # tests/unit/fixtures/asp/session_expired.html (see that directory's README) is this
+        # collection's own reconstruction of GitHub issue #5's documented HTML shape -- confirms
+        # this degrade path handles it exactly like the inline SESSION_EXPIRED_HTML constant above,
+        # not just that ad hoc string, and that the reason recorded is still "protocol" (accurate:
+        # module_utils/asp.py's looks_like_session_expired_html() now gives that ProtocolError a
+        # specific message naming the shape, rather than leaving the degrade reason vague).
+        client = build_client_with_fixtures({"getremotesession": _read_fixture("session_expired.html")})
+        client.login()
+        remote_session, read = asmb8_sessions.fetch_remote_session_config(client)
+        assert remote_session is None
+        assert read == {"outcome": "failed", "error_class": "protocol"}
+
 
 class TestMainReadOnlyDefault:
     def test_default_run_reports_services_and_remote_session(self, monkeypatch):

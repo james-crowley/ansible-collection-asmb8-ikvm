@@ -81,6 +81,19 @@ description:
     transparent to a normal O(state=attached) call; it is noted here only so an operator manually
     probing O(cd_port) with, say, C(nc)/C(telnet) is not alarmed to find it closed with no session
     active.
+  - >-
+    B(RV(operation.observed.read_trace_head)/RV(operation.observed.read_trace_tail) record a
+    bounded, two-ended trace of every SCSI READ(10)/READ(12) request served -- opcode, LBA, and
+    block count only, B(never media contents or credentials)): the EARLIEST requests (the
+    firmware catalogue/El Torito boot-image reads a stalled early boot would show) and the MOST
+    RECENT ones (wherever the session actually stopped). Both matter: the only real install
+    failure this project has recorded stopped roughly 22,000 reads into a 32,741-read session,
+    deep in package extraction -- a trace of only the earliest requests would show nothing but a
+    healthy early boot. RV(operation.observed.read_trace_dropped) is the exact count of requests
+    discarded between the two, so a reader can never mistake that gap for contiguous history. The
+    underlying trace itself lives in a separate, append-only log next to the state file rather
+    than inside it, so it costs this module's background daemon a single small write per request
+    instead of rewriting a growing trace on every one of (in that real session) 32,741 requests.
 version_added: 0.1.0
 author:
   - Jim Crowley (@james-crowley)
@@ -337,6 +350,68 @@ operation:
         sectors_served:
           description: Total SCSI blocks served by READ(10)/READ(12) commands so far.
           type: int
+        read_trace_head:
+          description:
+            - >-
+              The EARLIEST READ(10)/READ(12) requests this session has served -- opcode
+              (C(0x28)/C(0xA8)), LBA, and block count only. B(Never media contents or
+              credentials.) Answers "did this session ever get past the firmware
+              catalogue/El Torito boot-image reads" for a boot that stalls early.
+            - >-
+              Bounded (128 entries): once full, it stops growing and simply stays as the
+              earliest requests this session ever served. Reconstructed on read from a
+              separate, append-only sidecar log next to the state file, never itself
+              part of the atomically-rewritten state -- see
+              C(plugins/module_utils/media_session.py)'s module docstring point 3 for
+              why (a 32,741-request real install would otherwise pay a full-trace
+              rewrite on every single request).
+          type: list
+          elements: dict
+          contains:
+            opcode:
+              description: C(0x28) (READ(10)) or C(0xa8) (READ(12)), as a lowercase hex string.
+              type: str
+            lba:
+              description: The logical block address requested.
+              type: int
+            blocks:
+              description: The number of blocks requested.
+              type: int
+        read_trace_tail:
+          description:
+            - >-
+              The MOST RECENT READ(10)/READ(12) requests this session has served, in the
+              same C(opcode)/C(lba)/C(blocks) shape as C(read_trace_head). Answers "where
+              did this session actually stop" for a stall deep into an install -- the only
+              real failure this project has recorded (a 32,741-read session that stopped
+              roughly 22,000 reads in, mid package-extraction) stalled far past where
+              C(read_trace_head) alone could ever show.
+            - >-
+              Never overlaps C(read_trace_head): while the total request count is at or
+              below C(read_trace_head)'s own limit, this stays empty rather than
+              duplicating it. Bounded at 128 entries as a rolling window once the total
+              exceeds both limits combined.
+          type: list
+          elements: dict
+          contains:
+            opcode:
+              description: Same shape as C(read_trace_head.opcode).
+              type: str
+            lba:
+              description: Same shape as C(read_trace_head.lba).
+              type: int
+            blocks:
+              description: Same shape as C(read_trace_head.blocks).
+              type: int
+        read_trace_dropped:
+          description: >-
+            Exactly how many requests fall in the discarded gap between C(read_trace_head)
+            and C(read_trace_tail) -- V(0) means those two lists are the COMPLETE record
+            with no gap at all. A nonzero value means the boundary between the tail's
+            earliest entry and the head's latest entry is NOT one request apart; it is
+            this many requests apart, so a reader can never mistake the gap for
+            contiguous history.
+          type: int
         last_request_at:
           description: >-
             Controller-clock ISO-8601 timestamp of the last real SCSI request the background
@@ -515,8 +590,34 @@ def _finalize(receipt: OperationReceipt, *, session_id: str, fields: dict, **ext
     }
 
 
-def _status_fields(state: dict | None) -> dict:
+#: What every ``read_trace_*`` field defaults to when there is no sidecar log
+#: to read yet (no session, or one that never served a single READ(10)/
+#: READ(12)) -- the same empty-but-present shape a real, quiet session would
+#: also produce, per ``media_session.read_trace_summary()``'s own contract.
+_EMPTY_READ_TRACE = {"read_trace_head": [], "read_trace_tail": [], "read_trace_dropped": 0}
+
+
+def _with_trace(state: dict | None, trace: dict) -> dict | None:
+    """Merge a read-trace summary into a raw state dict, for ``operation.observed``.
+
+    The trace never lives inside the state file itself (see
+    ``media_session.py``'s module docstring point 3 -- it is reconstructed on
+    demand from a separate sidecar log), so it has to be stitched into
+    whatever raw dict a caller is about to hand ``OperationReceipt`` as
+    ``observed=`` -- that dict is exactly what ends up under
+    ``operation.observed`` (see ``models.OperationReceipt.to_dict``, which
+    passes a plain dict through unchanged). Returns ``None`` unchanged: a
+    check-mode attach with nothing observed yet has no trace to merge in
+    either.
+    """
+    if state is None:
+        return None
+    return {**state, **trace}
+
+
+def _status_fields(state: dict | None, *, trace: dict | None = None) -> dict:
     state = state or {}
+    trace = trace or _EMPTY_READ_TRACE
     return {
         "session_state": state.get("state", "unknown"),
         "pid": state.get("pid"),
@@ -538,6 +639,15 @@ def _status_fields(state: dict | None) -> dict:
         # BMC-initiated one after the fact -- see media_session.py's module
         # docstring point 2 and roles/asmb8_baremetal_install/README.md.
         "stop_reason": state.get("stop_reason"),
+        # The READ(10)/READ(12) trace -- see media_session.py's module
+        # docstring point 3 and read_trace_summary()'s own docstring for the
+        # retention shape (earliest read_trace_head + most recent
+        # read_trace_tail, with read_trace_dropped counting exactly what falls
+        # in between). No media contents, no credentials -- opcode/LBA/block
+        # count only, per entry.
+        "read_trace_head": trace["read_trace_head"],
+        "read_trace_tail": trace["read_trace_tail"],
+        "read_trace_dropped": trace["read_trace_dropped"],
     }
 
 
@@ -559,8 +669,11 @@ def _attach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
     if existing is not None and media_session.is_pid_alive(existing.get("pid")) and existing.get("state") not in media_session.TERMINAL_STATES:
         # Idempotent: a live session already answers to this id. Never start a second one --
         # this BMC's media slot is single-occupancy, board-wide.
-        fields = _status_fields(existing)
-        receipt = OperationReceipt(action="asmb8_media.attach", endpoint=endpoint, changed=False, previous=existing, desired=None, observed=existing)
+        trace = media_session.read_trace_summary(runtime_dir, session_id)
+        fields = _status_fields(existing, trace=trace)
+        receipt = OperationReceipt(
+            action="asmb8_media.attach", endpoint=endpoint, changed=False, previous=existing, desired=None, observed=_with_trace(existing, trace)
+        )
         return _finalize(receipt, session_id=session_id, fields=fields, reclaimed_sessions=[])
 
     recovered_stale = existing is not None
@@ -577,7 +690,16 @@ def _attach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
     # another process (that would be a mutation), so it only reports what it would reclaim.
     if module.check_mode:
         would_reclaim = [s.get("session_id") for s in media_session.find_conflicting_sessions(runtime_dir, endpoint, exclude_session_id=session_id)]
-        fields = {"session_state": "starting", "pid": None, "bytes_read": 0, "sectors_served": 0, "last_request_at": None, "updated_at": None, "error": None}
+        fields = {
+            "session_state": "starting",
+            "pid": None,
+            "bytes_read": 0,
+            "sectors_served": 0,
+            "last_request_at": None,
+            "updated_at": None,
+            "error": None,
+            **_EMPTY_READ_TRACE,  # nothing has been attached (or read) yet in check mode.
+        }
         receipt = OperationReceipt(action="asmb8_media.attach", endpoint=endpoint, changed=True, previous=existing, desired="attached", observed=None)
         return _finalize(receipt, session_id=session_id, fields=fields, recovered_stale_session=recovered_stale, reclaimed_sessions=would_reclaim)
 
@@ -592,7 +714,8 @@ def _attach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
         until=lambda s: s.get("state") in (media_session.STATE_ATTACHED, media_session.STATE_ERROR, media_session.STATE_DETACHED),
         timeout=float(params["attach_timeout"]),
     )
-    fields = _status_fields(observed)
+    trace = media_session.read_trace_summary(runtime_dir, session_id)
+    fields = _status_fields(observed, trace=trace)
 
     if fields["session_state"] == media_session.STATE_ERROR:
         module.fail_json(
@@ -611,7 +734,8 @@ def _attach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
         pid = (observed or {}).get("pid")
         if not media_session.is_pid_alive(pid):
             final = media_session.read_state(runtime_dir, session_id) or observed
-            final_fields = _status_fields(final)
+            final_trace = media_session.read_trace_summary(runtime_dir, session_id)
+            final_fields = _status_fields(final, trace=final_trace)
             reported = final_fields.get("error") or fields.get("error")
             module.fail_json(
                 msg=(
@@ -663,7 +787,9 @@ def _attach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
         )
         module.fail_json(**err.to_result(), session_id=session_id, reclaimed_sessions=reclaimed, **fields)
 
-    receipt = OperationReceipt(action="asmb8_media.attach", endpoint=endpoint, changed=True, previous=existing, desired="attached", observed=observed)
+    receipt = OperationReceipt(
+        action="asmb8_media.attach", endpoint=endpoint, changed=True, previous=existing, desired="attached", observed=_with_trace(observed, trace)
+    )
     return _finalize(receipt, session_id=session_id, fields=fields, recovered_stale_session=recovered_stale, reclaimed_sessions=reclaimed)
 
 
@@ -681,19 +807,31 @@ def _detach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
     live = media_session.is_pid_alive(pid)
 
     if module.check_mode:
-        fields = _status_fields(existing)
-        receipt = OperationReceipt(action="asmb8_media.detach", endpoint=endpoint, changed=live, previous=existing, desired="detached", observed=existing)
+        trace = media_session.read_trace_summary(runtime_dir, session_id)
+        fields = _status_fields(existing, trace=trace)
+        receipt = OperationReceipt(
+            action="asmb8_media.detach", endpoint=endpoint, changed=live, previous=existing, desired="detached", observed=_with_trace(existing, trace)
+        )
         return _finalize(receipt, session_id=session_id, fields=fields)
 
     if not live:
+        # Read the trace BEFORE remove_state() -- remove_state() deletes the sidecar
+        # log too (see media_session.remove_state's own docstring), and this is the
+        # last chance to surface it in this call's own receipt.
+        trace = media_session.read_trace_summary(runtime_dir, session_id)
+        fields = _status_fields(existing, trace=trace)
         media_session.remove_state(runtime_dir, session_id)
-        fields = _status_fields(existing)
-        receipt = OperationReceipt(action="asmb8_media.detach", endpoint=endpoint, changed=False, previous=existing, desired="detached", observed=existing)
+        receipt = OperationReceipt(
+            action="asmb8_media.detach", endpoint=endpoint, changed=False, previous=existing, desired="detached", observed=_with_trace(existing, trace)
+        )
         return _finalize(receipt, session_id=session_id, fields=fields, recovered_stale_session=True)
 
     media_session.request_stop(pid)
     exited = media_session.wait_for_exit(pid, timeout=float(params["detach_timeout"]))
     final_state = media_session.read_state(runtime_dir, session_id) or existing
+    # Same ordering reason as the stale-session branch above: read the trace before
+    # remove_state() deletes its sidecar log out from under this call's own receipt.
+    trace = media_session.read_trace_summary(runtime_dir, session_id)
     media_session.remove_state(runtime_dir, session_id)
 
     if not exited:
@@ -702,8 +840,10 @@ def _detach(module: AnsibleModule, params: dict, *, endpoint: str) -> dict:
             f"{params['detach_timeout']}s after being signalled; it may still be shutting down."
         )
 
-    fields = _status_fields(final_state)
-    receipt = OperationReceipt(action="asmb8_media.detach", endpoint=endpoint, changed=True, previous=existing, desired="detached", observed=final_state)
+    fields = _status_fields(final_state, trace=trace)
+    receipt = OperationReceipt(
+        action="asmb8_media.detach", endpoint=endpoint, changed=True, previous=existing, desired="detached", observed=_with_trace(final_state, trace)
+    )
     return _finalize(receipt, session_id=session_id, fields=fields, exited_cleanly=exited)
 
 

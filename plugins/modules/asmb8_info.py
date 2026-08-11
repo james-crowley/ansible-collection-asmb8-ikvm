@@ -63,10 +63,17 @@ description:
     RV(asmb8.media.preconditions.attach.attach_raw) are sourced from C(getremotesession.asp), which
     this project's own testing found answers a programmatic client with a session-expired-looking
     HTML page B(even immediately after a fresh, successful login) -- the identical request sequence
-    works from a browser, and what a programmatic client additionally needs has not been
-    identified; see M(james_crowley.asmb8_ikvm.asmb8_sessions)'s own description for the same,
-    independently observed gap. This module therefore treats a parse failure on that one endpoint
-    as expected, not fatal: on failure, both fields above degrade to V(null) and
+    works from a browser. B(Correction:) an earlier version of this description said what a
+    programmatic client additionally needs "has not been identified" -- GitHub issue #5
+    (2026-08-11, live hardware) identified a general mechanism for exactly this symptom: a missing
+    C(CSRFTOKEN) header, confirmed for five other endpoints and now attached by C(asp.py) to every
+    non-C(WEBSES) request. Whether C(getremotesession.asp) itself is one of the endpoints that
+    enforces C(CSRFTOKEN) is B(not) itself confirmed either way -- it was not one of the five issue
+    #5 tested -- so this module continues to treat it as a documented, unverified gap rather than
+    assuming the general fix also covers this specific endpoint; see
+    M(james_crowley.asmb8_ikvm.asmb8_sessions)'s own description for the same, independently
+    observed gap. This module therefore treats a parse failure on that one endpoint as expected, not
+    fatal: on failure, both fields above degrade to V(null) and
     RV(asmb8.media.preconditions.remote_session_read.outcome) reports V(failed), rather than this
     module failing outright. Treat RV(asmb8.media.preconditions.remote_session_read) as the honest
     statement that reading C(getremotesession.asp) working at all, on any given run, is unverified,
@@ -74,6 +81,16 @@ description:
     testing, so a failure reading it is B(not) degraded the same way -- it fails this module
     outright, the same as this module's existing O(include_web_session) diagnostic read already
     does.
+  - >-
+    B(A session-expired body can never produce RV(web_management.logged_in)=V(true).) Earlier,
+    C(hoststatus.asp)'s response was returned verbatim and unchecked, so a session-expired HTML page
+    (see C(module_utils/asp.py)'s C(looks_like_session_expired_html)) would have been reported as a
+    successful C(host_status_raw) read alongside V(logged_in)=V(true) -- a confident wrong answer,
+    and precisely the false positive GitHub issue #5 reported. C(AspClient.get_host_status()) now
+    raises C(errors.ProtocolError) on that shape instead, which this module does not catch: it
+    propagates and fails the whole module, exactly like a rejected login already does under
+    O(include_web_session) (see that option's own documentation for why this module does not hide
+    that class of failure behind a successful-looking IPMI-only result).
   - >-
     RV(asmb8.media.preconditions.status_raw) (C(V_MEDIA_STATUS), via C(getvmediacfg.asp)) is
     reported B(raw only, with no interpretation, and is never used by this module to decide
@@ -257,16 +274,23 @@ asmb8:
       contains:
         logged_in:
           description: >-
-            Whether C(create.asp) accepted the credentials. Always V(true) when
-            present -- a rejected login fails the whole module rather than being
-            reported here (see O(include_web_session)).
+            Whether C(create.asp) accepted the credentials B(and) C(hoststatus.asp) returned
+            something other than a session-expired-looking body. Always V(true) when present --
+            either kind of failure (a rejected login, or C(hoststatus.asp) answering with the HTML
+            shape C(module_utils/asp.py)'s C(looks_like_session_expired_html) detects) fails the
+            whole module rather than being reported here (see O(include_web_session)). This field
+            can therefore never be V(true) alongside a session-expired
+            RV(asmb8.web_management.host_status_raw) -- see GitHub issue #5, which reported exactly
+            that false-positive combination before C(get_host_status()) started raising on it.
           type: bool
         host_status_raw:
           description: >-
             Raw C(hoststatus.asp) response text, truncated, for diagnosis only.
             C(module_utils/asp.py) documents this endpoint's response shape as
             B(unverified) -- it is not parsed, and no field within it is claimed
-            to mean anything specific.
+            to mean anything specific. It is, however, checked for the
+            session-expired HTML shape before this module ever sees it -- see
+            RV(asmb8.web_management.logged_in).
           type: str
     capabilities:
       description: >-
@@ -594,7 +618,14 @@ def gather_web_management_facts(asp_client: AspClient) -> dict:
     is also set, rather than this module paying for a second
     C(POST /rpc/WEBSES/create.asp) authentication. A failure reading
     C(hoststatus.asp) is allowed to propagate: see O(include_web_session)'s
-    own documentation for why this module does not swallow it.
+    own documentation for why this module does not swallow it. That now
+    includes C(AspClient.get_host_status()) raising C(errors.ProtocolError) on a
+    session-expired-looking body (see C(module_utils/asp.py)'s
+    C(looks_like_session_expired_html)) -- deliberately not caught here, so it
+    joins a rejected login as a reason this call, and this dict's V(True)
+    C(logged_in), never gets built at all. See GitHub issue #5, which reported
+    the previous, uncorrected behaviour: V(True) reported alongside a
+    C(host_status_raw) that was really this HTML page.
     """
     host_status_raw = asp_client.get_host_status()
     if len(host_status_raw) > _HOST_STATUS_DIAGNOSTIC_LIMIT:
@@ -628,10 +659,14 @@ def fetch_remote_session_preconditions(asp_client: AspClient) -> tuple[dict | No
 
     Mirrors plugins/modules/asmb8_sessions.py's ``fetch_remote_session_config()``: this endpoint
     has been observed, against the target hardware, to answer a fresh and otherwise-successful
-    login with a session-expired-looking page for reasons not yet identified -- see this module's
-    description. Only :class:`errors.ProtocolError` is degraded here, exactly like that sibling
-    function -- a connection/authentication/timeout failure at this point is a real problem with
-    the run, not this endpoint's documented quirk, and is allowed to propagate.
+    login with a session-expired-looking page. GitHub issue #5 identified the general mechanism
+    behind that symptom for five *other* endpoints (a missing ``CSRFTOKEN`` header, now attached by
+    ``AspClient`` to every non-``WEBSES`` request) -- but whether ``getremotesession.asp`` itself is
+    one of the endpoints that enforces that header is **not** confirmed either way, so this remains
+    a documented, unverified gap for this specific endpoint rather than something the general fix
+    is known to have closed. Only :class:`errors.ProtocolError` is degraded here, exactly like that
+    sibling function -- a connection/authentication/timeout failure at this point is a real problem
+    with the run, not this endpoint's documented quirk, and is allowed to propagate.
     """
     try:
         response = asp_client.get_webvar("getremotesession")
@@ -672,7 +707,7 @@ def fetch_vmediacfg_preconditions(asp_client: AspClient) -> dict:
 
     Unlike :func:`fetch_remote_session_preconditions`, a failure here is allowed to propagate and
     fail the whole module: this endpoint has shown no equivalent of ``getremotesession.asp``'s
-    session-expired quirk in this project's testing, so silently degrading it to ``None`` would
+    session-expired-page quirk in this project's testing, so silently degrading it to ``None`` would
     hide a real problem behind a result that looks like a clean, if empty, read. This matches
     :func:`gather_web_management_facts`'s own hard-fail behaviour for its one diagnostic read under
     O(include_web_session).

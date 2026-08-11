@@ -532,16 +532,48 @@ cost this serialized client an extra round trip against a web server already
 known to wedge under concurrent load, for a value the login response already
 carries.
 
-**Whether this firmware actually *enforces* CSRFTOKEN on any request is
-unverified.** This collection's existing `GET` reads send no such header and
-have always worked without it; whether a `POST` is rejected without one has
-not been tested, because every `POST` this collection issues has one
-available to send. `AspClient` therefore attaches the header on a
-best-effort, match-the-vendor basis — sent whenever a token has been
-captured, never treated as a precondition for the request — and does exactly
-that only for `POST` requests other than the login itself; see
-`AspClient._headers()`'s own docstring for why this is deliberately narrower
-than the vendor's own URL-based (not method-based) rule for `GET`.
+**Correction (2026-08-11), retiring a claim this section got wrong.** This
+section used to say that whether this firmware *enforces* CSRFTOKEN on any
+request "is unverified", and specifically that "this collection's existing
+`GET` reads send no such header and have always worked without it". That
+was **wrong**, and it was wrong in a specific, instructive way: it
+generalised "works without it" from a partial sample. The `GET` endpoints
+this project happened to test by hand before [GitHub issue
+#5](https://github.com/james-crowley/ansible-collection-asmb8-ikvm/issues/5)
+(`getvmediacfg`, `getallservicescfg`, `getdatetime`, `getntpcfg`) simply
+happen not to enforce the header — that is a fact about those four
+endpoints, not about `GET` as a method. Issue #5 (2026-08-11, live hardware)
+showed five *other* `GET` endpoints (`getalllancfg.asp`,
+`getlanchannelinfo.asp`, `getdnscfg.asp`, `getnwbondcfg.asp`,
+`checknwbond.asp`) answering an authenticated `GET` missing `CSRFTOKEN` with
+a session-expired-looking HTML page (2,223 bytes, SHA-256
+`7129528f34a2b230534e705ad8cb230cd1f5d4ae0362a9f9694c99b61f4c3427` in every
+one of the five), and answering normally, every time, once the header was
+attached.
+
+**Enforcement is per-endpoint, not a blanket `GET`-vs-`POST` rule.**
+`AspClient._headers()` now attaches `CSRFTOKEN` to `GET` as well as `POST`
+(any non-`WEBSES` request, matching the vendor's own URL-based rule exactly
+— see `AspClient._headers()`'s own docstring for the full history, including
+the earlier, narrower GET-excluded version this replaced). Whether any given
+`POST`/write enforces the header remains genuinely untested either way —
+issue #5 exercised `GET` only — so that half of the original claim still
+stands as **[unverified]**, just no longer generalised into a false claim
+about `GET`.
+
+**A structural detector for the failure shape, not a byte-length or digest
+check.** `module_utils/asp.py`'s `looks_like_session_expired_html()`
+recognises this HTML page by shape — an HTML document carrying a login/session
+marker, with none of this format's own `WEBVAR_JSONVAR_` marker — rather than
+by the exact 2,223 bytes or SHA-256 above, which are properties of one
+firmware build's rendering of this one page and would silently stop matching
+the moment a firmware revision changes so much as whitespace in it.
+`AspClient.get_host_status()`/`get_webvar()`/`post_webvar()`/`set_webvar()`
+all check for this shape before treating a response as legitimate, so a
+caller gets a specific, named failure instead of either a generic parse
+complaint or — the more dangerous failure issue #5 actually reported against
+`asmb8_info(include_web_session=true)` — a confident wrong answer that
+treated this HTML as a successful, if oddly-shaped, response.
 
 ### Three `set*.asp` endpoints are sourced so far. Two are now implemented; one is not
 

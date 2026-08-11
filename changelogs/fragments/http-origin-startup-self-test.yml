@@ -1,0 +1,26 @@
+---
+bugfixes:
+  - >-
+    C(asmb8_http_origin) - stop reporting O(state=serving) on the strength of
+    a bound, listening socket alone (issue #2). A background session now
+    issues one real HTTP request against the address and port it just bound
+    -- fetching a real file under O(path) when one exists, otherwise
+    accepting a well-formed C(404) as the best available proof when there is
+    none -- and only reports O(state=serving) once that request actually
+    returns the expected bytes within a bounded timeout. A session whose
+    socket is listening but that is not actually servicing it for any reason
+    now fails this self-test and reports RV(session_state=error) instead of a
+    receipt nothing downstream can trust; a failed self-test tears the
+    background process down rather than leaving it holding the port. This
+    startup self-test's own request is never counted in
+    RV(request_count)/RV(bytes_served), which continue to describe real
+    client traffic only.
+  - >-
+    C(asmb8_http_origin) - bound the background session's own C(shutdown())
+    call (used both when the startup self-test fails and on a normal
+    C(SIGTERM)/lifetime-cap stop) to a fixed timeout instead of waiting on it
+    indefinitely. C(socketserver.BaseServer.shutdown()) blocks on an internal
+    event that only a running C(serve_forever()) loop's own teardown ever
+    sets; waiting on it unconditionally could turn a server thread that never
+    got around to running into a second, unbounded hang at teardown, on top
+    of the one the startup self-test above exists to catch at the start.

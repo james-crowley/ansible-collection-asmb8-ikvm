@@ -43,6 +43,26 @@ be forever. Three properties in this file exist specifically to bound that:
    play ends**, specifically so a failed install ("the installer 404'd
    fetching X") is diagnosable from evidence instead of guesswork -- see
    :func:`_append_access_log`.
+4. **A V(serving) state is never reported on the strength of a bound,
+   listening socket alone.** Binding and listening only proves the kernel
+   will *accept* a TCP connection and queue it -- it says nothing about
+   whether anything is actually going to call ``accept()`` on it, read the
+   request, and write a response. This distinction is not academic: it is
+   exactly the shape of a real, reported defect (a leaked reference to this
+   module's own tracker, issue #2) where a caller received V(serving), a
+   real client's TCP connect succeeded repeatedly, and yet zero response
+   bytes were ever sent for the lifetime of the session. Before this daemon
+   ever persists V(serving), :func:`_run_self_test` issues one real HTTP
+   request against the address and port it just bound, for a file that
+   actually exists under the served root when one is available, and demands
+   the exact bytes back within a bounded timeout. A daemon whose socket is
+   listening but whose serving path is for any reason not actually
+   servicing it -- whatever the cause -- fails this self-test and reports
+   V(error) instead of a receipt nothing downstream can trust. See that
+   function's own docstring for exactly what is (and, deliberately, is not)
+   verified, and :data:`_SELF_TEST_HEADER` for how this one request is kept
+   out of RV(request_count)/RV(bytes_served), which exist to describe real
+   client traffic, not this daemon's own opinion of itself.
 
 As with ``media_session.py``: this module owns exactly the process
 lifecycle, state-file bookkeeping, path confinement, and request serving. It
@@ -53,6 +73,7 @@ only caller.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import http.server
 import json
 import mimetypes
@@ -160,6 +181,33 @@ _CONTROL_POLL_INTERVAL = 0.2
 
 #: Read/write chunk size used when streaming a file's bytes to a client.
 _COPY_BUFFER_SIZE = 64 * 1024
+
+#: A request header this daemon's own startup self-test sends on the one
+#: request it issues against itself -- see :func:`_run_self_test` and this
+#: module's own docstring point 4 below. No real client (an installer, a
+#: bootloader, a human with curl) has any reason to ever send this, so its
+#: mere presence is what lets the handler tell "the daemon proving itself
+#: alive at startup" apart from "the traffic RV(request_count)/RV(bytes_served)
+#: exist to describe" -- see :func:`_build_handler_class`'s use of it.
+_SELF_TEST_HEADER = "X-Asmb8-Http-Origin-Selftest"
+
+#: Hard bound on how long the startup self-test below may wait for its own
+#: request to complete, covering connect *and* read. Generous enough that a
+#: loaded CI box or a slow filesystem does not make a perfectly healthy
+#: daemon fail its own self-test, but finite: this runs on the daemon's own
+#: main thread before it will ever report V(serving), so an unbounded wait
+#: here would recreate exactly the "reports success while every request
+#: hangs" failure this self-test exists to close off -- just moved one step
+#: earlier and turned into "never reports anything at all" instead. See
+#: start_timeout on the module side, which this must stay comfortably inside.
+_SELF_TEST_TIMEOUT_SECONDS = 5.0
+
+#: The path the self-test requests when the served root contains no regular
+#: file at all to verify real byte-serving against (see _find_probe_file). A
+#: name no real installer would ever request, so a genuine 404 for it proves
+#: nothing more than "the server answers," which is the best available proof
+#: when there is no real file to fetch -- see _run_self_test's docstring.
+_SELF_TEST_EMPTY_ROOT_PROBE_PATH = "/.asmb8-http-origin-selftest-no-file-in-root"
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +537,10 @@ def _build_handler_class(
             status = 200
             outcome = "ok"
             bytes_sent = 0
+            # Set once, read twice below (the counters skip and the access-log tag) --
+            # see _SELF_TEST_HEADER's own docstring for why this exists at all and why
+            # no real client could ever set it by accident.
+            is_self_test = self.headers.get(_SELF_TEST_HEADER) is not None
             try:
                 resolved = resolve_within_root(self.root_dir, self.path)
                 if resolved is None:
@@ -552,11 +604,18 @@ def _build_handler_class(
                 with contextlib.suppress(Exception):
                     self.send_error(500, redact(str(exc)))
             finally:
-                with state_lock:
-                    state["request_count"] += 1
-                    state["bytes_served"] += bytes_sent
-                    state["last_request_at"] = _now_iso()
-                    persist()
+                # The startup self-test's own request deliberately never touches these --
+                # see this module's docstring point 4 and _SELF_TEST_HEADER's docstring.
+                # RV(request_count)/RV(bytes_served)/RV(last_request_at) exist to answer
+                # "what has a real client done", and counting the daemon's own probe of
+                # itself here would hand an operator a receipt reading request_count=1
+                # before anything they are provisioning has connected at all.
+                if not is_self_test:
+                    with state_lock:
+                        state["request_count"] += 1
+                        state["bytes_served"] += bytes_sent
+                        state["last_request_at"] = _now_iso()
+                        persist()
                 _append_access_log(
                     access_log_path,
                     {
@@ -567,6 +626,7 @@ def _build_handler_class(
                         "outcome": outcome,
                         "bytes_sent": bytes_sent,
                         "client": self.client_address[0],
+                        "self_test": is_self_test,
                     },
                 )
 
@@ -687,6 +747,184 @@ def _format_bound_url(bind_address: str, port: int) -> str:
     return f"http://{host}:{port}/"
 
 
+# --------------------------------------------------------------------------
+# The startup self-test. See the module docstring's point 4 for why this
+# exists at all -- in short, a bound and listening socket proves the kernel
+# will accept a connection, not that anything will ever answer it, and this
+# module's whole reason for existing collapses if a V(serving) receipt is not
+# trustworthy.
+# --------------------------------------------------------------------------
+
+
+def _find_probe_file(root: Path) -> Path | None:
+    """The first regular file under ``root``, in a stable (sorted) walk order.
+
+    Used to pick a real file to fetch for the self-test below -- exercising
+    the exact same resolve-and-stream path a real installer's request would,
+    rather than a synthetic stand-in. Deliberately does not follow symlinks
+    that escape ``root`` (``os.walk`` here uses its default
+    ``followlinks=False``): a self-test has no business succeeding by reading
+    through the very confinement boundary :func:`resolve_within_root` exists
+    to enforce on every real request.
+
+    Returns ``None`` if ``root`` contains no regular file at all, however
+    deeply nested -- an unusual but legal setup (see :func:`validate_root`,
+    which only requires an existing directory) that :func:`_run_self_test`
+    still has to handle without either hanging or fabricating success.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            candidate = Path(dirpath) / name
+            # Skip a symlink even if it happens to be the first entry found: reading it
+            # directly here (to compute the "expected" bytes below) would follow it
+            # wherever it points, but resolve_within_root() -- correctly -- refuses to
+            # serve one that lands outside root, which would make a perfectly healthy
+            # daemon fail its own self-test over an unrelated confinement check.
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate
+    return None
+
+
+def _self_test_connect_host(bind_address: str) -> str:
+    """The address the self-test itself should connect to for a given ``bind_address``.
+
+    A wildcard bind (V(0.0.0.0), V(::), the two spellings a caller might use
+    to mean "every interface") is not itself a connectable destination on
+    every platform -- the self-test always runs on the same host the daemon
+    just bound on, so routing it through the loopback address for exactly
+    those two cases is both correct (loopback reaches a wildcard listener)
+    and avoids relying on platform-specific behaviour for connecting to the
+    wildcard address literally. Every other ``bind_address`` -- including a
+    real, routable, non-loopback address, which is this whole module's
+    normal case -- is used exactly as given: the daemon must be able to
+    reach itself on the address it just told the caller it was listening on,
+    or the self-test verifying nothing is wrong.
+    """
+    if bind_address in ("0.0.0.0", ""):  # noqa: S104 -- recognising the wildcard, not binding it.
+        return "127.0.0.1"
+    if bind_address == "::":
+        return "::1"
+    return bind_address
+
+
+def _perform_self_test_request(*, connect_host: str, port: int, url_path: str, timeout: float) -> tuple[int, bytes]:
+    """Issue exactly one real HTTP GET and return its status and full body.
+
+    Tagged with :data:`_SELF_TEST_HEADER` so the handler on the other end
+    knows to keep it out of RV(request_count)/RV(bytes_served) -- see that
+    constant's own docstring. ``Connection: close`` is sent explicitly so the
+    daemon-side connection closes the moment this response finishes, rather
+    than idling as a kept-alive HTTP/1.1 connection this function has no
+    further use for.
+
+    ``timeout`` bounds the socket for both connect and every subsequent read
+    -- the one property that keeps a wedged daemon's self-test from becoming
+    a second, self-inflicted instance of the exact hang this function exists
+    to catch.
+    """
+    conn = http.client.HTTPConnection(connect_host, port, timeout=timeout)
+    try:
+        conn.request("GET", url_path, headers={_SELF_TEST_HEADER: "1", "Connection": "close"})
+        response = conn.getresponse()
+        body = response.read()
+        return response.status, body
+    finally:
+        conn.close()
+
+
+def _run_self_test(*, bind_address: str, port: int, root: Path) -> tuple[bool, str]:
+    """Prove this daemon actually serves bytes before it is ever allowed to report V(serving).
+
+    Returns ``(True, detail)`` only once a real HTTP round trip against the
+    address and port just bound has demonstrably worked: a request for a
+    real file under ``root`` (when one exists -- see :func:`_find_probe_file`)
+    came back C(200) with exactly the bytes on disk, or, when ``root``
+    contains no file to verify against at all, a request for a path
+    guaranteed not to exist came back a well-formed C(404) rather than never
+    coming back at all. ``(False, detail)`` on anything else: a timeout, a
+    connection failure, a wrong status, or a body that does not match --
+    every one of those is a caller-visible :data:`STATE_ERROR`, never a
+    silently downgraded V(serving).
+
+    What this deliberately does **not** claim to verify: that every
+    possible file under ``root`` is servable (only one is fetched), that
+    C(Range) requests work (see ``parse_range_header``'s own, separate unit
+    coverage for that), or that a client other than this same host can reach
+    the bound address (a firewall or routing problem between the controller
+    and the actual target is outside anything a same-host self-test could
+    ever observe). It verifies exactly one thing, which is also exactly the
+    thing the reported defect broke: that the process which just claimed a
+    listening socket has something on the other end of it that will read a
+    real request and write back a real response, instead of a socket the
+    kernel will accept connections into forever with nobody home.
+    """
+    connect_host = _self_test_connect_host(bind_address)
+    probe = _find_probe_file(root)
+
+    if probe is not None:
+        rel_parts = probe.relative_to(root).parts
+        url_path = "/" + "/".join(urllib.parse.quote(part) for part in rel_parts)
+        try:
+            expected = probe.read_bytes()
+        except OSError as exc:
+            return False, f"self-test could not read probe file {probe}: {exc}"
+
+        try:
+            status, body = _perform_self_test_request(connect_host=connect_host, port=port, url_path=url_path, timeout=_SELF_TEST_TIMEOUT_SECONDS)
+        except (OSError, http.client.HTTPException) as exc:
+            return False, f"self-test GET {url_path} against {connect_host}:{port} failed: {exc}"
+
+        if status != 200:
+            return False, f"self-test GET {url_path} against {connect_host}:{port} returned status {status}, expected 200"
+        if body != expected:
+            return False, f"self-test GET {url_path} against {connect_host}:{port} returned {len(body)} bytes, expected {len(expected)}"
+        return True, f"self-test verified {len(body)} real byte(s) served from {url_path}"
+
+    # root has no file at all to verify byte-serving against -- the best available proof
+    # left is that the server answers a well-formed HTTP response instead of hanging.
+    try:
+        status, _body = _perform_self_test_request(
+            connect_host=connect_host, port=port, url_path=_SELF_TEST_EMPTY_ROOT_PROBE_PATH, timeout=_SELF_TEST_TIMEOUT_SECONDS
+        )
+    except (OSError, http.client.HTTPException) as exc:
+        return False, f"self-test GET against {connect_host}:{port} (empty root) failed: {exc}"
+    if status != 404:
+        return False, f"self-test GET against {connect_host}:{port} (empty root) returned status {status}, expected 404"
+    return True, "self-test confirmed the server responds (root has no file to verify byte-serving against)"
+
+
+def _shutdown_server_bounded(server: http.server.ThreadingHTTPServer, *, timeout: float) -> None:
+    """Call ``server.shutdown()`` without risking waiting on it forever.
+
+    ``socketserver.BaseServer.shutdown()`` blocks on an internal
+    ``threading.Event`` that only a running ``serve_forever()`` loop's own
+    ``finally`` block ever sets -- there is no timeout parameter to hand it.
+    If that loop's thread never actually got around to running for any
+    reason (which is precisely the failure mode :func:`_run_self_test`
+    exists to catch at startup, but nothing rules out something equivalent
+    happening later, after a session has already been serving normally),
+    calling ``shutdown()`` directly here would trade one unbounded hang for
+    another -- the exact "reports success while the socket is real but
+    nobody is servicing it" defect this module exists to stop, just moved
+    from startup to teardown instead. Confirmed directly, not theorised: the
+    test that exercises this (forcing ``serve_forever()`` to a no-op to
+    prove the startup self-test catches it) also wedged the daemon's own
+    normal shutdown path the same way, before this function existed.
+
+    Running the call on a bounded, abandonable watchdog thread means a stuck
+    ``shutdown()`` delays teardown by at most ``timeout`` instead of
+    forever. Abandoning that watchdog is safe: every caller of this function
+    is about to return from :func:`_run_daemon`, whose only caller
+    (:func:`spawn_session`'s forked child) calls ``os._exit()`` immediately
+    afterward, which tears down every thread in this process regardless of
+    what any of them are doing.
+    """
+    watchdog = threading.Thread(target=server.shutdown, daemon=True)
+    watchdog.start()
+    watchdog.join(timeout=timeout)
+
+
 def _run_daemon(config: SessionConfig) -> None:
     """The daemon's entire lifetime: bind, serve, and self-terminate.
 
@@ -702,7 +940,11 @@ def _run_daemon(config: SessionConfig) -> None:
     deadlocking (calling it from the same thread that is blocked inside
     ``serve_forever()``, e.g. from within a signal handler that interrupted
     that same thread, waits on an event only that same thread's own loop can
-    ever set).
+    ever set) -- and, per :func:`_shutdown_server_bounded`, on a bounded
+    watchdog rather than directly, so a ``serve_forever()`` loop that for any
+    reason never got around to running cannot turn this self-terminating
+    daemon's own shutdown into the very hang its lifetime cap exists to rule
+    out.
     """
     log_path = log_file_path(config.runtime_dir, config.session_id)
     _redirect_std_fds(log_path)
@@ -751,11 +993,38 @@ def _run_daemon(config: SessionConfig) -> None:
     actual_port = server.server_address[1]
     state["port"] = actual_port
     state["url"] = _format_bound_url(config.bind_address, actual_port)
-    state["state"] = STATE_SERVING
     _persist()
 
     server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
     server_thread.start()
+
+    # Do not report V(serving) on the strength of a bound, listening socket alone -- see the
+    # module docstring's point 4 and _run_self_test's own docstring for exactly why. A daemon
+    # that fails this tears itself down here, the same way a bind failure above does, rather
+    # than leaving an unusable process behind still holding the port.
+    self_test_ok, self_test_detail = _run_self_test(bind_address=config.bind_address, port=actual_port, root=root)
+    if not self_test_ok:
+        # Deliberately server_close() only, never server.shutdown() here. shutdown() waits on
+        # an internal event that only a running serve_forever() loop's own *finally* block ever
+        # sets -- and a self-test failure means exactly "something about that loop is not
+        # working right now," for reasons this function cannot know. Waiting on that event here
+        # would risk recreating, in this teardown path, the very same class of hang this
+        # self-test exists to catch (confirmed directly: forcing serve_forever() to a no-op to
+        # prove the self-test catches it also proved shutdown() alone can wedge here forever).
+        # server_close() just closes the listening socket -- always safe, never blocks on
+        # serve_forever's state -- which is what actually frees the port. The process exits via
+        # os._exit() immediately after this function returns (see spawn_session), which tears
+        # down server_thread (a daemon thread) regardless of whatever it is or is not doing.
+        with contextlib.suppress(OSError):
+            server.server_close()
+        state["state"] = STATE_ERROR
+        state["error"] = redact(self_test_detail)
+        state["error_class"] = ErrorClass.CONNECTION
+        _persist()
+        return
+
+    state["state"] = STATE_SERVING
+    _persist()
 
     deadline = time.monotonic() + config.lifetime_seconds
     reason = "signal"
@@ -769,7 +1038,7 @@ def _run_daemon(config: SessionConfig) -> None:
                 break
             time.sleep(_CONTROL_POLL_INTERVAL)
     finally:
-        server.shutdown()
+        _shutdown_server_bounded(server, timeout=5.0)
         server.server_close()
         server_thread.join(timeout=5.0)
 
