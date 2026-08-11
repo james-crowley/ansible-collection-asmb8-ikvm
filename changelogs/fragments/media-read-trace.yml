@@ -1,0 +1,8 @@
+---
+minor_changes:
+  - >-
+    C(asmb8_media) - retain a bounded 256-entry trace of recent SCSI
+    C(READ(10))/C(READ(12)) LBA and block-count requests in the session state,
+    so operators can distinguish catalogue, bootloader, and filesystem access
+    without recording media contents or allowing the state file to grow without
+    bound.
