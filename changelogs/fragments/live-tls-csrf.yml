@@ -1,0 +1,10 @@
+---
+bugfixes:
+  - >-
+    C(AmiLegacyTlsAdapter) - preserve the resolved fingerprint, CA, or explicit
+    insecure trust mode when Requests runs its per-request certificate hook,
+    instead of allowing that hook to replace the adapter's TLS policy.
+  - >-
+    C(AspClient) - replay the login-issued C(CSRFTOKEN) on every post-login
+    non-C(WEBSES) request, matching the vendor client's URL-based rule and the
+    virtual-media session path observed on hardware.
