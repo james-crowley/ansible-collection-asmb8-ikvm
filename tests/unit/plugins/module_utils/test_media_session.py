@@ -164,6 +164,8 @@ class TestInitialStateRecord:
             "image",
             "bytes_read",
             "sectors_served",
+            "read_trace",
+            "read_trace_dropped",
             "last_request_at",
             "started_at",
             "updated_at",
@@ -178,6 +180,8 @@ class TestInitialStateRecord:
         assert record["error_class"] is None
         assert record["bytes_read"] == 0
         assert record["sectors_served"] == 0
+        assert record["read_trace"] == []
+        assert record["read_trace_dropped"] == 0
         assert record["last_request_at"] is None
         assert record["idle_polls"] == 0
         assert record["idle_poll_interval_seconds"] == media_session._RECV_POLL_TIMEOUT
@@ -557,6 +561,14 @@ def _read_capacity_frame(*, sequence_number: int = 1) -> bytes:
     return iusb.Header(data_packet_len=len(payload), sequence_number=sequence_number).marshal() + payload
 
 
+def _read10_frame(*, lba: int, blocks: int, sequence_number: int = 1) -> bytes:
+    payload = bytearray(29)
+    payload[iusb.OPCODE_OFFSET] = iusb.SCSI_READ10
+    payload[iusb.OPCODE_OFFSET + 2 : iusb.OPCODE_OFFSET + 6] = lba.to_bytes(4, "big")
+    payload[iusb.OPCODE_OFFSET + 7 : iusb.OPCODE_OFFSET + 9] = blocks.to_bytes(2, "big")
+    return iusb.Header(data_packet_len=len(payload), sequence_number=sequence_number).marshal() + bytes(payload)
+
+
 class TestRunDaemonIdleHandling:
     """The highest-consequence behaviour in this whole daemon.
 
@@ -622,6 +634,12 @@ class TestRunDaemonIdleHandling:
         assert final["state"] == media_session.STATE_DETACHED
         assert final["sectors_served"] == 0  # READ CAPACITY(10) reports capacity; it does not itself transfer sectors
         assert final["last_request_at"] is not None
+
+    def test_read_trace_records_lba_and_block_count(self, harness):
+        script = [*self._handshake(), _read10_frame(lba=4130, blocks=4, sequence_number=9), _kill_frame()]
+        final = harness(script)
+        assert final["read_trace"] == [{"opcode": "0x28", "lba": 4130, "blocks": 4}]
+        assert final["read_trace_dropped"] == 0
 
     def test_updated_at_advances_on_idle_while_last_request_at_does_not(self, harness, monkeypatch):
         # The operator-facing contract this test pins: updated_at is a heartbeat (moves

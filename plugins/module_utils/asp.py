@@ -264,6 +264,16 @@ class AmiLegacyTlsAdapter(HTTPAdapter):
             kwargs["assert_fingerprint"] = self._policy.fingerprint
         return super().proxy_manager_for(proxy, **kwargs)
 
+    def cert_verify(self, conn: Any, url: str, verify: Any, cert: Any) -> None:
+        """Keep Requests from replacing this adapter's resolved trust mode."""
+        if self._policy.pinned or not self._policy.validate_certs:
+            effective_verify: Any = False
+        elif self._policy.ca_path:
+            effective_verify = self._policy.ca_path
+        else:
+            effective_verify = verify
+        super().cert_verify(conn, url, effective_verify, cert)
+
 
 # --- .asp RPC surface -------------------------------------------------------
 
@@ -462,32 +472,23 @@ class AspClient:
 
         CSRFTOKEN is attached only when **all** of the following hold: a token has actually been
         harvested from a prior :meth:`login` (never fabricated, never fetched proactively -- a
-        missing token simply means this header is omitted, never a blocking failure); the request
-        is a ``POST`` (a second capture confirmed this header on both this collection's
-        ``post_webvar`` reads, ``getselentries.asp`` and ``getsessioninfo.asp`` -- both POST); and
-        the URL is not the login endpoint itself (``WEBSES``), matching the vendor JS's own rule in
+        missing token simply means this header is omitted, never a blocking failure); and the URL
+        is not the login endpoint itself (``WEBSES``), matching the vendor JS's own rule in
         ``/lib/xmit.js``: ``if (this.url.indexOf("WEBSES") == -1) { ... setRequestHeader("CSRFTOKEN",
         ...) }``. The BMC issues the very token this header would carry from that same login call,
         so sending it back on the login request itself is nonsensical as well as contrary to the
         vendor's own rule.
 
-        **Deliberately narrower than the vendor's rule for `GET`.** The vendor's own check is
-        URL-based, not method-based, so its real client likely attaches this header to non-WEBSES
-        `GET`s too -- but this collection's `GET` reads (`get_webvar`, `get_host_status`,
-        `get_session_token`, the JNLP fetch) are independently confirmed working without it, and
-        widening this now, on an inference rather than a capture of a `GET` carrying the header,
-        would risk changing already-working behaviour for no sourced reason. If a future capture
-        shows a `GET` carrying CSRFTOKEN too, widen this then, with that evidence cited.
-
-        Whether this firmware actually *enforces* CSRFTOKEN on any request -- `GET` or `POST` -- is
-        **unverified**: the existing `GET` reads succeed without ever sending one. This header is
-        attached on a best-effort, match-the-vendor basis, not because refusal without it has ever
-        been observed.
+        This deliberately follows the vendor's URL-based rule for both ``GET`` and ``POST``. Live
+        virtual-media qualification showed that the post-login JNLP/session path needs the same
+        token continuity as the vendor client; restricting the token to POST produced an unusable
+        session even though login itself succeeded. A missing token remains non-blocking and the
+        login endpoint remains explicitly excluded.
         """
         headers = {}
         if self._session_cookie:
             headers["Cookie"] = f"SessionCookie={self._session_cookie}"
-        if self._csrf_token and method == "POST" and "WEBSES" not in url:
+        if self._csrf_token and "WEBSES" not in url:
             headers["CSRFTOKEN"] = self._csrf_token
         return headers
 

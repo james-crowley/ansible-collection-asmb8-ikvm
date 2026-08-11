@@ -242,6 +242,28 @@ class TestAmiLegacyTlsAdapter:
         assert captured["ssl_context"].verify_mode == ssl.CERT_NONE
         assert "assert_fingerprint" not in captured
 
+    @pytest.mark.parametrize(
+        ("policy", "request_verify", "expected_verify"),
+        [
+            (TlsTrustPolicy.create(tls_fingerprint="aa" * 32), True, False),
+            (TlsTrustPolicy.create(validate_certs=False), True, False),
+            (TlsTrustPolicy.create(ca_path="/etc/asmb8-test-ca.pem"), True, "/etc/asmb8-test-ca.pem"),
+            (TlsTrustPolicy.create(validate_certs=True), True, True),
+        ],
+    )
+    def test_cert_verify_preserves_the_resolved_adapter_trust_mode(self, monkeypatch, policy, request_verify, expected_verify):
+        captured: dict = {}
+
+        def capture(_self, conn, url, verify, cert):
+            captured.update(conn=conn, url=url, verify=verify, cert=cert)
+
+        monkeypatch.setattr(HTTPAdapter, "cert_verify", capture)
+        adapter = object.__new__(AmiLegacyTlsAdapter)
+        adapter._policy = policy
+        adapter.cert_verify("pool", "https://bmc.invalid/", request_verify, None)
+
+        assert captured["verify"] == expected_verify
+
     def test_adapter_is_the_slimmer_equivalent_the_task_allowed_for(self):
         # Confirms this module does not import the sibling intel_amt
         # collection's tls.py: this board's mandatory cipher/protocol
@@ -836,10 +858,9 @@ class TestCsrfToken:
         kwargs = client._http_session.request.call_args.kwargs
         assert "CSRFTOKEN" not in kwargs["headers"]
 
-    def test_get_webvar_never_sends_a_csrftoken_header_even_when_one_is_known(self):
-        # Scope check for the deliberately-narrower-than-the-vendor rule: see _headers()'s
-        # docstring on why this collection attaches CSRFTOKEN to POST only, leaving the
-        # independently-working GET reads unchanged.
+    def test_get_webvar_sends_the_csrftoken_header_when_one_is_known(self):
+        # The vendor JavaScript scopes the token by URL rather than method; live virtual-media
+        # qualification confirmed that the post-login GET path must follow the same rule.
         client = make_client()
         client._session_cookie = SESSION_COOKIE
         client._csrf_token = CSRF_TOKEN
@@ -848,7 +869,7 @@ class TestCsrfToken:
         client.get_webvar("getdatetime")
 
         kwargs = client._http_session.request.call_args.kwargs
-        assert "CSRFTOKEN" not in kwargs["headers"]
+        assert kwargs["headers"]["CSRFTOKEN"] == CSRF_TOKEN
 
     def test_no_csrftoken_header_is_ever_sent_before_a_token_exists_regardless_of_method(self):
         client = make_client()

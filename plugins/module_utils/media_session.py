@@ -146,6 +146,12 @@ _RECV_POLL_TIMEOUT = 2.0
 #: ``ErrorClass.BMC_BUSY`` on its own if the slot is in fact still held.
 _RECLAIM_STOP_TIMEOUT = 10.0
 
+# Keep enough recent READ(10)/READ(12) requests to distinguish ISO catalogue,
+# boot-image, and filesystem access without allowing a long install to grow the
+# state file without bound.  This is diagnostic metadata only; it contains no
+# media contents or credentials.
+_READ_TRACE_LIMIT = 256
+
 
 @dataclass(frozen=True, slots=True)
 class SessionConfig:
@@ -224,6 +230,8 @@ def _initial_state(*, session_id: str, endpoint: str, pid: int, image: str) -> d
         "image": image,
         "bytes_read": 0,
         "sectors_served": 0,
+        "read_trace": [],
+        "read_trace_dropped": 0,
         "last_request_at": None,
         "started_at": now,
         "updated_at": now,
@@ -656,6 +664,19 @@ def _run_daemon(config: SessionConfig, username: str, password: str) -> None:
             _close_idle_streak(state, now=now)
             state["bytes_read"] = device.bytes_served()
             state["sectors_served"] = device.blocks_served()
+            cdb = _req.cdb()
+            if cdb and cdb[0] in (iusb.SCSI_READ10, iusb.SCSI_READ12):
+                blocks_slice = cdb[7:9] if cdb[0] == iusb.SCSI_READ10 else cdb[6:10]
+                entry = {
+                    "opcode": f"0x{cdb[0]:02x}",
+                    "lba": int.from_bytes(cdb[2:6], "big"),
+                    "blocks": int.from_bytes(blocks_slice, "big"),
+                }
+                trace = state["read_trace"]
+                if len(trace) < _READ_TRACE_LIMIT:
+                    trace.append(entry)
+                else:
+                    state["read_trace_dropped"] += 1
             state["last_request_at"] = now
             _persist(now)
 
