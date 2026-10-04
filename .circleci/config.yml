@@ -202,7 +202,7 @@ commands:
             python3 -m venv .venv
             . .venv/bin/activate
             python -m pip install --upgrade pip
-            python -m pip install "ansible-core~=2.19.0" -r requirements.txt
+            python -m pip install "ansible-core~=2.19.11" -r requirements.txt
             ansible --version
       - run:
           name: Install the collection from this checkout
